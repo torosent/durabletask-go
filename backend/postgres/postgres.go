@@ -140,7 +140,7 @@ func (be *postgresBackend) AbandonOrchestrationWorkItem(ctx context.Context, wi 
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	var visibleTime*time.Time = nil
+	var visibleTime *time.Time = nil
 	if delay := wi.GetAbandonDelay(); delay > 0 {
 		t := time.Now().UTC().Add(delay)
 		visibleTime = &t
@@ -497,6 +497,12 @@ func (be *postgresBackend) createOrchestrationInstanceInternal(ctx context.Conte
 }
 
 func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *backend.HistoryEvent, startEvent *protos.ExecutionStartedEvent) (int64, error) {
+	var parentInstanceID *string
+	if pi := startEvent.GetParentInstance(); pi != nil {
+		if instanceID := pi.GetOrchestrationInstance().GetInstanceId(); instanceID != "" {
+			parentInstanceID = &instanceID
+		}
+	}
 	res, err := tx.Exec(
 		ctx,
 		`INSERT INTO Instances (
@@ -506,8 +512,9 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *back
 			ExecutionID,
 			Input,
 			RuntimeStatus,
-			CreatedTime
-		) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
+			CreatedTime,
+			ParentInstanceID
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
 		startEvent.Name,
 		startEvent.Version.GetValue(),
 		startEvent.OrchestrationInstance.InstanceId,
@@ -515,6 +522,7 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *back
 		startEvent.Input.GetValue(),
 		"PENDING",
 		e.Timestamp.AsTime(),
+		parentInstanceID,
 	)
 	if err != nil {
 		return -1, fmt.Errorf("failed to insert into Instances table: %w", err)
@@ -769,7 +777,7 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	now := time.Now().UTC()
-	newLockExpiration:= now.Add(be.options.OrchestrationLockTimeout)
+	newLockExpiration := now.Add(be.options.OrchestrationLockTimeout)
 
 	// Place a lock on an orchestration instance that has new events that are ready to be executed.
 	row := tx.QueryRow(
