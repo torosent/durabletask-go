@@ -46,7 +46,7 @@ func (c *backendClient) ScheduleNewOrchestration(ctx context.Context, orchestrat
 		}
 	}
 	if req.InstanceId == "" {
-		u, err := uuid.NewRandom()
+		u, err := uuid.NewV7()
 		if err != nil {
 			return api.EmptyInstanceID, fmt.Errorf("failed to generate instance ID: %w", err)
 		}

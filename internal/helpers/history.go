@@ -21,6 +21,10 @@ func NewExecutionStartedEvent(
 	parentTraceContext *protos.TraceContext,
 	scheduledStartTimeStamp *timestamppb.Timestamp,
 ) *protos.HistoryEvent {
+	u, err := uuid.NewV7()
+	if err != nil {
+		u = uuid.New()
+	}
 	return &protos.HistoryEvent{
 		EventId:   -1,
 		Timestamp: timestamppb.New(time.Now()),
@@ -31,7 +35,7 @@ func NewExecutionStartedEvent(
 				Input:          input,
 				OrchestrationInstance: &protos.OrchestrationInstance{
 					InstanceId:  instanceId,
-					ExecutionId: wrapperspb.String(uuid.New().String()),
+					ExecutionId: wrapperspb.String(u.String()),
 				},
 				ParentTraceContext:      parentTraceContext,
 				ScheduledStartTimestamp: scheduledStartTimeStamp,

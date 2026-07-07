@@ -64,7 +64,11 @@ func NewPostgresBackend(opts *PostgresOptions, logger backend.Logger) backend.Ba
 	}
 
 	pid := os.Getpid()
-	uuidStr := uuid.NewString()
+	u, err := uuid.NewV7()
+	if err != nil {
+		u = uuid.New()
+	}
+	uuidStr := u.String()
 
 	if opts == nil {
 		opts = NewPostgresOptions("localhost", 5432, "postgres", "postgres", "postgres")
@@ -789,7 +793,7 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 				SELECT 1 FROM NewEvents E
 				WHERE E.InstanceID = I.InstanceID AND (E.VisibleTime IS NULL OR E.VisibleTime < $4)
 			)
-			ORDER BY I.SequenceNumber ASC
+			ORDER BY I.InstanceID, I.SequenceNumber ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		) RETURNING InstanceID`,
@@ -827,30 +831,42 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 	}
 	defer events.Close()
 
-	maxDequeueCount := int32(0)
+	type rawEvent struct {
+		payload []byte
+		dequeue int32
+	}
 
-	newEvents := make([]*protos.HistoryEvent, 0, 10)
+	rawEvents := []rawEvent{}
 	for events.Next() {
 		var eventPayload []byte
 		var dequeueCount int32
 		if err := events.Scan(&eventPayload, &dequeueCount); err != nil {
 			return nil, fmt.Errorf("failed to read history event: %w", err)
 		}
+		rawEvents = append(rawEvents, rawEvent{
+			payload: eventPayload,
+			dequeue: dequeueCount,
+		})
+	}
+	events.Close()
 
-		if dequeueCount > maxDequeueCount {
-			maxDequeueCount = dequeueCount
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to update orchestration work-item: %w", err)
+	}
+
+	maxDequeueCount := int32(0)
+	newEvents := make([]*protos.HistoryEvent, 0, len(rawEvents))
+	for _, e := range rawEvents {
+		if e.dequeue > maxDequeueCount {
+			maxDequeueCount = e.dequeue
 		}
 
-		e, err := backend.UnmarshalHistoryEvent(eventPayload)
+		evt, err := backend.UnmarshalHistoryEvent(e.payload)
 		if err != nil {
 			return nil, err
 		}
 
-		newEvents = append(newEvents, e)
-	}
-
-	if err = tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to update orchestration work-item: %w", err)
+		newEvents = append(newEvents, evt)
 	}
 
 	wi := &backend.OrchestrationWorkItem{
@@ -877,7 +893,7 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 		WHERE SequenceNumber = (
 			SELECT SequenceNumber FROM NewTasks T
 			WHERE T.LockExpiration IS NULL OR T.LockExpiration < $3
-			ORDER BY T.SequenceNumber ASC
+			ORDER BY T.InstanceID, T.SequenceNumber ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		) RETURNING SequenceNumber, InstanceID, EventPayload`,

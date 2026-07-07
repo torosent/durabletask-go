@@ -27,6 +27,9 @@ CREATE INDEX IF NOT EXISTS IX_Instances_RuntimeStatus ON Instances(RuntimeStatus
 -- This index is intended to help the performance of multi-instance query
 CREATE INDEX IF NOT EXISTS IX_Instances_CreatedTime ON Instances(CreatedTime);
 
+-- This index is used to improve queries that use Instances.ParentInstanceID
+CREATE INDEX IF NOT EXISTS IX_Instances_ParentInstanceID ON Instances(ParentInstanceID);
+
 CREATE TABLE IF NOT EXISTS History (
     InstanceID TEXT NOT NULL,
     SequenceNumber SERIAL NOT NULL,
