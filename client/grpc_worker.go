@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
@@ -38,6 +39,25 @@ type TaskHubGrpcWorkerConnectionFactory func(context.Context) (grpc.ClientConnIn
 
 type TaskHubGrpcWorkerOption func(*taskHubGrpcWorkerOptions) error
 
+type WorkerCapability = protos.WorkerCapability
+
+const (
+	WorkerCapabilityHistoryStreaming WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING
+	WorkerCapabilityScheduledTasks   WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_SCHEDULED_TASKS
+	WorkerCapabilityLargePayloads    WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_LARGE_PAYLOADS
+)
+
+type WorkItemFilter struct {
+	Name     string
+	Versions []string
+}
+
+type WorkItemFilters struct {
+	Orchestrations []WorkItemFilter
+	Activities     []WorkItemFilter
+	Entities       []string
+}
+
 type taskHubGrpcWorkerOptions struct {
 	maxConcurrentOrchestrations int
 	maxConcurrentActivities     int
@@ -51,7 +71,9 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
 	taskExecutorOptions         []task.TaskExecutorOption
-	workItemFilters             *protos.WorkItemFilters
+	capabilities                []WorkerCapability
+	workItemFilters             *WorkItemFilters
+	largePayloads               *api.LargePayloadOptions
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -68,6 +90,7 @@ func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
 		transientRetryMaxAttempts:   10,
 		transientRetryBaseDelay:     200 * time.Millisecond,
 		transientRetryMaxDelay:      15 * time.Second,
+		capabilities:                []WorkerCapability{WorkerCapabilityHistoryStreaming},
 	}
 }
 
@@ -100,78 +123,6 @@ func WithMaxConcurrentEntityWorkItems(n int) TaskHubGrpcWorkerOption {
 		options.maxConcurrentEntities = n
 		return nil
 	}
-}
-
-type OrchestrationWorkItemFilter struct {
-	Name     string
-	Versions []string
-}
-
-type ActivityWorkItemFilter struct {
-	Name     string
-	Versions []string
-}
-
-type WorkItemFilters struct {
-	Orchestrations []OrchestrationWorkItemFilter
-	Activities     []ActivityWorkItemFilter
-	Entities       []string
-}
-
-// WithWorkItemFilters configures server-side work routing filters.
-func WithWorkItemFilters(filters WorkItemFilters) TaskHubGrpcWorkerOption {
-	return func(options *taskHubGrpcWorkerOptions) error {
-		wire := &protos.WorkItemFilters{}
-		for _, filter := range filters.Orchestrations {
-			versions, err := sortedFilterVersions("orchestration", filter.Name, filter.Versions)
-			if err != nil {
-				return err
-			}
-			wire.Orchestrations = append(wire.Orchestrations, &protos.OrchestrationFilter{
-				Name:     filter.Name,
-				Versions: versions,
-			})
-		}
-		for _, filter := range filters.Activities {
-			versions, err := sortedFilterVersions("activity", filter.Name, filter.Versions)
-			if err != nil {
-				return err
-			}
-			wire.Activities = append(wire.Activities, &protos.ActivityFilter{
-				Name:     filter.Name,
-				Versions: versions,
-			})
-		}
-		for _, name := range filters.Entities {
-			if strings.TrimSpace(name) == "" {
-				return fmt.Errorf("entity work-item filter name must not be empty")
-			}
-			wire.Entities = append(wire.Entities, &protos.EntityFilter{Name: name})
-		}
-		// Sort by name so that the filter set sent to the server is deterministic.
-		slices.SortFunc(wire.Orchestrations, func(left, right *protos.OrchestrationFilter) int {
-			return strings.Compare(left.Name, right.Name)
-		})
-		slices.SortFunc(wire.Activities, func(left, right *protos.ActivityFilter) int {
-			return strings.Compare(left.Name, right.Name)
-		})
-		slices.SortFunc(wire.Entities, func(left, right *protos.EntityFilter) int {
-			return strings.Compare(left.Name, right.Name)
-		})
-		options.workItemFilters = wire
-		return nil
-	}
-}
-
-// sortedFilterVersions validates a work-item filter name and returns a sorted copy of
-// its versions, leaving the caller's slice untouched.
-func sortedFilterVersions(kind string, name string, versions []string) ([]string, error) {
-	if strings.TrimSpace(name) == "" {
-		return nil, fmt.Errorf("%s work-item filter name must not be empty", kind)
-	}
-	sorted := slices.Clone(versions)
-	slices.Sort(sorted)
-	return sorted, nil
 }
 
 func WithWorkerHelloTimeout(timeout time.Duration) TaskHubGrpcWorkerOption {
@@ -235,6 +186,70 @@ func WithWorkerTransientRetryPolicy(maxAttempts int, baseDelay, maxDelay time.Du
 func WithTaskExecutorOptions(options ...task.TaskExecutorOption) TaskHubGrpcWorkerOption {
 	return func(workerOptions *taskHubGrpcWorkerOptions) error {
 		workerOptions.taskExecutorOptions = append(workerOptions.taskExecutorOptions, options...)
+		return nil
+	}
+}
+
+// WithWorkerCapabilities explicitly configures the capabilities advertised to the sidecar.
+func WithWorkerCapabilities(capabilities ...WorkerCapability) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		seen := make(map[WorkerCapability]struct{}, len(capabilities))
+		configured := make([]WorkerCapability, 0, len(capabilities))
+		for _, capability := range capabilities {
+			switch capability {
+			case WorkerCapabilityHistoryStreaming, WorkerCapabilityScheduledTasks, WorkerCapabilityLargePayloads:
+			default:
+				return fmt.Errorf("unsupported worker capability: %d", capability)
+			}
+			if _, ok := seen[capability]; ok {
+				continue
+			}
+			seen[capability] = struct{}{}
+			configured = append(configured, capability)
+		}
+		options.capabilities = configured
+		return nil
+	}
+}
+
+// WithScheduledTaskCapability controls scheduled-task capability advertisement.
+func WithScheduledTaskCapability(enabled bool) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		options.capabilities = setWorkerCapability(options.capabilities, WorkerCapabilityScheduledTasks, enabled)
+		return nil
+	}
+}
+
+// WithWorkItemFilters restricts orchestration/activity names and versions and entity names accepted by the worker.
+// A nil filter means no restrictions. An explicitly empty kind rejects all work items of that kind.
+func WithWorkItemFilters(filters *WorkItemFilters) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if filters == nil {
+			options.workItemFilters = nil
+			return nil
+		}
+		clone, err := cloneWorkItemFilters(filters)
+		if err != nil {
+			return err
+		}
+		options.workItemFilters = clone
+		return nil
+	}
+}
+
+// WithWorkerLargePayloads configures worker payload hydration/externalization and advertises support.
+func WithWorkerLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcWorkerOption {
+	return func(workerOptions *taskHubGrpcWorkerOptions) error {
+		normalized, err := api.NormalizeLargePayloadOptions(options)
+		if err != nil {
+			return err
+		}
+		workerOptions.largePayloads = normalized
+		workerOptions.capabilities = setWorkerCapability(
+			workerOptions.capabilities,
+			WorkerCapabilityLargePayloads,
+			normalized != nil,
+		)
 		return nil
 	}
 }
@@ -353,6 +368,13 @@ func newTaskHubGrpcWorker(
 		if err := configure(&options); err != nil {
 			return nil, err
 		}
+	}
+	hasLargePayloadCapability := slices.Contains(options.capabilities, WorkerCapabilityLargePayloads)
+	if hasLargePayloadCapability && options.largePayloads == nil {
+		return nil, fmt.Errorf("large-payload capability requires worker large-payload options")
+	}
+	if options.largePayloads != nil {
+		options.capabilities = setWorkerCapability(options.capabilities, WorkerCapabilityLargePayloads, true)
 	}
 	return &TaskHubGrpcWorker{
 		clientFactory: factory,
@@ -563,10 +585,8 @@ func (w *TaskHubGrpcWorker) connect(ctx context.Context) (*grpcWorkerConnection,
 		MaxConcurrentOrchestrationWorkItems: int32(w.options.maxConcurrentOrchestrations),
 		MaxConcurrentActivityWorkItems:      int32(w.options.maxConcurrentActivities),
 		MaxConcurrentEntityWorkItems:        int32(w.options.maxConcurrentEntities),
-		Capabilities: []protos.WorkerCapability{
-			protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING,
-		},
-		WorkItemFilters: w.options.workItemFilters,
+		Capabilities:                        slices.Clone(w.options.capabilities),
+		WorkItemFilters:                     workItemFiltersToProto(w.options.workItemFilters),
 	})
 	if err != nil {
 		cancelStream()
@@ -580,6 +600,84 @@ func (w *TaskHubGrpcWorker) connect(ctx context.Context) (*grpcWorkerConnection,
 		cancelStream: cancelStream,
 		closer:       closer,
 	}, nil
+}
+
+func setWorkerCapability(capabilities []WorkerCapability, capability WorkerCapability, enabled bool) []WorkerCapability {
+	index := slices.Index(capabilities, capability)
+	switch {
+	case enabled && index < 0:
+		return append(capabilities, capability)
+	case !enabled && index >= 0:
+		return slices.Delete(capabilities, index, index+1)
+	default:
+		return capabilities
+	}
+}
+
+func cloneWorkItemFilters(filters *WorkItemFilters) (*WorkItemFilters, error) {
+	result := &WorkItemFilters{
+		Orchestrations: make([]WorkItemFilter, len(filters.Orchestrations)),
+		Activities:     make([]WorkItemFilter, len(filters.Activities)),
+		Entities:       slices.Clone(filters.Entities),
+	}
+	for i, filter := range filters.Orchestrations {
+		if filter.Name == "" {
+			return nil, errors.New("orchestration filter name cannot be empty")
+		}
+		result.Orchestrations[i] = WorkItemFilter{Name: filter.Name, Versions: slices.Clone(filter.Versions)}
+	}
+	for i, filter := range filters.Activities {
+		if filter.Name == "" {
+			return nil, errors.New("activity filter name cannot be empty")
+		}
+		result.Activities[i] = WorkItemFilter{Name: filter.Name, Versions: slices.Clone(filter.Versions)}
+	}
+	for _, name := range result.Entities {
+		if strings.TrimSpace(name) == "" {
+			return nil, errors.New("entity filter name cannot be empty")
+		}
+	}
+	slices.SortFunc(result.Orchestrations, func(left, right WorkItemFilter) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	slices.SortFunc(result.Activities, func(left, right WorkItemFilter) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	for i := range result.Orchestrations {
+		slices.Sort(result.Orchestrations[i].Versions)
+	}
+	for i := range result.Activities {
+		slices.Sort(result.Activities[i].Versions)
+	}
+	slices.Sort(result.Entities)
+	return result, nil
+}
+
+func workItemFiltersToProto(filters *WorkItemFilters) *protos.WorkItemFilters {
+	if filters == nil {
+		return nil
+	}
+	result := &protos.WorkItemFilters{
+		Orchestrations: make([]*protos.OrchestrationFilter, 0, len(filters.Orchestrations)),
+		Activities:     make([]*protos.ActivityFilter, 0, len(filters.Activities)),
+		Entities:       make([]*protos.EntityFilter, 0, len(filters.Entities)),
+	}
+	for _, filter := range filters.Orchestrations {
+		result.Orchestrations = append(result.Orchestrations, &protos.OrchestrationFilter{
+			Name:     filter.Name,
+			Versions: slices.Clone(filter.Versions),
+		})
+	}
+	for _, filter := range filters.Activities {
+		result.Activities = append(result.Activities, &protos.ActivityFilter{
+			Name:     filter.Name,
+			Versions: slices.Clone(filter.Versions),
+		})
+	}
+	for _, name := range filters.Entities {
+		result.Entities = append(result.Entities, &protos.EntityFilter{Name: name})
+	}
+	return result
 }
 
 func (w *TaskHubGrpcWorker) retireConnection(run *grpcWorkerRun, connection *grpcWorkerConnection) {

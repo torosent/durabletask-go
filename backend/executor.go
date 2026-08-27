@@ -504,13 +504,24 @@ func (g *grpcExecutor) resolveEntityTask(completionToken string, response *proto
 }
 
 // CreateTaskHub implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) CreateTaskHub(context.Context, *protos.CreateTaskHubRequest) (*protos.CreateTaskHubResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "CreateTaskHub is not implemented")
+func (g *grpcExecutor) CreateTaskHub(ctx context.Context, req *protos.CreateTaskHubRequest) (*protos.CreateTaskHubResponse, error) {
+	if req.GetRecreateIfExists() {
+		if err := g.backend.DeleteTaskHub(ctx); err != nil && !errors.Is(err, ErrTaskHubNotFound) {
+			return nil, fmt.Errorf("failed to recreate task hub: %w", err)
+		}
+	}
+	if err := g.backend.CreateTaskHub(ctx); err != nil {
+		return nil, fmt.Errorf("failed to create task hub: %w", err)
+	}
+	return &protos.CreateTaskHubResponse{}, nil
 }
 
 // DeleteTaskHub implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) DeleteTaskHub(context.Context, *protos.DeleteTaskHubRequest) (*protos.DeleteTaskHubResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "DeleteTaskHub is not implemented")
+func (g *grpcExecutor) DeleteTaskHub(ctx context.Context, _ *protos.DeleteTaskHubRequest) (*protos.DeleteTaskHubResponse, error) {
+	if err := g.backend.DeleteTaskHub(ctx); err != nil {
+		return nil, fmt.Errorf("failed to delete task hub: %w", err)
+	}
+	return &protos.DeleteTaskHubResponse{}, nil
 }
 
 // GetInstance implements protos.TaskHubSidecarServiceServer
@@ -532,20 +543,187 @@ func (g *grpcExecutor) GetInstance(ctx context.Context, req *protos.GetInstanceR
 
 // PurgeInstances implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) PurgeInstances(ctx context.Context, req *protos.PurgeInstancesRequest) (*protos.PurgeInstancesResponse, error) {
-	if req.GetPurgeInstanceFilter() != nil {
-		return nil, status.Error(codes.Unimplemented, "multi-instance purge is not yet implemented")
+	if req.GetPurgeInstanceFilter() == nil && req.GetInstanceBatch() == nil {
+		count, err := purgeOrchestrationState(ctx, g.backend, api.InstanceID(req.GetInstanceId()), req.Recursive)
+		resp := &protos.PurgeInstancesResponse{
+			DeletedInstanceCount: int32(count),
+			IsComplete:           wrapperspb.Bool(true),
+		}
+		if err != nil {
+			return resp, fmt.Errorf("failed to purge orchestration state: %w", err)
+		}
+		return resp, nil
 	}
-	count, err := purgeOrchestrationState(ctx, g.backend, api.InstanceID(req.GetInstanceId()), req.Recursive)
-	resp := &protos.PurgeInstancesResponse{DeletedInstanceCount: int32(count)}
+
+	capability, ok := g.backend.(PurgeInstancesBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "multi-instance purge is not supported by this backend")
+	}
+	request := api.PurgeInstancesRequest{Recursive: req.GetRecursive()}
+	if batch := req.GetInstanceBatch(); batch != nil {
+		if len(batch.GetInstanceIds()) > api.MaxInstanceBatchSize {
+			return nil, status.Errorf(codes.InvalidArgument, "instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize)
+		}
+		request.InstanceIDs = make([]api.InstanceID, 0, len(batch.GetInstanceIds()))
+		for _, id := range batch.GetInstanceIds() {
+			request.InstanceIDs = append(request.InstanceIDs, api.InstanceID(id))
+		}
+	} else {
+		filter := req.GetPurgeInstanceFilter()
+		request.Filter = &api.PurgeInstanceFilter{
+			RuntimeStatus: append([]api.OrchestrationStatus(nil), filter.GetRuntimeStatus()...),
+		}
+		if filter.GetCreatedTimeFrom() != nil {
+			request.Filter.CreatedTimeFrom = filter.GetCreatedTimeFrom().AsTime()
+		}
+		if filter.GetCreatedTimeTo() != nil {
+			request.Filter.CreatedTimeTo = filter.GetCreatedTimeTo().AsTime()
+		}
+		if filter.GetTimeout() != nil {
+			request.Filter.Timeout = filter.GetTimeout().AsDuration()
+		}
+	}
+	result, err := capability.PurgeInstances(ctx, request)
 	if err != nil {
-		return resp, fmt.Errorf("failed to purge orchestration state: %w", err)
+		return nil, managementRPCError(err, "failed to purge orchestration instances")
+	}
+	return &protos.PurgeInstancesResponse{
+		DeletedInstanceCount: int32(result.DeletedInstanceCount),
+		IsComplete:           wrapperspb.Bool(result.IsComplete),
+	}, nil
+}
+
+// QueryInstances implements protos.TaskHubSidecarServiceServer
+func (g *grpcExecutor) QueryInstances(ctx context.Context, req *protos.QueryInstancesRequest) (*protos.QueryInstancesResponse, error) {
+	capability, ok := g.backend.(OrchestrationQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "instance queries are not supported by this backend")
+	}
+	wireQuery := req.GetQuery()
+	if wireQuery == nil {
+		wireQuery = &protos.InstanceQuery{}
+	}
+	query := api.OrchestrationQuery{
+		RuntimeStatus:         append([]api.OrchestrationStatus(nil), wireQuery.GetRuntimeStatus()...),
+		PageSize:              int(wireQuery.GetMaxInstanceCount()),
+		ContinuationToken:     wireQuery.GetContinuationToken().GetValue(),
+		InstanceIDPrefix:      wireQuery.GetInstanceIdPrefix().GetValue(),
+		FetchInputsAndOutputs: wireQuery.GetFetchInputsAndOutputs(),
+	}
+	if wireQuery.GetCreatedTimeFrom() != nil {
+		query.CreatedTimeFrom = wireQuery.GetCreatedTimeFrom().AsTime()
+	}
+	if wireQuery.GetCreatedTimeTo() != nil {
+		query.CreatedTimeTo = wireQuery.GetCreatedTimeTo().AsTime()
+	}
+	for _, taskHubName := range wireQuery.GetTaskHubNames() {
+		query.TaskHubNames = append(query.TaskHubNames, taskHubName.GetValue())
+	}
+	result, err := capability.QueryOrchestrations(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query orchestration instances: %w", err)
+	}
+	resp := &protos.QueryInstancesResponse{
+		OrchestrationState: make([]*protos.OrchestrationState, 0, len(result.Orchestrations)),
+	}
+	for _, metadata := range result.Orchestrations {
+		resp.OrchestrationState = append(resp.OrchestrationState, createOrchestrationState(metadata, query.FetchInputsAndOutputs))
+	}
+	if result.ContinuationToken != "" {
+		resp.ContinuationToken = wrapperspb.String(result.ContinuationToken)
 	}
 	return resp, nil
 }
 
-// QueryInstances implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) QueryInstances(context.Context, *protos.QueryInstancesRequest) (*protos.QueryInstancesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "QueryInstances is not implemented")
+// ListInstanceIds implements protos.TaskHubSidecarServiceServer
+func (g *grpcExecutor) ListInstanceIds(ctx context.Context, req *protos.ListInstanceIdsRequest) (*protos.ListInstanceIdsResponse, error) {
+	capability, ok := g.backend.(InstanceIDQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "instance ID queries are not supported by this backend")
+	}
+	query := api.InstanceIDQuery{
+		RuntimeStatus:     append([]api.OrchestrationStatus(nil), req.GetRuntimeStatus()...),
+		PageSize:          int(req.GetPageSize()),
+		ContinuationToken: req.GetLastInstanceKey().GetValue(),
+	}
+	if req.GetCompletedTimeFrom() != nil {
+		query.CompletedTimeFrom = req.GetCompletedTimeFrom().AsTime()
+	}
+	if req.GetCompletedTimeTo() != nil {
+		query.CompletedTimeTo = req.GetCompletedTimeTo().AsTime()
+	}
+	result, err := capability.ListInstanceIDs(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list orchestration instance IDs: %w", err)
+	}
+	resp := &protos.ListInstanceIdsResponse{
+		InstanceIds: make([]string, len(result.InstanceIDs)),
+	}
+	for i, id := range result.InstanceIDs {
+		resp.InstanceIds[i] = string(id)
+	}
+	if result.ContinuationToken != "" {
+		resp.LastInstanceKey = wrapperspb.String(result.ContinuationToken)
+	}
+	return resp, nil
+}
+
+// RestartInstance implements protos.TaskHubSidecarServiceServer
+func (g *grpcExecutor) RestartInstance(ctx context.Context, req *protos.RestartInstanceRequest) (*protos.RestartInstanceResponse, error) {
+	capability, ok := g.backend.(RestartInstanceBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "instance restart is not supported by this backend")
+	}
+	id, err := capability.RestartInstance(ctx, api.InstanceID(req.GetInstanceId()), req.GetRestartWithNewInstanceId())
+	if err != nil {
+		return nil, managementRPCError(err, "failed to restart orchestration instance")
+	}
+	return &protos.RestartInstanceResponse{InstanceId: string(id)}, nil
+}
+
+// RewindInstance implements protos.TaskHubSidecarServiceServer
+func (g *grpcExecutor) RewindInstance(ctx context.Context, req *protos.RewindInstanceRequest) (*protos.RewindInstanceResponse, error) {
+	capability, ok := g.backend.(RewindInstanceBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "instance rewind is not supported by this backend")
+	}
+	if err := capability.RewindInstance(ctx, api.InstanceID(req.GetInstanceId()), req.GetReason().GetValue()); err != nil {
+		return nil, managementRPCError(err, "failed to rewind orchestration instance")
+	}
+	return &protos.RewindInstanceResponse{}, nil
+}
+
+// SkipGracefulOrchestrationTerminations implements protos.TaskHubSidecarServiceServer
+func (g *grpcExecutor) SkipGracefulOrchestrationTerminations(
+	ctx context.Context,
+	req *protos.SkipGracefulOrchestrationTerminationsRequest,
+) (*protos.SkipGracefulOrchestrationTerminationsResponse, error) {
+	capability, ok := g.backend.(SkipGracefulTerminationsBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "immediate orchestration termination is not supported by this backend")
+	}
+	batch := req.GetInstanceBatch()
+	if batch == nil || len(batch.GetInstanceIds()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "at least one instance ID is required")
+	}
+	if len(batch.GetInstanceIds()) > api.MaxInstanceBatchSize {
+		return nil, status.Errorf(codes.InvalidArgument, "instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize)
+	}
+	ids := make([]api.InstanceID, 0, len(batch.GetInstanceIds()))
+	for _, id := range batch.GetInstanceIds() {
+		ids = append(ids, api.InstanceID(id))
+	}
+	unterminated, err := capability.SkipGracefulOrchestrationTerminations(ctx, ids, req.GetReason().GetValue())
+	if err != nil {
+		return nil, fmt.Errorf("failed to skip graceful orchestration terminations: %w", err)
+	}
+	resp := &protos.SkipGracefulOrchestrationTerminationsResponse{
+		UnterminatedInstanceIds: make([]string, len(unterminated)),
+	}
+	for i, id := range unterminated {
+		resp.UnterminatedInstanceIds[i] = string(id)
+	}
+	return resp, nil
 }
 
 // RaiseEvent implements protos.TaskHubSidecarServiceServer
@@ -825,21 +1003,62 @@ func (grpcExecutor) mustEmbedUnimplementedTaskHubSidecarServiceServer() { //noli
 }
 
 func createGetInstanceResponse(req *protos.GetInstanceRequest, metadata *api.OrchestrationMetadata) *protos.GetInstanceResponse {
-	state := &protos.OrchestrationState{
-		InstanceId:           req.InstanceId,
-		Name:                 metadata.Name,
-		Version:              wrapperspb.String(metadata.Version),
-		OrchestrationStatus:  metadata.RuntimeStatus,
-		CreatedTimestamp:     timestamppb.New(metadata.CreatedAt),
-		LastUpdatedTimestamp: timestamppb.New(metadata.LastUpdatedAt),
+	return &protos.GetInstanceResponse{
+		Exists:             true,
+		OrchestrationState: createOrchestrationState(metadata, req.GetGetInputsAndOutputs()),
 	}
+}
 
-	if req.GetInputsAndOutputs {
+func createOrchestrationState(metadata *api.OrchestrationMetadata, fetchInputsAndOutputs bool) *protos.OrchestrationState {
+	state := &protos.OrchestrationState{
+		InstanceId:          string(metadata.InstanceID),
+		Name:                metadata.Name,
+		OrchestrationStatus: metadata.RuntimeStatus,
+		Tags:                contextprop.Clone(metadata.Tags),
+	}
+	if metadata.Version != "" {
+		state.Version = wrapperspb.String(metadata.Version)
+	}
+	if metadata.ExecutionID != "" {
+		state.ExecutionId = wrapperspb.String(metadata.ExecutionID)
+	}
+	if metadata.ParentInstanceID != "" {
+		state.ParentInstanceId = wrapperspb.String(string(metadata.ParentInstanceID))
+	}
+	if !metadata.ScheduledStartAt.IsZero() {
+		state.ScheduledStartTimestamp = timestamppb.New(metadata.ScheduledStartAt)
+	}
+	if !metadata.CreatedAt.IsZero() {
+		state.CreatedTimestamp = timestamppb.New(metadata.CreatedAt)
+	}
+	if !metadata.LastUpdatedAt.IsZero() {
+		state.LastUpdatedTimestamp = timestamppb.New(metadata.LastUpdatedAt)
+	}
+	if !metadata.CompletedAt.IsZero() {
+		state.CompletedTimestamp = timestamppb.New(metadata.CompletedAt)
+	}
+	if fetchInputsAndOutputs {
 		state.Input = wrapperspb.String(metadata.SerializedInput)
 		state.CustomStatus = wrapperspb.String(metadata.SerializedCustomStatus)
 		state.Output = wrapperspb.String(metadata.SerializedOutput)
 		state.FailureDetails = metadata.FailureDetails
 	}
+	return state
+}
 
-	return &protos.GetInstanceResponse{Exists: true, OrchestrationState: state}
+func managementRPCError(err error, operation string) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	case errors.Is(err, api.ErrInstanceNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, api.ErrInvalidState), errors.Is(err, api.ErrNotCompleted):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, api.ErrFeatureNotSupported):
+		return status.Error(codes.Unimplemented, err.Error())
+	default:
+		return fmt.Errorf("%s: %w", operation, err)
+	}
 }

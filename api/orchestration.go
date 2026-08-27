@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ var (
 	ErrNoFailures        = errors.New("orchestration did not report failure details")
 	ErrDuplicateInstance = errors.New("orchestration instance already exists")
 	ErrIgnoreInstance    = errors.New("ignore creating orchestration instance")
+	ErrInvalidState      = errors.New("orchestration is not in a valid state for this operation")
 
 	EmptyInstanceID = InstanceID("")
 )
@@ -61,14 +63,18 @@ type OrchestrationMetadata struct {
 	InstanceID             InstanceID
 	Name                   string
 	Version                string
+	ExecutionID            string
 	ParentInstanceID       InstanceID
 	RuntimeStatus          protos.OrchestrationStatus
+	ScheduledStartAt       time.Time
 	CreatedAt              time.Time
 	LastUpdatedAt          time.Time
+	CompletedAt            time.Time
 	SerializedInput        string
 	SerializedOutput       string
 	SerializedCustomStatus string
 	FailureDetails         *protos.TaskFailureDetails
+	Tags                   map[string]string
 }
 
 // NewOrchestrationOptions configures options for starting a new orchestration.
@@ -164,10 +170,31 @@ func WithVersion(version string) NewOrchestrationOptions {
 // and activity contexts. The fields are persisted with orchestration history.
 func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
-		req.Tags = make(map[string]string, len(fields))
+		if req.Tags == nil {
+			req.Tags = make(map[string]string, len(fields))
+		}
 		for key, value := range fields {
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
 				return fmt.Errorf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
+			}
+			req.Tags[key] = value
+		}
+		return nil
+	}
+}
+
+// WithTags configures orchestration tags that are persisted and returned by metadata queries.
+func WithTags(tags map[string]string) NewOrchestrationOptions {
+	return func(req *protos.CreateInstanceRequest) error {
+		if req.Tags == nil {
+			req.Tags = make(map[string]string, len(tags))
+		}
+		for key, value := range tags {
+			if key == "" {
+				return errors.New("tag key cannot be empty")
+			}
+			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
+				return fmt.Errorf("tag %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
 			}
 			req.Tags[key] = value
 		}
@@ -279,14 +306,26 @@ func (m *OrchestrationMetadata) MarshalJSON() ([]byte, error) {
 	if m.Version != "" {
 		obj["version"] = m.Version
 	}
+	if m.ExecutionID != "" {
+		obj["executionId"] = m.ExecutionID
+	}
 	if m.ParentInstanceID != "" {
 		obj["parentInstanceId"] = m.ParentInstanceID
+	}
+	if !m.ScheduledStartAt.IsZero() {
+		obj["scheduledStartAt"] = m.ScheduledStartAt
+	}
+	if !m.CompletedAt.IsZero() {
+		obj["completedAt"] = m.CompletedAt
 	}
 	if m.SerializedOutput != "" {
 		obj["serializedOutput"] = m.SerializedOutput
 	}
 	if m.SerializedCustomStatus != "" {
 		obj["serializedCustomStatus"] = m.SerializedCustomStatus
+	}
+	if len(m.Tags) > 0 {
+		obj["tags"] = maps.Clone(m.Tags)
 	}
 
 	// Optional failure details (recursive)
@@ -371,14 +410,37 @@ func (m *OrchestrationMetadata) UnmarshalJSON(data []byte) (err error) {
 	if version, ok := obj["version"]; ok {
 		m.Version = version.(string)
 	}
+	if executionID, ok := obj["executionId"]; ok {
+		m.ExecutionID = executionID.(string)
+	}
 	if parentInstanceID, ok := obj["parentInstanceId"]; ok {
 		m.ParentInstanceID = InstanceID(parentInstanceID.(string))
+	}
+	if scheduledStartAt, ok := obj["scheduledStartAt"]; ok {
+		parsed, err := time.Parse(time.RFC3339, scheduledStartAt.(string))
+		if err != nil {
+			return errors.New("invalid 'scheduledStartAt' field: must be RFC3339 format")
+		}
+		m.ScheduledStartAt = parsed
+	}
+	if completedAt, ok := obj["completedAt"]; ok {
+		parsed, err := time.Parse(time.RFC3339, completedAt.(string))
+		if err != nil {
+			return errors.New("invalid 'completedAt' field: must be RFC3339 format")
+		}
+		m.CompletedAt = parsed
 	}
 	if output, ok := obj["serializedOutput"]; ok {
 		m.SerializedOutput = output.(string)
 	}
 	if output, ok := obj["serializedCustomStatus"]; ok {
 		m.SerializedCustomStatus = output.(string)
+	}
+	if tags, ok := obj["tags"]; ok {
+		m.Tags = make(map[string]string, len(tags.(map[string]any)))
+		for key, value := range tags.(map[string]any) {
+			m.Tags[key] = value.(string)
+		}
 	}
 
 	failureDetails, ok := obj["failureDetails"]

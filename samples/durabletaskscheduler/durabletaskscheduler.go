@@ -8,7 +8,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/task"
 )
@@ -51,7 +53,16 @@ func run() error {
 		}
 	}()
 
-	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
+	worker, err := durabletaskscheduler.NewWorker(
+		options,
+		registry,
+		logger,
+		durabletaskclient.WithScheduledTaskCapability(true),
+		durabletaskclient.WithWorkItemFilters(&durabletaskclient.WorkItemFilters{
+			Orchestrations: []durabletaskclient.WorkItemFilter{{Name: "ActivitySequence"}},
+			Activities:     []durabletaskclient.WorkItemFilter{{Name: "SayHello"}},
+		}),
+	)
 	if err != nil {
 		return err
 	}
@@ -66,7 +77,11 @@ func run() error {
 		}
 	}()
 
-	instanceID, err := schedulerClient.ScheduleNewOrchestration(ctx, "ActivitySequence")
+	instanceID, err := schedulerClient.ScheduleNewOrchestration(
+		ctx,
+		"ActivitySequence",
+		api.WithTags(map[string]string{"sample": "durable-task-scheduler"}),
+	)
 	if err != nil {
 		return err
 	}
@@ -79,6 +94,13 @@ func run() error {
 		return err
 	}
 	fmt.Println(string(output))
+	query, err := schedulerClient.QueryInstances(ctx, api.OrchestrationQuery{
+		Tags: map[string]string{"sample": "durable-task-scheduler"},
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("matched %d tagged orchestration(s)\n", len(query.Orchestrations))
 	return nil
 }
 

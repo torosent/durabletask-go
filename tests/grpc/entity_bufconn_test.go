@@ -73,7 +73,7 @@ func Test_Bufconn_DurableEntityEndToEnd(t *testing.T) {
 		registry,
 		logger,
 		client.WithMaxConcurrentEntityWorkItems(4),
-		client.WithWorkItemFilters(client.WorkItemFilters{Entities: []string{"counter"}}),
+		client.WithWorkItemFilters(&client.WorkItemFilters{Entities: []string{"counter"}}),
 	)
 	require.NoError(t, err)
 	require.NoError(t, worker.Start(testCtx))

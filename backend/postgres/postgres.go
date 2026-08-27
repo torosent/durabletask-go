@@ -110,7 +110,12 @@ func (be *postgresBackend) DeleteTaskHub(ctx context.Context) error {
 		}
 	}
 
-	_, err := be.db.Exec(ctx, "DROP TABLE IF EXISTS Instances CASCADE")
+	_, err := be.db.Exec(ctx, "DROP TABLE IF EXISTS InstanceTags CASCADE")
+	if err != nil {
+		be.logger.Error("DeleteTaskHub", "failed to drop InstanceTags table", err)
+		return fmt.Errorf("failed to drop InstanceTags table: %w", err)
+	}
+	_, err = be.db.Exec(ctx, "DROP TABLE IF EXISTS Instances CASCADE")
 	if err != nil {
 		be.logger.Error("DeleteTaskHub", "failed to drop Instances table", err)
 		return fmt.Errorf("failed to drop Instances table: %w", err)
@@ -557,7 +562,27 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *back
 	if err != nil {
 		return -1, fmt.Errorf("failed to count the rows affected: %w", err)
 	}
+	if rows > 0 {
+		if err := insertInstanceTags(ctx, tx, startEvent.OrchestrationInstance.InstanceId, startEvent.Tags); err != nil {
+			return -1, err
+		}
+	}
 	return rows, nil
+}
+
+func insertInstanceTags(ctx context.Context, tx pgx.Tx, instanceID string, tags map[string]string) error {
+	for key, value := range tags {
+		if _, err := tx.Exec(
+			ctx,
+			"INSERT INTO InstanceTags (InstanceID, TagKey, TagValue) VALUES ($1, $2, $3)",
+			instanceID,
+			key,
+			value,
+		); err != nil {
+			return fmt.Errorf("failed to insert instance tag: %w", err)
+		}
+	}
+	return nil
 }
 
 func (be *postgresBackend) handleInstanceExists(ctx context.Context, tx pgx.Tx, startEvent *protos.ExecutionStartedEvent, policy *api.OrchestrationIdReusePolicy, e *backend.HistoryEvent) error {
@@ -652,6 +677,11 @@ func (be *postgresBackend) cleanupOrchestrationStateInternal(ctx context.Context
 		return fmt.Errorf("failed to delete from History table: %w", err)
 	}
 
+	_, err = tx.Exec(ctx, "DELETE FROM InstanceTags WHERE InstanceID = $1", string(id))
+	if err != nil {
+		return fmt.Errorf("failed to delete from InstanceTags table: %w", err)
+	}
+
 	_, err = tx.Exec(ctx, "DELETE FROM NewEvents WHERE InstanceID = $1", string(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete from NewEvents table: %w", err)
@@ -698,25 +728,27 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 
 	row := be.db.QueryRow(
 		ctx,
-		`SELECT InstanceID, Name, Version, ParentInstanceID, RuntimeStatus, CreatedTime, LastUpdatedTime, Input, Output, CustomStatus, FailureDetails
+		`SELECT InstanceID, ExecutionID, Name, Version, ParentInstanceID, RuntimeStatus, CreatedTime, LastUpdatedTime, CompletedTime, Input, Output, CustomStatus, FailureDetails
 		FROM Instances WHERE InstanceID = $1`,
 		string(iid),
 	)
 
 	var instanceID *string
+	var executionID *string
 	var name *string
 	var version *string
 	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
 	var lastUpdatedAt *time.Time
+	var completedAt *time.Time
 	var input *string
 	var output *string
 	var customStatus *string
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err := row.Scan(&instanceID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err := row.Scan(&instanceID, &executionID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -756,9 +788,20 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 	if version != nil {
 		metadata.Version = *version
 	}
+	if executionID != nil {
+		metadata.ExecutionID = *executionID
+	}
 	if parentInstanceID != nil {
 		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
 	}
+	if completedAt != nil {
+		metadata.CompletedAt = *completedAt
+	}
+	tags, err := be.getInstanceTags(ctx, []api.InstanceID{iid})
+	if err != nil {
+		return nil, err
+	}
+	metadata.Tags = tags[iid]
 	return metadata, nil
 }
 

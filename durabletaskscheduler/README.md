@@ -33,6 +33,52 @@ keys include `ClientID`, `TenantID`, `TokenFilePath`, and
 worker recreates channels after transient disconnects and closes retired
 channels only after their in-flight completions have drained.
 
+### Advanced management
+
+`TaskHubGrpcClient` exposes bounded `QueryInstances` and `ListInstanceIDs`
+operations with opaque continuation tokens, plus `RestartInstance`,
+`RewindInstance`, batch/filter `PurgeInstances`,
+`SkipGracefulOrchestrationTerminations`, and task-hub lifecycle RPCs. Queries
+can filter locally by exact tag key/value pairs when the current wire contract
+does not carry tag filters.
+
+The embedded sqlite and Postgres sidecar implementations support these
+operations directly. The current DTS emulator supports query, restart, and
+batch purge, but has known service limitations: `SkipGracefulOrchestrationTerminations`
+is unimplemented, rewind can return success without transitioning the failed
+instance, filtered purge can complete without deleting matches, and
+`ListInstanceIds` can omit matching IDs. The emulator integration tests record
+these limitations explicitly.
+
+### Worker routing and capabilities
+
+Use `client.WithWorkItemFilters` to advertise and locally enforce accepted
+orchestration/activity names and versions. Local enforcement is a fallback for
+services that ignore the filter request. Capability advertisement is explicit:
+history streaming is enabled by default, while scheduled tasks use
+`client.WithScheduledTaskCapability(true)`.
+
+### Large payloads
+
+Large payload support uses an opaque, integrity-checked reference encoded in
+the existing string payload fields, so no cloud storage dependency is required.
+Configure a shared store/resolver for both the management client and worker:
+
+```go
+store := payload.NewMemoryStore()
+options.LargePayloads = &api.LargePayloadOptions{
+    Store:            store,
+    Resolver:         store,
+    ThresholdBytes:   64 * 1024,
+    MaxPayloadBytes:  64 * 1024 * 1024,
+}
+```
+
+`payload.NewFileStore` provides a bounded local-file implementation. Workers
+advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured. The same
+abstraction can be used with embedded backends through
+`backend.NewLargePayloadBackend`.
+
 ## Worker lifecycle
 
 Use `Start` for background execution or `Run` for blocking execution. `Shutdown`
@@ -43,8 +89,13 @@ cancels them only if the shutdown context expires.
 
 | Feature | Status |
 | --- | --- |
-| Schedule, query, and wait for orchestrations | Supported |
-| Raise events, suspend/resume, terminate, and purge | Supported |
+| Schedule, bounded query/list, and wait for orchestrations | Supported |
+| Tags on schedule, metadata, query, sub-orchestration, continue-as-new, restart, and rewind | Supported |
+| Restart and batch/filter purge | Supported; see emulator limitations above |
+| Rewind | Supported by embedded sqlite/Postgres; current emulator does not transition instances |
+| Skip-graceful termination | Supported by embedded sqlite/Postgres; current emulator returns `Unimplemented` |
+| Task-hub create/delete | Supported by embedded sidecars; remote-service behavior is provider-specific |
+| Raise events, suspend/resume, terminate, and single-instance purge | Supported |
 | Orchestration and activity execution | Supported |
 | Bounded orchestration/activity/entity concurrency | Supported |
 | Work-item filters for orchestrations, activities, and entities | Supported |
@@ -52,8 +103,9 @@ cancels them only if the shutdown context expires.
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
 | Streamed orchestration history | Supported and advertised |
 | Version-aware dispatch | Supported with `client.WithTaskExecutorOptions(task.WithVersioning(...))` |
-| Scheduled-task capability | Not advertised |
-| Large-payload capability | Not advertised |
+| Name/version work-item filters | Supported, advertised, and locally enforced |
+| Scheduled-task capability | Supported; opt in with `client.WithScheduledTaskCapability(true)` |
+| Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
 | Legacy instance-ID `IGNORE` | Known-compatible local sidecars only, with `client.WithLegacyOrchestrationIDReusePolicyWire`; rejected for DTS because the current wire format is ambiguous |

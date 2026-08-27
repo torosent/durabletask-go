@@ -1,0 +1,189 @@
+package largepayload
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/payload"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+func TestExternalizeAndHydrate(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  4,
+		MaxPayloadBytes: 1024,
+	}
+	externalized, err := Externalize(context.Background(), options, wrapperspb.String("large payload"))
+	require.NoError(t, err)
+	require.NotEqual(t, "large payload", externalized.GetValue())
+
+	hydrated, err := Hydrate(context.Background(), options, externalized)
+	require.NoError(t, err)
+	require.Equal(t, "large payload", hydrated.GetValue())
+}
+
+func TestLargePayloadIntegrityFailure(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	externalized, err := Externalize(context.Background(), options, wrapperspb.String("payload"))
+	require.NoError(t, err)
+
+	options.Resolver = staticResolver{payload: []byte("tampered")}
+	_, err = Hydrate(context.Background(), options, externalized)
+	require.ErrorIs(t, err, api.ErrLargePayloadIntegrity)
+}
+
+func TestLargePayloadLimitAndMalformedReference(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 4,
+	}
+	_, err := Externalize(context.Background(), options, wrapperspb.String("oversized"))
+	require.ErrorIs(t, err, api.ErrLargePayloadTooLarge)
+
+	_, err = Hydrate(context.Background(), options, wrapperspb.String(referencePrefix+"not-base64"))
+	require.ErrorIs(t, err, api.ErrLargePayloadReference)
+}
+
+func TestTransformOrchestratorResponsePayloadFields(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	response := &protos.OrchestratorResponse{
+		CustomStatus: wrapperspb.String("status"),
+		Actions: []*protos.OrchestratorAction{
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_ScheduleTask{
+					ScheduleTask: &protos.ScheduleTaskAction{Input: wrapperspb.String("activity")},
+				},
+			},
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_CreateSubOrchestration{
+					CreateSubOrchestration: &protos.CreateSubOrchestrationAction{Input: wrapperspb.String("child")},
+				},
+			},
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_CompleteOrchestration{
+					CompleteOrchestration: &protos.CompleteOrchestrationAction{Result: wrapperspb.String("result")},
+				},
+			},
+		},
+	}
+	require.NoError(t, TransformOrchestratorResponse(context.Background(), options, response))
+
+	for _, value := range []*wrapperspb.StringValue{
+		response.CustomStatus,
+		response.Actions[0].GetScheduleTask().Input,
+		response.Actions[1].GetCreateSubOrchestration().Input,
+		response.Actions[2].GetCompleteOrchestration().Result,
+	} {
+		hydrated, err := Hydrate(context.Background(), options, value)
+		require.NoError(t, err)
+		require.NotEqual(t, value.GetValue(), hydrated.GetValue())
+	}
+}
+
+func TestTransformHistoryEventPayloadFields(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	tests := []struct {
+		name  string
+		event *protos.HistoryEvent
+		value func(*protos.HistoryEvent) *wrapperspb.StringValue
+	}{
+		{
+			name: "event raised",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EventRaised{
+				EventRaised: &protos.EventRaisedEvent{Input: wrapperspb.String("raised")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetEventRaised().Input
+			},
+		},
+		{
+			name: "event sent",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EventSent{
+				EventSent: &protos.EventSentEvent{Input: wrapperspb.String("sent")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetEventSent().Input
+			},
+		},
+		{
+			name: "termination",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_ExecutionTerminated{
+				ExecutionTerminated: &protos.ExecutionTerminatedEvent{Input: wrapperspb.String("terminated")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetExecutionTerminated().Input
+			},
+		},
+		{
+			name: "continue as new",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_ContinueAsNew{
+				ContinueAsNew: &protos.ContinueAsNewEvent{Input: wrapperspb.String("continued")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetContinueAsNew().Input
+			},
+		},
+		{
+			name: "rewind",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_ExecutionRewound{
+				ExecutionRewound: &protos.ExecutionRewoundEvent{Input: wrapperspb.String("rewound")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetExecutionRewound().Input
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := test.value(test.event).GetValue()
+			require.NoError(t, TransformHistoryEvent(context.Background(), options, test.event, true))
+			require.NotEqual(t, original, test.value(test.event).GetValue())
+			require.NoError(t, TransformHistoryEvent(context.Background(), options, test.event, false))
+			require.Equal(t, original, test.value(test.event).GetValue())
+		})
+	}
+}
+
+type staticResolver struct {
+	payload []byte
+	err     error
+}
+
+func (r staticResolver) Resolve(context.Context, string) ([]byte, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return append([]byte(nil), r.payload...), nil
+}
+
+func (staticResolver) Store(context.Context, []byte) (string, error) {
+	return "", errors.New("not implemented")
+}

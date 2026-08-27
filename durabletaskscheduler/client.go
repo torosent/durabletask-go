@@ -43,8 +43,12 @@ func NewClient(ctx context.Context, options *Options, logger backend.Logger) (*C
 		return nil, fmt.Errorf("DTS client Hello failed: %w", err)
 	}
 	return &Client{
-		TaskHubGrpcClient: durabletaskclient.NewTaskHubGrpcClient(connection, logger),
-		connection:        connection,
+		TaskHubGrpcClient: durabletaskclient.NewTaskHubGrpcClient(
+			connection,
+			logger,
+			durabletaskclient.WithLargePayloads(prepared.LargePayloads),
+		),
+		connection: connection,
 	}, nil
 }
 

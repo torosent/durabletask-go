@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/cenkalti/backoff/v4"
@@ -16,6 +17,7 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
+	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
 
@@ -26,6 +28,7 @@ type TaskHubGrpcClient struct {
 	connection                   grpc.ClientConnInterface
 	logger                       backend.Logger
 	allowLegacyIDReusePolicyWire bool
+	largePayloads                *api.LargePayloadOptions
 
 	listenerMu sync.Mutex
 	listener   *TaskHubGrpcWorker
@@ -41,6 +44,18 @@ var ErrUnsupportedOrchestrationIDReusePolicy = errors.New("orchestration ID reus
 func WithLegacyOrchestrationIDReusePolicyWire() TaskHubGrpcClientOption {
 	return func(c *TaskHubGrpcClient) {
 		c.allowLegacyIDReusePolicyWire = true
+	}
+}
+
+// WithLargePayloads configures externalization and hydration for management payloads.
+func WithLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcClientOption {
+	return func(c *TaskHubGrpcClient) {
+		if options == nil {
+			c.largePayloads = nil
+			return
+		}
+		clone := *options
+		c.largePayloads = &clone
 	}
 }
 
@@ -76,6 +91,11 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		} else {
 			req.InstanceId = uuid.NewString()
 		}
+	}
+	var err error
+	req.Input, err = largepayload.Externalize(ctx, c.largePayloads, req.Input)
+	if err != nil {
+		return api.EmptyInstanceID, fmt.Errorf("failed to externalize orchestration input: %w", err)
 	}
 
 	resp, err := c.client.StartInstance(ctx, req)
@@ -126,7 +146,7 @@ func (c *TaskHubGrpcClient) FetchOrchestrationMetadata(ctx context.Context, id a
 		}
 		return nil, fmt.Errorf("failed to fetch orchestration metadata: %w", err)
 	}
-	return makeOrchestrationMetadata(resp)
+	return c.makeOrchestrationMetadata(ctx, resp)
 }
 
 // WaitForOrchestrationStart waits for an orchestration to start running and returns an [api.OrchestrationMetadata] object that contains
@@ -151,7 +171,7 @@ func (c *TaskHubGrpcClient) WaitForOrchestrationStart(ctx context.Context, id ap
 	if err != nil {
 		return nil, err
 	}
-	return makeOrchestrationMetadata(resp)
+	return c.makeOrchestrationMetadata(ctx, resp)
 }
 
 // WaitForOrchestrationCompletion waits for an orchestration to complete and returns an [api.OrchestrationMetadata] object that contains
@@ -176,7 +196,7 @@ func (c *TaskHubGrpcClient) WaitForOrchestrationCompletion(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	return makeOrchestrationMetadata(resp)
+	return c.makeOrchestrationMetadata(ctx, resp)
 }
 
 // TerminateOrchestration terminates a running orchestration by causing it to stop receiving new events and
@@ -188,8 +208,13 @@ func (c *TaskHubGrpcClient) TerminateOrchestration(ctx context.Context, id api.I
 			return fmt.Errorf("failed to configure termination request: %w", err)
 		}
 	}
+	var err error
+	req.Output, err = largepayload.Externalize(ctx, c.largePayloads, req.Output)
+	if err != nil {
+		return fmt.Errorf("failed to externalize termination output: %w", err)
+	}
 
-	_, err := c.client.TerminateInstance(ctx, req)
+	_, err = c.client.TerminateInstance(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -206,6 +231,11 @@ func (c *TaskHubGrpcClient) RaiseEvent(ctx context.Context, id api.InstanceID, e
 		if err := configure(req); err != nil {
 			return fmt.Errorf("failed to configure raise event request: %w", err)
 		}
+	}
+	var err error
+	req.Input, err = largepayload.Externalize(ctx, c.largePayloads, req.Input)
+	if err != nil {
+		return fmt.Errorf("failed to externalize event payload: %w", err)
 	}
 
 	if _, err := c.client.RaiseEvent(ctx, req); err != nil {
@@ -422,27 +452,50 @@ func makeGetInstanceRequest(id api.InstanceID, opts []api.FetchOrchestrationMeta
 
 // makeOrchestrationMetadata validates and converts protos.GetInstanceResponse to api.OrchestrationMetadata
 // api.ErrInstanceNotFound is returned when the specified orchestration doesn't exist.
-func makeOrchestrationMetadata(resp *protos.GetInstanceResponse) (*api.OrchestrationMetadata, error) {
+func (c *TaskHubGrpcClient) makeOrchestrationMetadata(
+	ctx context.Context,
+	resp *protos.GetInstanceResponse,
+) (*api.OrchestrationMetadata, error) {
 	if !resp.Exists {
 		return nil, api.ErrInstanceNotFound
 	}
 	if resp.OrchestrationState == nil {
 		return nil, fmt.Errorf("orchestration state is nil")
 	}
+	if err := largepayload.TransformOrchestrationState(ctx, c.largePayloads, resp.OrchestrationState); err != nil {
+		return nil, fmt.Errorf("failed to hydrate orchestration metadata: %w", err)
+	}
+	return orchestrationMetadataFromState(resp.OrchestrationState)
+}
+
+func orchestrationMetadataFromState(state *protos.OrchestrationState) (*api.OrchestrationMetadata, error) {
+	if state == nil {
+		return nil, errors.New("orchestration state is nil")
+	}
 	metadata := &api.OrchestrationMetadata{
-		InstanceID:             api.InstanceID(resp.OrchestrationState.InstanceId),
-		Name:                   resp.OrchestrationState.Name,
-		Version:                resp.OrchestrationState.Version.GetValue(),
-		RuntimeStatus:          resp.OrchestrationState.OrchestrationStatus,
-		SerializedInput:        resp.OrchestrationState.Input.GetValue(),
-		SerializedCustomStatus: resp.OrchestrationState.CustomStatus.GetValue(),
-		SerializedOutput:       resp.OrchestrationState.Output.GetValue(),
+		InstanceID:             api.InstanceID(state.InstanceId),
+		Name:                   state.Name,
+		Version:                state.Version.GetValue(),
+		ExecutionID:            state.ExecutionId.GetValue(),
+		ParentInstanceID:       api.InstanceID(state.ParentInstanceId.GetValue()),
+		RuntimeStatus:          state.OrchestrationStatus,
+		SerializedInput:        state.Input.GetValue(),
+		SerializedCustomStatus: state.CustomStatus.GetValue(),
+		SerializedOutput:       state.Output.GetValue(),
+		FailureDetails:         state.FailureDetails,
+		Tags:                   maps.Clone(state.Tags),
 	}
-	if resp.OrchestrationState.CreatedTimestamp != nil {
-		metadata.CreatedAt = resp.OrchestrationState.CreatedTimestamp.AsTime()
+	if state.ScheduledStartTimestamp != nil {
+		metadata.ScheduledStartAt = state.ScheduledStartTimestamp.AsTime()
 	}
-	if resp.OrchestrationState.LastUpdatedTimestamp != nil {
-		metadata.LastUpdatedAt = resp.OrchestrationState.LastUpdatedTimestamp.AsTime()
+	if state.CreatedTimestamp != nil {
+		metadata.CreatedAt = state.CreatedTimestamp.AsTime()
+	}
+	if state.LastUpdatedTimestamp != nil {
+		metadata.LastUpdatedAt = state.LastUpdatedTimestamp.AsTime()
+	}
+	if state.CompletedTimestamp != nil {
+		metadata.CompletedAt = state.CompletedTimestamp.AsTime()
 	}
 	return metadata, nil
 }

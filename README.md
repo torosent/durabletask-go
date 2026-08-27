@@ -59,6 +59,12 @@ registry.AddOrchestratorN("read-counter", func(ctx *task.OrchestrationContext) (
 
 See the complete [durable entities sample](./samples/entity).
 
+Advanced management includes bounded queries and ID listing, restart/rewind,
+batch and filtered purge, immediate termination, tags, and explicit worker
+capabilities. Large payloads can be externalized without a cloud dependency by
+configuring an `api.LargePayloadOptions` store/resolver on DTS clients/workers
+or by wrapping an embedded backend with `backend.NewLargePayloadBackend`.
+
 ## Creating the standalone gRPC sidecar
 
 See the `main.go` file for an example of how to create a standalone gRPC sidecar that embeds the Durable Task engine. In short, you must create an `Backend` (for storage), an `Executor` (for executing user code), and host them as a `TaskHubWorker`.

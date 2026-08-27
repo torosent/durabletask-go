@@ -392,6 +392,8 @@ func (ctx *OrchestrationContext) getNextHistoryEvent() (*protos.HistoryEvent, bo
 func countsTowardTurnBudget(event *protos.HistoryEvent) bool {
 	return event.GetOrchestratorStarted() == nil &&
 		event.GetOrchestratorCompleted() == nil &&
+		event.GetGenericEvent() == nil &&
+		event.GetExecutionRewound() == nil &&
 		event.GetExecutionTerminated() == nil &&
 		event.GetExecutionSuspended() == nil &&
 		event.GetExecutionResumed() == nil
@@ -467,6 +469,8 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 		err = ctx.onExecutionTerminated(et)
 	} else if oc := e.GetOrchestratorCompleted(); oc != nil {
 		// Nothing to do
+	} else if e.GetGenericEvent() != nil || e.GetExecutionRewound() != nil {
+		// Backend control markers are replay no-ops.
 	} else {
 		err = fmt.Errorf("don't know how to handle event: %v", e)
 	}
