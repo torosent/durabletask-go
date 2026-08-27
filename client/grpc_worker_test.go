@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/payload"
@@ -313,6 +314,14 @@ func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
 	require.False(t, matchesWorkItemFilters(filters, false, "activity", "v1"))
 	require.True(t, matchesWorkItemFilters(filters, true, "orchestration", "v1"))
 	require.True(t, matchesEntityWorkItemFilters(filters, "counter"))
+	wire := workItemFiltersToProto(&WorkItemFilters{
+		RejectAllOrchestrations: true,
+		RejectAllActivities:     true,
+		RejectAllEntities:       true,
+	})
+	require.Equal(t, helpers.RejectAllWorkItemFilterName, wire.Orchestrations[0].Name)
+	require.Equal(t, helpers.RejectAllWorkItemFilterName, wire.Activities[0].Name)
+	require.Equal(t, helpers.RejectAllWorkItemFilterName, wire.Entities[0].Name)
 }
 
 func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T) {

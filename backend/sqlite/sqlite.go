@@ -436,9 +436,10 @@ func (be *sqliteBackend) CreateOrchestrationInstance(ctx context.Context, e *bac
 
 	_, err = tx.ExecContext(
 		ctx,
-		`INSERT INTO NewEvents ([InstanceID], [EventPayload]) VALUES (?, ?)`,
+		`INSERT INTO NewEvents ([InstanceID], [EventPayload], [VisibleTime]) VALUES (?, ?, ?)`,
 		instanceID,
 		eventPayload,
+		orchestrationVisibleTime(e),
 	)
 
 	if err != nil {
@@ -655,6 +656,28 @@ func (be *sqliteBackend) cleanupOrchestrationStateInternal(ctx context.Context, 
 	_, err = tx.ExecContext(ctx, "DELETE FROM NewTasks WHERE [InstanceID] = ?", string(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete from NewTasks table: %w", err)
+	}
+	if err := be.releaseEntityLocksForOwnerTx(ctx, tx, id); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (be *sqliteBackend) releaseEntityLocksForOwnerTx(ctx context.Context, tx *sql.Tx, id api.InstanceID) error {
+	if _, err := tx.ExecContext(
+		ctx,
+		`DELETE FROM EntityMessages
+		WHERE [ParentInstanceID] = ? AND [MessageKind] IN ('lock', 'unlock', 'call')`,
+		string(id),
+	); err != nil {
+		return fmt.Errorf("failed to delete entity messages for orchestration %s: %w", id, err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		"UPDATE Entities SET [LockedBy] = NULL WHERE [LockedBy] = ?",
+		string(id),
+	); err != nil {
+		return fmt.Errorf("failed to release entity locks for orchestration %s: %w", id, err)
 	}
 	return nil
 }
@@ -1472,7 +1495,7 @@ func (be *sqliteBackend) CompleteEntityWorkItem(ctx context.Context, wi *backend
 				return err
 			}
 			if err == nil {
-				if err := be.insertOrchestrationEventTx(ctx, tx, instanceID, event, nil); err != nil {
+				if err := be.insertOrchestrationEventTx(ctx, tx, instanceID, event, orchestrationVisibleTime(event)); err != nil {
 					return err
 				}
 			}
@@ -1820,6 +1843,14 @@ func nullString(value string) any {
 	return value
 }
 
+func orchestrationVisibleTime(event *protos.HistoryEvent) *time.Time {
+	if event == nil || event.GetExecutionStarted().GetScheduledStartTimestamp() == nil {
+		return nil
+	}
+	value := event.GetExecutionStarted().GetScheduledStartTimestamp().AsTime()
+	return &value
+}
+
 func (be *sqliteBackend) PurgeOrchestrationState(ctx context.Context, id api.InstanceID) error {
 	if err := be.ensureDB(); err != nil {
 		return err
@@ -1913,6 +1944,9 @@ func (be *sqliteBackend) ensureScheduledStartColumn(ctx context.Context) error {
 		return nil
 	}
 	if _, err := be.db.ExecContext(ctx, "ALTER TABLE Instances ADD COLUMN [ScheduledStartTime] DATETIME NULL"); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return nil
+		}
 		return fmt.Errorf("failed to add ScheduledStartTime column: %w", err)
 	}
 	return nil

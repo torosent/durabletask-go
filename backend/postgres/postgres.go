@@ -479,9 +479,10 @@ func (be *postgresBackend) CreateOrchestrationInstance(ctx context.Context, e *b
 
 	_, err = tx.Exec(
 		ctx,
-		`INSERT INTO NewEvents (InstanceID, EventPayload) VALUES ($1, $2)`,
+		`INSERT INTO NewEvents (InstanceID, EventPayload, VisibleTime) VALUES ($1, $2, $3)`,
 		instanceID,
 		eventPayload,
+		orchestrationVisibleTime(e),
 	)
 
 	if err != nil {
@@ -694,6 +695,28 @@ func (be *postgresBackend) cleanupOrchestrationStateInternal(ctx context.Context
 	_, err = tx.Exec(ctx, "DELETE FROM NewTasks WHERE InstanceID = $1", string(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete from NewTasks table: %w", err)
+	}
+	if err := be.releaseEntityLocksForOwnerTx(ctx, tx, id); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (be *postgresBackend) releaseEntityLocksForOwnerTx(ctx context.Context, tx pgx.Tx, id api.InstanceID) error {
+	if _, err := tx.Exec(
+		ctx,
+		`DELETE FROM EntityMessages
+		WHERE ParentInstanceID = $1 AND MessageKind IN ('lock', 'unlock', 'call')`,
+		string(id),
+	); err != nil {
+		return fmt.Errorf("failed to delete entity messages for orchestration %s: %w", id, err)
+	}
+	if _, err := tx.Exec(
+		ctx,
+		"UPDATE Entities SET LockedBy = NULL WHERE LockedBy = $1",
+		string(id),
+	); err != nil {
+		return fmt.Errorf("failed to release entity locks for orchestration %s: %w", id, err)
 	}
 	return nil
 }
@@ -1528,7 +1551,7 @@ func (be *postgresBackend) CompleteEntityWorkItem(ctx context.Context, wi *backe
 				return err
 			}
 			if err == nil {
-				if err := be.insertOrchestrationEventTx(ctx, tx, instanceID, event, nil); err != nil {
+				if err := be.insertOrchestrationEventTx(ctx, tx, instanceID, event, orchestrationVisibleTime(event)); err != nil {
 					return err
 				}
 			}
@@ -1876,6 +1899,14 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+func orchestrationVisibleTime(event *protos.HistoryEvent) *time.Time {
+	if event == nil || event.GetExecutionStarted().GetScheduledStartTimestamp() == nil {
+		return nil
+	}
+	value := event.GetExecutionStarted().GetScheduledStartTimestamp().AsTime()
+	return &value
 }
 
 func (be *postgresBackend) PurgeOrchestrationState(ctx context.Context, id api.InstanceID) error {

@@ -7,6 +7,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const RejectAllWorkItemFilterName = "\x00__durabletask_reject_all__"
+
 func GetDefaultWorkerName() string {
 	hostname, err := os.Hostname()
 	if err != nil {

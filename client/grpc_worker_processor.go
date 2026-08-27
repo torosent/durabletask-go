@@ -507,6 +507,9 @@ func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, 
 	if len(candidates) == 0 {
 		return true
 	}
+	if len(candidates) == 0 {
+		return true
+	}
 	for _, filter := range candidates {
 		if filter.Name != name {
 			continue

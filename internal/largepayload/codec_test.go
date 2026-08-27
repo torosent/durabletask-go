@@ -248,6 +248,13 @@ func TestTransformEntityBatchPayloadFields(t *testing.T) {
 	require.NoError(t, err)
 	request.Operations[0].Input, err = Externalize(context.Background(), options, request.Operations[0].Input)
 	require.NoError(t, err)
+	require.ErrorIs(t, TransformEntityBatchRequest(context.Background(), nil, &protos.EntityBatchRequest{
+		EntityState: request.EntityState,
+		Operations:  []*protos.OperationRequest{{Input: request.Operations[0].Input}},
+	}), api.ErrFeatureNotSupported)
+	require.ErrorIs(t, TransformEntityBatchResult(context.Background(), nil, &protos.EntityBatchResult{
+		EntityState: request.EntityState,
+	}), api.ErrFeatureNotSupported)
 	require.NoError(t, TransformEntityBatchRequest(context.Background(), options, request))
 	require.Equal(t, "state", request.EntityState.GetValue())
 	require.Equal(t, "input", request.Operations[0].Input.GetValue())

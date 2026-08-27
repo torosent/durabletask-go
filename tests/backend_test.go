@@ -115,14 +115,32 @@ func Test_EntityBackend_PersistenceOrderingAbandonAndCleanup(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, workItem.Operations, 1)
 		assert.Equal(t, scheduledID, workItem.Operations[0].GetEntityOperationSignaled().RequestId)
+		childID := fmt.Sprintf("entity-scheduled-child-%d", index)
+		childStart := time.Now().UTC().Add(150 * time.Millisecond)
 		workItem.Result = &protos.EntityBatchResult{
 			EntityState: wrapperspb.String("4"),
 			Results: []*protos.OperationResult{{
 				ResultType: &protos.OperationResult_Success{Success: &protos.OperationResultSuccess{Result: wrapperspb.String("4")}},
 			}},
 			OperationInfos: []*protos.OperationInfo{{RequestId: scheduledID}},
+			Actions: []*protos.OperationAction{{
+				OperationActionType: &protos.OperationAction_StartNewOrchestration{
+					StartNewOrchestration: &protos.StartNewOrchestrationAction{
+						InstanceId:    childID,
+						Name:          "scheduled-child",
+						ScheduledTime: timestamppb.New(childStart),
+					},
+				},
+			}},
 		}
 		require.NoError(t, entityBackend.CompleteEntityWorkItem(ctx, workItem))
+		_, err = be.GetOrchestrationWorkItem(ctx)
+		require.ErrorIs(t, err, backend.ErrNoWorkItems)
+		time.Sleep(time.Until(childStart) + 25*time.Millisecond)
+		childWorkItem, err := be.GetOrchestrationWorkItem(ctx)
+		require.NoError(t, err)
+		require.Equal(t, api.InstanceID(childID), childWorkItem.InstanceID)
+		require.NoError(t, be.AbandonOrchestrationWorkItem(ctx, childWorkItem))
 
 		query, err := entityBackend.QueryEntities(ctx, api.EntityQuery{
 			InstanceIDStartsWith: entityID.String(),

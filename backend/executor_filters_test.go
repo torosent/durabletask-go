@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -32,6 +33,11 @@ func TestWorkItemMatchesFilters(t *testing.T) {
 			Version: wrapperspb.String("v2"),
 		}},
 	}
+	entity := &protos.WorkItem{
+		Request: &protos.WorkItem_EntityRequestV2{EntityRequestV2: &protos.EntityRequest{
+			InstanceId: "@counter@one",
+		}},
+	}
 	require.True(t, workItemMatchesFilters(&protos.WorkItemFilters{}, orchestration))
 	require.True(t, workItemMatchesFilters(&protos.WorkItemFilters{
 		Orchestrations: []*protos.OrchestrationFilter{{Name: "orchestration", Versions: []string{"v1"}}},
@@ -45,6 +51,23 @@ func TestWorkItemMatchesFilters(t *testing.T) {
 	require.False(t, workItemMatchesFilters(&protos.WorkItemFilters{
 		Activities: []*protos.ActivityFilter{{Name: "activity", Versions: []string{"v1"}}},
 	}, activity))
+	require.True(t, workItemMatchesFilters(&protos.WorkItemFilters{
+		Entities: []*protos.EntityFilter{{Name: "counter"}},
+	}, entity))
+	require.False(t, workItemMatchesFilters(&protos.WorkItemFilters{
+		Entities: []*protos.EntityFilter{{Name: "other"}},
+	}, entity))
+	rejectAll := &protos.WorkItemFilters{
+		Orchestrations: []*protos.OrchestrationFilter{{Name: helpers.RejectAllWorkItemFilterName}},
+		Activities:     []*protos.ActivityFilter{{Name: helpers.RejectAllWorkItemFilterName}},
+		Entities:       []*protos.EntityFilter{{Name: helpers.RejectAllWorkItemFilterName}},
+	}
+	require.False(t, workItemMatchesFilters(rejectAll, orchestration))
+	require.False(t, workItemMatchesFilters(rejectAll, activity))
+	require.False(t, workItemMatchesFilters(rejectAll, entity))
+	require.False(t, workItemMatchesFilters(rejectAll, &protos.WorkItem{
+		Request: &protos.WorkItem_OrchestratorRequest{OrchestratorRequest: &protos.OrchestratorRequest{}},
+	}))
 }
 
 func TestDispatchWorkItemRoutesToMatchingSubscriber(t *testing.T) {

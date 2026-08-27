@@ -14,6 +14,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc"
@@ -678,20 +679,38 @@ func workItemFiltersToProto(filters *WorkItemFilters) *protos.WorkItemFilters {
 		Activities:     make([]*protos.ActivityFilter, 0, len(filters.Activities)),
 		Entities:       make([]*protos.EntityFilter, 0, len(filters.Entities)),
 	}
-	for _, filter := range filters.Orchestrations {
+	if filters.RejectAllOrchestrations {
 		result.Orchestrations = append(result.Orchestrations, &protos.OrchestrationFilter{
-			Name:     filter.Name,
-			Versions: slices.Clone(filter.Versions),
+			Name: helpers.RejectAllWorkItemFilterName,
 		})
+	} else {
+		for _, filter := range filters.Orchestrations {
+			result.Orchestrations = append(result.Orchestrations, &protos.OrchestrationFilter{
+				Name:     filter.Name,
+				Versions: slices.Clone(filter.Versions),
+			})
+		}
 	}
-	for _, filter := range filters.Activities {
+	if filters.RejectAllActivities {
 		result.Activities = append(result.Activities, &protos.ActivityFilter{
-			Name:     filter.Name,
-			Versions: slices.Clone(filter.Versions),
+			Name: helpers.RejectAllWorkItemFilterName,
 		})
+	} else {
+		for _, filter := range filters.Activities {
+			result.Activities = append(result.Activities, &protos.ActivityFilter{
+				Name:     filter.Name,
+				Versions: slices.Clone(filter.Versions),
+			})
+		}
 	}
-	for _, name := range filters.Entities {
-		result.Entities = append(result.Entities, &protos.EntityFilter{Name: name})
+	if filters.RejectAllEntities {
+		result.Entities = append(result.Entities, &protos.EntityFilter{
+			Name: helpers.RejectAllWorkItemFilterName,
+		})
+	} else {
+		for _, name := range filters.Entities {
+			result.Entities = append(result.Entities, &protos.EntityFilter{Name: name})
+		}
 	}
 	return result
 }
