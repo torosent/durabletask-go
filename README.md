@@ -12,7 +12,8 @@ The Durable Task engine is also intended to be used as the basis for the [Dapr e
 
 ## Storage providers
 
-This project includes a [sqlite](https://sqlite.org/) storage provider for persisting app state to disk.
+This project includes [sqlite](https://sqlite.org/) and PostgreSQL storage
+providers for orchestrations, activities, and durable entities.
 
 ```go
 // Persists state to a file named test.sqlite3. Use "" for in-memory storage.
@@ -34,6 +35,30 @@ environment-gated emulator tests.
 See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
 and the [environment-driven sample](./samples/durabletaskscheduler).
 
+## Durable entities
+
+Durable entities are addressable stateful objects that execute operations one at
+a time. The Go SDK supports raw entity functions, struct-based dispatch,
+scheduled signals, orchestration calls, entity-to-entity signals, storage
+queries and cleanup, and ordered multi-entity critical sections. Both local
+storage providers use native entity queues and state tables; the gRPC worker
+accepts legacy `EntityBatchRequest` and current `EntityRequestV2` work items.
+
+```go
+registry.AddEntityN("counter", task.NewEntityFor[Counter]())
+counter := api.NewEntityID("counter", "orders")
+
+client.SignalEntity(ctx, counter, "Add", api.WithSignalInput(1))
+
+registry.AddOrchestratorN("read-counter", func(ctx *task.OrchestrationContext) (any, error) {
+    var value int
+    err := ctx.CallEntity(counter, "Get").Await(&value)
+    return value, err
+})
+```
+
+See the complete [durable entities sample](./samples/entity).
+
 ## Creating the standalone gRPC sidecar
 
 See the `main.go` file for an example of how to create a standalone gRPC sidecar that embeds the Durable Task engine. In short, you must create an `Backend` (for storage), an `Executor` (for executing user code), and host them as a `TaskHubWorker`.
@@ -50,12 +75,24 @@ be := sqlite.NewSqliteBackend(sqliteOptions, logger)
 
 // Create a gRPC server that the language SDKs will connect to
 grpcServer := grpc.NewServer()
-executor := backend.NewGrpcExecutor(grpcServer, be, logger)
+executor, register := backend.NewGrpcExecutor(be, logger)
+register(grpcServer)
 
-// Construct and start the task hub worker object, which polls the backend for new work
+// Construct and start the task hub workers, which poll each durable queue.
 orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger)
 activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
-taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger)
+entityWorker := backend.NewEntityWorker(
+    be.(backend.EntityBackend),
+    executor.(backend.EntityExecutor),
+    logger,
+)
+taskHubWorker := backend.NewTaskHubWorker(
+    be,
+    orchestrationWorker,
+    activityWorker,
+    logger,
+    entityWorker,
+)
 taskHubWorker.Start(context.Background())
 
 // Start listening.

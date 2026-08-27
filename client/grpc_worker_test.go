@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -76,6 +77,7 @@ type fakeSidecarClient struct {
 
 	orchestrationCompletions []*protos.OrchestratorResponse
 	activityCompletions      []*protos.ActivityResponse
+	entityCompletions        []*protos.EntityBatchResult
 	orchestrationAbandons    int
 	activityAbandons         int
 	entityAbandonAttempts    int
@@ -117,6 +119,17 @@ func (c *fakeSidecarClient) CompleteActivityTask(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.activityCompletions = append(c.activityCompletions, response)
+	return &protos.CompleteTaskResponse{}, nil
+}
+
+func (c *fakeSidecarClient) CompleteEntityTask(
+	_ context.Context,
+	response *protos.EntityBatchResult,
+	_ ...grpc.CallOption,
+) (*protos.CompleteTaskResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entityCompletions = append(c.entityCompletions, response)
 	return &protos.CompleteTaskResponse{}, nil
 }
 
@@ -167,6 +180,7 @@ func (c *fakeSidecarClient) AbandonTaskEntityWorkItem(
 type recordingExecutor struct {
 	executeOrchestrator func(context.Context, api.InstanceID, []*protos.HistoryEvent, []*protos.HistoryEvent) (*backend.ExecutionResults, error)
 	executeActivity     func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error)
+	executeEntity       func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
 }
 
 func (e *recordingExecutor) ExecuteOrchestrator(
@@ -188,6 +202,13 @@ func (e *recordingExecutor) ExecuteActivity(
 
 func (*recordingExecutor) Shutdown(context.Context) error {
 	return nil
+}
+
+func (e *recordingExecutor) ExecuteEntity(
+	ctx context.Context,
+	request *protos.EntityBatchRequest,
+) (*protos.EntityBatchResult, error) {
+	return e.executeEntity(ctx, request)
 }
 
 func newFakeWorker(t *testing.T, client *fakeSidecarClient, opts ...TaskHubGrpcWorkerOption) *TaskHubGrpcWorker {
@@ -225,6 +246,10 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 		client,
 		WithMaxConcurrentOrchestrationWorkItems(2),
 		WithMaxConcurrentActivityWorkItems(3),
+		WithMaxConcurrentEntityWorkItems(4),
+		WithWorkItemFilters(WorkItemFilters{
+			Entities: []string{"counter"},
+		}),
 	)
 	worker.executor = &recordingExecutor{
 		executeActivity: func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error) {
@@ -259,6 +284,8 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 	client.mu.Lock()
 	require.EqualValues(t, 2, client.request.MaxConcurrentOrchestrationWorkItems)
 	require.EqualValues(t, 3, client.request.MaxConcurrentActivityWorkItems)
+	require.EqualValues(t, 4, client.request.MaxConcurrentEntityWorkItems)
+	require.Equal(t, "counter", client.request.WorkItemFilters.Entities[0].Name)
 	require.Equal(t, []protos.WorkerCapability{
 		protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING,
 	}, client.request.Capabilities)
@@ -414,15 +441,83 @@ func TestTaskHubGrpcWorkerAppliesActivityBackpressure(t *testing.T) {
 	require.NoError(t, worker.Shutdown(context.Background()))
 }
 
-func TestTaskHubGrpcWorkerAbandonsUnsupportedEntityWithBoundedRetry(t *testing.T) {
-	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{
-		stream:                stream,
-		entityAbandonFailures: 2,
+func TestTaskHubGrpcWorkerCompletesLegacyAndV2EntityBatches(t *testing.T) {
+	stream := newFakeWorkItemStream(2)
+	client := &fakeSidecarClient{stream: stream}
+	worker := newFakeWorker(t, client, WithMaxConcurrentEntityWorkItems(1))
+	worker.executor = &recordingExecutor{
+		executeEntity: func(_ context.Context, request *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+			require.Equal(t, "@counter@key", request.InstanceId)
+			require.Len(t, request.Operations, 1)
+			return &protos.EntityBatchResult{
+				Results: []*protos.OperationResult{{
+					ResultType: &protos.OperationResult_Success{
+						Success: &protos.OperationResultSuccess{Result: wrapperspb.String("1")},
+					},
+				}},
+				EntityState: wrapperspb.String("1"),
+			}, nil
+		},
 	}
+	legacyRequestID := uuid.NewString()
+	v2RequestID := uuid.NewString()
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_EntityRequest{EntityRequest: &protos.EntityBatchRequest{
+			InstanceId: "@counter@key",
+			Operations: []*protos.OperationRequest{{Operation: "add", RequestId: legacyRequestID}},
+		}},
+		CompletionToken: "legacy-token",
+	}}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_EntityRequestV2{EntityRequestV2: &protos.EntityRequest{
+			InstanceId: "@counter@key",
+			OperationRequests: []*protos.HistoryEvent{{
+				EventType: &protos.HistoryEvent_EntityOperationCalled{
+					EntityOperationCalled: &protos.EntityOperationCalledEvent{
+						RequestId:        v2RequestID,
+						Operation:        "add",
+						ParentInstanceId: wrapperspb.String("caller"),
+					},
+				},
+			}},
+		}},
+		CompletionToken: "v2-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return len(client.entityCompletions) == 2
+	}, time.Second, time.Millisecond)
+	client.mu.Lock()
+	require.Equal(t, "legacy-token", client.entityCompletions[0].CompletionToken)
+	require.Equal(t, "v2-token", client.entityCompletions[1].CompletionToken)
+	require.Len(t, client.entityCompletions[1].OperationInfos, 1)
+	require.Equal(t, v2RequestID, client.entityCompletions[1].OperationInfos[0].RequestId)
+	require.Equal(t, "caller", client.entityCompletions[1].OperationInfos[0].ResponseDestination.InstanceId)
+	client.mu.Unlock()
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerAbandonsInvalidV2EntityWithBoundedRetry(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSidecarClient{stream: stream, entityAbandonFailures: 2}
 	worker := newFakeWorker(t, client)
 	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
-		Request:         &protos.WorkItem_EntityRequest{EntityRequest: &protos.EntityBatchRequest{}},
+		Request: &protos.WorkItem_EntityRequestV2{EntityRequestV2: &protos.EntityRequest{
+			InstanceId: "@counter@key",
+			OperationRequests: []*protos.HistoryEvent{{
+				EventType: &protos.HistoryEvent_EntityOperationSignaled{
+					EntityOperationSignaled: &protos.EntityOperationSignaledEvent{
+						RequestId: "not-a-guid",
+						Operation: "add",
+					},
+				},
+			}},
+		}},
 		CompletionToken: "entity-token",
 	}}
 
