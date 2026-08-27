@@ -100,10 +100,7 @@ func connect(
 	if err != nil {
 		return nil, err
 	}
-	credential, err := resolveCredential(options)
-	if err != nil {
-		return nil, err
-	}
+	credential := options.Credential
 
 	host := endpoint.Host
 	if endpoint.Port() == "" {

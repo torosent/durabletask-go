@@ -26,28 +26,23 @@ func (w *TaskHubGrpcWorker) consumeConnection(run *grpcWorkerRun, connection *gr
 		}
 		observedMessage = true
 
-		if workItem.GetHealthPing() != nil {
+		switch request := workItem.Request.(type) {
+		case *protos.WorkItem_HealthPing:
 			continue
-		}
-		if request := workItem.GetOrchestratorRequest(); request != nil {
-			if err := w.dispatchOrchestration(run, connection, workItem.GetCompletionToken(), request); err != nil {
+		case *protos.WorkItem_OrchestratorRequest:
+			if err := w.dispatchOrchestration(run, connection, workItem.GetCompletionToken(), request.OrchestratorRequest); err != nil {
 				return observedMessage, err
 			}
-			continue
-		}
-		if request := workItem.GetActivityRequest(); request != nil {
-			if err := w.dispatchActivity(run, connection, workItem.GetCompletionToken(), request); err != nil {
+		case *protos.WorkItem_ActivityRequest:
+			if err := w.dispatchActivity(run, connection, workItem.GetCompletionToken(), request.ActivityRequest); err != nil {
 				return observedMessage, err
 			}
-			continue
-		}
-		if workItem.GetEntityRequest() != nil || workItem.GetEntityRequestV2() != nil {
+		case *protos.WorkItem_EntityRequest, *protos.WorkItem_EntityRequestV2:
 			w.logger.Warn("received unsupported entity work item; abandoning it")
 			w.abandonEntity(run.processingCtx, connection.client, workItem.GetCompletionToken())
-			continue
+		default:
+			w.logger.Warnf("received unknown work item type with completion token present=%t", workItem.GetCompletionToken() != "")
 		}
-
-		w.logger.Warnf("received unknown work item type with completion token present=%t", workItem.GetCompletionToken() != "")
 	}
 }
 
@@ -152,7 +147,8 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		CompletionToken:           completionToken,
 		OrchestrationTraceContext: request.OrchestrationTraceContext,
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		response.Actions = []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
 			-1,
 			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
@@ -163,7 +159,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 				ErrorMessage: err.Error(),
 			},
 		)}
-	} else if results == nil || results.Response == nil {
+	case results == nil || results.Response == nil:
 		response.Actions = []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
 			-1,
 			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
@@ -174,7 +170,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 				ErrorMessage: "the orchestration executor returned no response",
 			},
 		)}
-	} else {
+	default:
 		response = proto.Clone(results.Response).(*protos.OrchestratorResponse)
 		response.InstanceId = request.InstanceId
 		response.CompletionToken = completionToken
@@ -198,7 +194,9 @@ func (w *TaskHubGrpcWorker) streamHistory(
 	client protos.TaskHubSidecarServiceClient,
 	request *protos.OrchestratorRequest,
 ) ([]*protos.HistoryEvent, error) {
-	stream, err := client.StreamInstanceHistory(ctx, &protos.StreamInstanceHistoryRequest{
+	historyCtx, cancelHistory := context.WithCancel(ctx)
+	defer cancelHistory()
+	stream, err := client.StreamInstanceHistory(historyCtx, &protos.StreamInstanceHistoryRequest{
 		InstanceId:            request.InstanceId,
 		ExecutionId:           request.ExecutionId,
 		ForWorkItemProcessing: true,
@@ -209,7 +207,16 @@ func (w *TaskHubGrpcWorker) streamHistory(
 
 	var history []*protos.HistoryEvent
 	for {
+		var timedOut atomic.Bool
+		timer := time.AfterFunc(w.options.silentDisconnectTimeout, func() {
+			timedOut.Store(true)
+			cancelHistory()
+		})
 		chunk, recvErr := stream.Recv()
+		timer.Stop()
+		if timedOut.Load() {
+			return nil, errSilentDisconnect
+		}
 		if errors.Is(recvErr, io.EOF) {
 			return history, nil
 		}
@@ -385,16 +392,5 @@ func isTransientWorkerRPCError(err error) bool {
 	if !ok {
 		return false
 	}
-	switch grpcStatus.Code() {
-	case codes.Canceled,
-		codes.DeadlineExceeded,
-		codes.ResourceExhausted,
-		codes.Aborted,
-		codes.Internal,
-		codes.Unavailable,
-		codes.Unknown:
-		return true
-	default:
-		return false
-	}
+	return isTransientWorkerGRPCCode(grpcStatus.Code())
 }

@@ -43,20 +43,23 @@ func (s *fakeWorkItemsStream) Recv() (*protos.WorkItem, error) {
 
 type fakeHistoryStream struct {
 	protos.TaskHubSidecarService_StreamInstanceHistoryClient
-	results []struct {
-		chunk *protos.HistoryChunk
-		err   error
-	}
-	index int
+	ctx    context.Context
+	chunks []*protos.HistoryChunk
+	block  bool
+	index  int
 }
 
 func (s *fakeHistoryStream) Recv() (*protos.HistoryChunk, error) {
-	if s.index >= len(s.results) {
-		return nil, io.EOF
+	if s.index < len(s.chunks) {
+		chunk := s.chunks[s.index]
+		s.index++
+		return chunk, nil
 	}
-	result := s.results[s.index]
-	s.index++
-	return result.chunk, result.err
+	if s.block {
+		<-s.ctx.Done()
+		return nil, s.ctx.Err()
+	}
+	return nil, io.EOF
 }
 
 type fakeSidecarClient struct {
@@ -68,10 +71,12 @@ type fakeSidecarClient struct {
 	stream   *fakeWorkItemsStream
 	request  *protos.GetWorkItemsRequest
 
-	history []*protos.HistoryChunk
+	history       []*protos.HistoryChunk
+	historyBlocks bool
 
 	orchestrationCompletions []*protos.OrchestratorResponse
 	activityCompletions      []*protos.ActivityResponse
+	orchestrationAbandons    int
 	entityAbandonAttempts    int
 	entityAbandonFailures    int
 }
@@ -115,21 +120,22 @@ func (c *fakeSidecarClient) CompleteActivityTask(
 }
 
 func (c *fakeSidecarClient) StreamInstanceHistory(
-	context.Context,
-	*protos.StreamInstanceHistoryRequest,
-	...grpc.CallOption,
+	ctx context.Context,
+	_ *protos.StreamInstanceHistoryRequest,
+	_ ...grpc.CallOption,
 ) (protos.TaskHubSidecarService_StreamInstanceHistoryClient, error) {
-	results := make([]struct {
-		chunk *protos.HistoryChunk
-		err   error
-	}, 0, len(c.history))
-	for _, chunk := range c.history {
-		results = append(results, struct {
-			chunk *protos.HistoryChunk
-			err   error
-		}{chunk: chunk})
-	}
-	return &fakeHistoryStream{results: results}, nil
+	return &fakeHistoryStream{ctx: ctx, chunks: c.history, block: c.historyBlocks}, nil
+}
+
+func (c *fakeSidecarClient) AbandonTaskOrchestratorWorkItem(
+	_ context.Context,
+	_ *protos.AbandonOrchestrationTaskRequest,
+	_ ...grpc.CallOption,
+) (*protos.AbandonOrchestrationTaskResponse, error) {
+	c.mu.Lock()
+	c.orchestrationAbandons++
+	c.mu.Unlock()
+	return &protos.AbandonOrchestrationTaskResponse{}, nil
 }
 
 func (c *fakeSidecarClient) AbandonTaskEntityWorkItem(
@@ -303,6 +309,47 @@ func TestTaskHubGrpcWorkerStreamsRequiredHistory(t *testing.T) {
 	client.mu.Lock()
 	require.Equal(t, "orchestration-token", client.orchestrationCompletions[0].CompletionToken)
 	client.mu.Unlock()
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerAbandonsSilentHistoryStream(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSidecarClient{
+		stream:        stream,
+		historyBlocks: true,
+	}
+	worker := newFakeWorker(t, client, WithWorkerSilentDisconnectTimeout(20*time.Millisecond))
+
+	var executions atomic.Int32
+	worker.executor = &recordingExecutor{
+		executeOrchestrator: func(
+			context.Context,
+			api.InstanceID,
+			[]*protos.HistoryEvent,
+			[]*protos.HistoryEvent,
+		) (*backend.ExecutionResults, error) {
+			executions.Add(1)
+			return &backend.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+		},
+	}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_OrchestratorRequest{OrchestratorRequest: &protos.OrchestratorRequest{
+			InstanceId:               "instance",
+			RequiresHistoryStreaming: true,
+		}},
+		CompletionToken: "orchestration-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.orchestrationAbandons == 1
+	}, time.Second, time.Millisecond)
+	require.Zero(t, executions.Load())
+
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
 }
