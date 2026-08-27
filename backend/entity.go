@@ -107,7 +107,7 @@ func EntityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatc
 			operationInfos = append(operationInfos, &protos.OperationInfo{
 				RequestId: event.RequestId,
 				ResponseDestination: &protos.OrchestrationInstance{
-					InstanceId:  event.ParentInstanceId.Value,
+					InstanceId:  event.ParentInstanceId.GetValue(),
 					ExecutionId: event.ParentExecutionId,
 				},
 			})
