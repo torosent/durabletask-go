@@ -53,9 +53,12 @@ type WorkItemFilter struct {
 }
 
 type WorkItemFilters struct {
-	Orchestrations []WorkItemFilter
-	Activities     []WorkItemFilter
-	Entities       []string
+	Orchestrations          []WorkItemFilter
+	Activities              []WorkItemFilter
+	Entities                []string
+	RejectAllOrchestrations bool
+	RejectAllActivities     bool
+	RejectAllEntities       bool
 }
 
 type taskHubGrpcWorkerOptions struct {
@@ -221,7 +224,7 @@ func WithScheduledTaskCapability(enabled bool) TaskHubGrpcWorkerOption {
 }
 
 // WithWorkItemFilters restricts orchestration/activity names and versions and entity names accepted by the worker.
-// A nil filter means no restrictions. An explicitly empty kind rejects all work items of that kind.
+// A nil per-kind list means no restriction for that kind. RejectAll* explicitly rejects a kind.
 func WithWorkItemFilters(filters *WorkItemFilters) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		if filters == nil {
@@ -616,9 +619,18 @@ func setWorkerCapability(capabilities []WorkerCapability, capability WorkerCapab
 
 func cloneWorkItemFilters(filters *WorkItemFilters) (*WorkItemFilters, error) {
 	result := &WorkItemFilters{
-		Orchestrations: make([]WorkItemFilter, len(filters.Orchestrations)),
-		Activities:     make([]WorkItemFilter, len(filters.Activities)),
-		Entities:       slices.Clone(filters.Entities),
+		RejectAllOrchestrations: filters.RejectAllOrchestrations,
+		RejectAllActivities:     filters.RejectAllActivities,
+		RejectAllEntities:       filters.RejectAllEntities,
+	}
+	if filters.Orchestrations != nil {
+		result.Orchestrations = make([]WorkItemFilter, len(filters.Orchestrations))
+	}
+	if filters.Activities != nil {
+		result.Activities = make([]WorkItemFilter, len(filters.Activities))
+	}
+	if filters.Entities != nil {
+		result.Entities = slices.Clone(filters.Entities)
 	}
 	for i, filter := range filters.Orchestrations {
 		if filter.Name == "" {

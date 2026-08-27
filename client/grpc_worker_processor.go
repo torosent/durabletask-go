@@ -491,8 +491,16 @@ func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, 
 		return true
 	}
 	candidates := filters.Activities
+	rejectAll := filters.RejectAllActivities
 	if orchestration {
 		candidates = filters.Orchestrations
+		rejectAll = filters.RejectAllOrchestrations
+	}
+	if rejectAll {
+		return false
+	}
+	if candidates == nil {
+		return true
 	}
 	for _, filter := range candidates {
 		if filter.Name != name {
@@ -507,6 +515,12 @@ func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, 
 
 func matchesEntityWorkItemFilters(filters *WorkItemFilters, name string) bool {
 	if filters == nil {
+		return true
+	}
+	if filters.RejectAllEntities {
+		return false
+	}
+	if filters.Entities == nil {
 		return true
 	}
 	return slices.Contains(filters.Entities, name)

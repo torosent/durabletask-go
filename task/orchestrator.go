@@ -77,9 +77,10 @@ type OrchestrationContext struct {
 	eventWaiters               map[string]map[*coroutine]struct{}
 	saveBufferedExternalEvents bool
 
-	criticalSectionID        string
-	criticalSectionLocks     []string
-	criticalSectionAvailable map[string]bool
+	criticalSectionID               string
+	criticalSectionLocks            []string
+	criticalSectionAvailable        map[string]bool
+	criticalSectionRequestCommitted bool
 }
 
 // callSubOrchestratorOptions is a struct that holds the options for the CallSubOrchestrator orchestrator method.
@@ -846,9 +847,11 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 	engine.pendingActions[action.Id] = action
 	task := newTaskInScope(engine, ctx.scope)
 	engine.pendingEntityTasks[requestID] = task
-	if engine.criticalSectionID != "" {
+	if sectionID := engine.criticalSectionID; sectionID != "" {
 		task.onCompleted(func() {
-			engine.criticalSectionAvailable[entityKey] = true
+			if engine.criticalSectionID == sectionID && engine.criticalSectionAvailable != nil {
+				engine.criticalSectionAvailable[entityKey] = true
+			}
 		})
 	}
 	return task
@@ -894,6 +897,9 @@ func (ctx *OrchestrationContext) SignalEntity(entityID api.EntityID, operationNa
 // LockEntities acquires an ordered critical section over a set of entities.
 func (ctx *OrchestrationContext) LockEntities(entityIDs ...api.EntityID) (func(), error) {
 	engine := ctx.engineContext()
+	if engine.isTerminated || ctx.scope.isCanceled() {
+		return nil, ErrTaskCanceled
+	}
 	if engine.criticalSectionID != "" {
 		return nil, fmt.Errorf("nested entity critical sections are not supported")
 	}
@@ -925,10 +931,14 @@ func (ctx *OrchestrationContext) LockEntities(entityIDs ...api.EntityID) (func()
 	engine.pendingActions[action.Id] = action
 	engine.criticalSectionID = criticalSectionID
 	engine.criticalSectionLocks = append([]string(nil), lockSet...)
+	engine.criticalSectionRequestCommitted = engine.IsReplaying
 	lockTask := newTaskInScope(engine, ctx.scope)
 	engine.pendingEntityTasks[criticalSectionID] = lockTask
 	if err := lockTask.Await(nil); err != nil {
-		engine.clearCriticalSection()
+		if !engine.criticalSectionRequestCommitted {
+			delete(engine.pendingActions, action.Id)
+			engine.clearCriticalSection()
+		}
 		return nil, err
 	}
 	engine.criticalSectionAvailable = make(map[string]bool, len(lockSet))
@@ -1294,6 +1304,7 @@ func (ctx *OrchestrationContext) onEntityLockRequested(eventID int32, event *pro
 		message.GetEntityLockRequested().CriticalSectionId != event.CriticalSectionId {
 		return fmt.Errorf("entity lock request %q does not match pending action %d", event.CriticalSectionId, eventID)
 	}
+	ctx.criticalSectionRequestCommitted = true
 	delete(ctx.pendingActions, eventID)
 	return nil
 }
@@ -1501,6 +1512,7 @@ func (ctx *OrchestrationContext) clearCriticalSection() {
 	ctx.criticalSectionID = ""
 	ctx.criticalSectionLocks = nil
 	ctx.criticalSectionAvailable = nil
+	ctx.criticalSectionRequestCommitted = false
 }
 
 func (ctx *OrchestrationContext) getNextSequenceNumber() int32 {

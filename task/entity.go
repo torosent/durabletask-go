@@ -63,10 +63,8 @@ func (ctx *EntityContext) GetState(v any) error {
 // SetState sets the entity state. The state must be JSON-serializable.
 // Passing nil deletes the entity state.
 func (ctx *EntityContext) SetState(state any) error {
-	ctx.stateDirty = true
 	if state == nil {
-		ctx.state.value = nil
-		ctx.state.hasValue = false
+		ctx.DeleteState()
 		return nil
 	}
 	bytes, err := json.Marshal(state)
@@ -75,6 +73,7 @@ func (ctx *EntityContext) SetState(state any) error {
 	}
 	ctx.state.value = bytes
 	ctx.state.hasValue = true
+	ctx.stateDirty = true
 	return nil
 }
 

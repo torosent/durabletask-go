@@ -24,9 +24,10 @@ type EntitySignalBackend interface {
 }
 
 type EntityQueryBackend interface {
-	GetEntityMetadata(context.Context, api.EntityID, bool) (*api.EntityMetadata, error)
-	QueryEntities(context.Context, api.EntityQuery) (*api.EntityQueryResults, error)
-	CleanEntityStorage(context.Context, api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error)
+	// GetEntityMetadata returns nil, nil when the entity does not exist.
+	GetEntityMetadata(ctx context.Context, id api.EntityID, includeState bool) (*api.EntityMetadata, error)
+	QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error)
+	CleanEntityStorage(ctx context.Context, request api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error)
 }
 
 // EntityBackend is an optional backend extension for native durable entity
@@ -44,7 +45,7 @@ type EntityWorkItem struct {
 	InstanceID   api.EntityID
 	ExecutionID  string
 	State        *string
-	Operations   []*protos.HistoryEvent
+	Operations   []*HistoryEvent
 	MessageIDs   []int64
 	LockedBy     string
 	RetryCount   int32
@@ -68,14 +69,7 @@ func (wi *EntityWorkItem) GetAbandonDelay() time.Duration {
 	if wi.AbandonDelay > 0 {
 		return wi.AbandonDelay
 	}
-	switch {
-	case wi.RetryCount == 0:
-		return 0
-	case wi.RetryCount > 100:
-		return 5 * time.Minute
-	default:
-		return time.Duration(wi.RetryCount) * time.Second
-	}
+	return abandonDelayForRetry(wi.RetryCount)
 }
 
 // EntityBatchFromRequestV2 converts a backend-scheduled V2 entity request into

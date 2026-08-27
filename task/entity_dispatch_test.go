@@ -603,3 +603,24 @@ func Test_EntityDispatcher_RejectsCaseInsensitiveOperationCollisions(t *testing.
 		_ = NewEntityFor[caseCollisionEntity]()
 	})
 }
+
+type ignoredSetStateErrorEntity struct {
+	Value int `json:"value"`
+}
+
+func (entity *ignoredSetStateErrorEntity) Mutate(ctx *EntityContext) int {
+	entity.Value++
+	_ = ctx.SetState(make(chan int))
+	return entity.Value
+}
+
+func Test_EntityDispatcher_FailedExplicitStateDoesNotSuppressAutoSave(t *testing.T) {
+	entity := NewEntityFor[ignoredSetStateErrorEntity]()
+	ctx := &EntityContext{ID: api.NewEntityID("state", "key"), Operation: "Mutate"}
+	result, err := entity(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, result)
+	var state ignoredSetStateErrorEntity
+	require.NoError(t, ctx.GetState(&state))
+	require.Equal(t, 1, state.Value)
+}

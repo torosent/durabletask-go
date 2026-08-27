@@ -250,8 +250,7 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 		WithMaxConcurrentActivityWorkItems(3),
 		WithMaxConcurrentEntityWorkItems(4),
 		WithWorkItemFilters(&WorkItemFilters{
-			Activities: []WorkItemFilter{{Name: "activity"}},
-			Entities:   []string{"Counter"},
+			Entities: []string{"Counter"},
 		}),
 	)
 	worker.executor = &recordingExecutor{
@@ -297,6 +296,23 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
+	filters, err := cloneWorkItemFilters(&WorkItemFilters{
+		Entities: []string{"Counter"},
+	})
+	require.NoError(t, err)
+	require.True(t, matchesWorkItemFilters(filters, true, "orchestration", "v1"))
+	require.True(t, matchesWorkItemFilters(filters, false, "activity", "v1"))
+	require.True(t, matchesEntityWorkItemFilters(filters, "counter"))
+	require.False(t, matchesEntityWorkItemFilters(filters, "other"))
+
+	filters, err = cloneWorkItemFilters(&WorkItemFilters{RejectAllActivities: true})
+	require.NoError(t, err)
+	require.False(t, matchesWorkItemFilters(filters, false, "activity", "v1"))
+	require.True(t, matchesWorkItemFilters(filters, true, "orchestration", "v1"))
+	require.True(t, matchesEntityWorkItemFilters(filters, "counter"))
 }
 
 func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T) {

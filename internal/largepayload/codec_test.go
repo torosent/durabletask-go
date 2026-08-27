@@ -223,11 +223,11 @@ func TestTransformEntityBatchPayloadFields(t *testing.T) {
 			Input: wrapperspb.String("input"),
 		}},
 	}
-	for _, target := range []*wrapperspb.StringValue{request.EntityState, request.Operations[0].Input} {
-		externalized, err := Externalize(context.Background(), options, target)
-		require.NoError(t, err)
-		*target = *externalized
-	}
+	var err error
+	request.EntityState, err = Externalize(context.Background(), options, request.EntityState)
+	require.NoError(t, err)
+	request.Operations[0].Input, err = Externalize(context.Background(), options, request.Operations[0].Input)
+	require.NoError(t, err)
 	require.NoError(t, TransformEntityBatchRequest(context.Background(), options, request))
 	require.Equal(t, "state", request.EntityState.GetValue())
 	require.Equal(t, "input", request.Operations[0].Input.GetValue())
