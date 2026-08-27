@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/internal/tagcodec"
@@ -779,7 +780,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 		*input,
 		*output,
 		*customStatus,
-		failureDetails,
+		failure.FromProto(failureDetails),
 	)
 	if version != nil {
 		metadata.Version = *version

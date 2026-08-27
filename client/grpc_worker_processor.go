@@ -11,10 +11,10 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
-	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -193,9 +193,9 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	}
 
 	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
-	var versionMismatch *task.VersionMismatchError
-	if errors.As(err, &versionMismatch) {
-		w.logger.Warnf("%s: orchestration version mismatch; abandoning work item: %v", request.InstanceId, err)
+	var delayed backend.WorkItemAbandonDelayError
+	if errors.As(err, &delayed) {
+		w.logger.Warnf("%s: orchestration work item rejected; abandoning it: %v", request.InstanceId, err)
 		w.abandonOrchestration(ctx, client, completionToken)
 		return
 	}
@@ -217,10 +217,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
 			wrapperspb.String("An internal error occurred while executing the orchestration."),
 			nil,
-			&protos.TaskFailureDetails{
-				ErrorType:    fmt.Sprintf("%T", err),
-				ErrorMessage: err.Error(),
-			},
+			failure.FromError(err),
 		)}
 	case results == nil || results.Response == nil:
 		response.Actions = []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
@@ -332,10 +329,10 @@ func (w *TaskHubGrpcWorker) processActivity(
 	)
 	event.GetTaskScheduled().Tags = contextprop.Clone(request.Tags)
 	result, err := w.executor.ExecuteActivity(ctx, api.InstanceID(request.OrchestrationInstance.InstanceId), event)
-	var versionMismatch *task.VersionMismatchError
-	if errors.As(err, &versionMismatch) {
+	var delayed backend.WorkItemAbandonDelayError
+	if errors.As(err, &delayed) {
 		w.logger.Warnf(
-			"%s/%s#%d: activity version mismatch; abandoning work item: %v",
+			"%s/%s#%d: activity work item rejected; abandoning it: %v",
 			request.OrchestrationInstance.InstanceId,
 			request.Name,
 			request.TaskId,
@@ -357,10 +354,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 		CompletionToken: completionToken,
 	}
 	if err != nil {
-		response.FailureDetails = &protos.TaskFailureDetails{
-			ErrorType:    fmt.Sprintf("%T", err),
-			ErrorMessage: err.Error(),
-		}
+		response.FailureDetails = failure.FromError(err)
 	} else if completed := result.GetTaskCompleted(); completed != nil {
 		response.Result = completed.Result
 	} else if failed := result.GetTaskFailed(); failed != nil {

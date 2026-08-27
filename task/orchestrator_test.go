@@ -3,6 +3,8 @@ package task
 import (
 	"testing"
 	"time"
+
+	"github.com/microsoft/durabletask-go/api"
 )
 
 func Test_computeNextDelay(t *testing.T) {
@@ -13,7 +15,6 @@ func Test_computeNextDelay(t *testing.T) {
 		policy         RetryPolicy
 		attempt        int
 		firstAttempt   time.Time
-		err            error
 	}
 	tests := []struct {
 		name string
@@ -29,7 +30,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   2,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         2 * time.Minute,
 				},
 				attempt:      0,
@@ -46,7 +47,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   2,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         2 * time.Minute,
 				},
 				attempt:      1,
@@ -63,7 +64,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   2,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         2 * time.Minute,
 				},
 				attempt:      2,
@@ -80,7 +81,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   2,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         2 * time.Minute,
 				},
 				attempt:      3,
@@ -97,7 +98,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   2,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         30 * time.Second,
 				},
 				attempt:      3,
@@ -114,7 +115,7 @@ func Test_computeNextDelay(t *testing.T) {
 					InitialRetryInterval: 2 * time.Second,
 					BackoffCoefficient:   1,
 					MaxRetryInterval:     10 * time.Second,
-					Handle:               func(err error) bool { return true },
+					Handle:               func(RetryContext) bool { return true },
 					RetryTimeout:         2 * time.Minute,
 				},
 				attempt:      3,
@@ -125,7 +126,11 @@ func Test_computeNextDelay(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := computeNextDelay(tt.args.currentTimeUtc, tt.args.policy, tt.args.attempt, tt.args.firstAttempt, tt.args.err); got != tt.want {
+			err := &TaskFailedError{
+				TaskName:       "activity",
+				FailureDetails: &api.FailureDetails{ErrorType: "TestError", ErrorMessage: "failed"},
+			}
+			if got := computeNextDelay(tt.args.currentTimeUtc, tt.args.policy, tt.args.attempt, tt.args.firstAttempt, err); got != tt.want {
 				t.Errorf("computeNextDelay() = %v, want %v", got, tt.want)
 			}
 		})

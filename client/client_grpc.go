@@ -15,6 +15,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -78,7 +79,10 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 	req := &protos.CreateInstanceRequest{Name: orchestrator}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return api.EmptyInstanceID, fmt.Errorf("failed to configure orchestration request: %w", err)
+			return api.EmptyInstanceID, fmt.Errorf(
+				"failed to configure orchestration request: %w",
+				api.WrapInvalidArgument(err),
+			)
 		}
 	}
 	if err := c.prepareOrchestrationIDReusePolicy(req); err != nil {
@@ -100,10 +104,7 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 
 	resp, err := c.client.StartInstance(ctx, req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return api.EmptyInstanceID, ctx.Err()
-		}
-		return api.EmptyInstanceID, fmt.Errorf("failed to start orchestrator: %w", err)
+		return api.EmptyInstanceID, clientRPCError(ctx, "failed to start orchestration", err)
 	}
 	return api.InstanceID(resp.InstanceId), nil
 }
@@ -141,10 +142,7 @@ func (c *TaskHubGrpcClient) FetchOrchestrationMetadata(ctx context.Context, id a
 	req := makeGetInstanceRequest(id, opts)
 	resp, err := c.client.GetInstance(ctx, req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("failed to fetch orchestration metadata: %w", err)
+		return nil, clientRPCError(ctx, "failed to fetch orchestration metadata", err)
 	}
 	return c.makeOrchestrationMetadata(ctx, resp)
 }
@@ -160,11 +158,14 @@ func (c *TaskHubGrpcClient) WaitForOrchestrationStart(ctx context.Context, id ap
 		req := makeGetInstanceRequest(id, opts)
 		resp, err = c.client.WaitForInstanceStart(ctx, req)
 		if err != nil {
-			// if its context cancelled stop retrying
 			if ctx.Err() != nil {
 				return backoff.Permanent(ctx.Err())
 			}
-			return fmt.Errorf("failed to wait for orchestration start: %w", err)
+			mapped := clientRPCError(ctx, "failed to wait for orchestration start", err)
+			if !retryableWaitRPCError(err) {
+				return backoff.Permanent(mapped)
+			}
+			return mapped
 		}
 		return nil
 	}, backoff.WithContext(newInfiniteRetries(), ctx))
@@ -185,11 +186,14 @@ func (c *TaskHubGrpcClient) WaitForOrchestrationCompletion(ctx context.Context, 
 		req := makeGetInstanceRequest(id, opts)
 		resp, err = c.client.WaitForInstanceCompletion(ctx, req)
 		if err != nil {
-			// if its context cancelled stop retrying
 			if ctx.Err() != nil {
 				return backoff.Permanent(ctx.Err())
 			}
-			return fmt.Errorf("failed to wait for orchestration completion: %w", err)
+			mapped := clientRPCError(ctx, "failed to wait for orchestration completion", err)
+			if !retryableWaitRPCError(err) {
+				return backoff.Permanent(mapped)
+			}
+			return mapped
 		}
 		return nil
 	}, backoff.WithContext(newInfiniteRetries(), ctx))
@@ -205,7 +209,7 @@ func (c *TaskHubGrpcClient) TerminateOrchestration(ctx context.Context, id api.I
 	req := &protos.TerminateRequest{InstanceId: string(id), Recursive: true}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure termination request: %w", err)
+			return fmt.Errorf("failed to configure termination request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	var err error
@@ -216,10 +220,7 @@ func (c *TaskHubGrpcClient) TerminateOrchestration(ctx context.Context, id api.I
 
 	_, err = c.client.TerminateInstance(ctx, req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to terminate instance: %w", err)
+		return clientRPCError(ctx, "failed to terminate orchestration", err)
 	}
 	return nil
 }
@@ -229,7 +230,7 @@ func (c *TaskHubGrpcClient) RaiseEvent(ctx context.Context, id api.InstanceID, e
 	req := &protos.RaiseEventRequest{InstanceId: string(id), Name: eventName}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure raise event request: %w", err)
+			return fmt.Errorf("failed to configure raise event request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	var err error
@@ -239,10 +240,7 @@ func (c *TaskHubGrpcClient) RaiseEvent(ctx context.Context, id api.InstanceID, e
 	}
 
 	if _, err := c.client.RaiseEvent(ctx, req); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to raise event: %w", err)
+		return clientRPCError(ctx, "failed to raise event", err)
 	}
 	return nil
 }
@@ -256,10 +254,7 @@ func (c *TaskHubGrpcClient) SuspendOrchestration(ctx context.Context, id api.Ins
 		Reason:     wrapperspb.String(reason),
 	}
 	if _, err := c.client.SuspendInstance(ctx, req); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to suspend orchestration: %w", err)
+		return clientRPCError(ctx, "failed to suspend orchestration", err)
 	}
 	return nil
 }
@@ -271,10 +266,7 @@ func (c *TaskHubGrpcClient) ResumeOrchestration(ctx context.Context, id api.Inst
 		Reason:     wrapperspb.String(reason),
 	}
 	if _, err := c.client.ResumeInstance(ctx, req); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to resume orchestration: %w", err)
+		return clientRPCError(ctx, "failed to resume orchestration", err)
 	}
 	return nil
 }
@@ -288,16 +280,13 @@ func (c *TaskHubGrpcClient) PurgeOrchestrationState(ctx context.Context, id api.
 	}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure purge request: %w", err)
+			return fmt.Errorf("failed to configure purge request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 
 	res, err := c.client.PurgeInstances(ctx, req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to purge orchestration state: %w", err)
+		return clientRPCError(ctx, "failed to purge orchestration state", err)
 	} else if res.GetDeletedInstanceCount() == 0 {
 		return api.ErrInstanceNotFound
 	}
@@ -307,10 +296,10 @@ func (c *TaskHubGrpcClient) PurgeOrchestrationState(ctx context.Context, id api.
 // SignalEntity sends a fire-and-forget operation to an entity.
 func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.EntityID, operationName string, opts ...api.SignalEntityOptions) error {
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
-		return err
+		return api.WrapInvalidArgument(err)
 	}
 	if operationName == "" {
-		return fmt.Errorf("entity operation name must not be empty")
+		return api.WrapInvalidArgument(errors.New("entity operation name must not be empty"))
 	}
 	req := &protos.SignalEntityRequest{
 		InstanceId:         entityID.String(),
@@ -321,7 +310,7 @@ func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.Entit
 	}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure signal entity request: %w", err)
+			return fmt.Errorf("failed to configure signal entity request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	var err error
@@ -330,31 +319,26 @@ func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.Entit
 		return fmt.Errorf("failed to externalize entity signal input: %w", err)
 	}
 	if _, err := c.client.SignalEntity(ctx, req); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to signal entity: %w", err)
+		return clientRPCError(ctx, "failed to signal entity", err)
 	}
 	return nil
 }
 
 // FetchEntityMetadata retrieves metadata for an entity instance.
+// api.ErrInstanceNotFound is returned when the entity doesn't exist.
 func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
-		return nil, err
+		return nil, api.WrapInvalidArgument(err)
 	}
 	response, err := c.client.GetEntity(ctx, &protos.GetEntityRequest{
 		InstanceId:   entityID.String(),
 		IncludeState: includeState,
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("failed to get entity metadata: %w", err)
+		return nil, clientRPCError(ctx, "failed to get entity metadata", err)
 	}
 	if !response.Exists || response.Entity == nil {
-		return nil, nil
+		return nil, api.ErrInstanceNotFound
 	}
 	return entityMetadataFromProto(ctx, c.largePayloads, response.Entity)
 }
@@ -382,10 +366,7 @@ func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQ
 	}
 	response, err := c.client.QueryEntities(ctx, &protos.QueryEntitiesRequest{Query: protoQuery})
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("failed to query entities: %w", err)
+		return nil, clientRPCError(ctx, "failed to query entities", err)
 	}
 	result := &api.EntityQueryResults{
 		Entities:          make([]*api.EntityMetadata, 0, len(response.Entities)),
@@ -412,10 +393,7 @@ func (c *TaskHubGrpcClient) CleanEntityStorage(ctx context.Context, request api.
 	}
 	response, err := c.client.CleanEntityStorage(ctx, protoRequest)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("failed to clean entity storage: %w", err)
+		return nil, clientRPCError(ctx, "failed to clean entity storage", err)
 	}
 	return &api.CleanEntityStorageResult{
 		ContinuationToken:     response.ContinuationToken.GetValue(),
@@ -496,7 +474,7 @@ func orchestrationMetadataFromState(state *protos.OrchestrationState) (*api.Orch
 		SerializedInput:        state.Input.GetValue(),
 		SerializedCustomStatus: state.CustomStatus.GetValue(),
 		SerializedOutput:       state.Output.GetValue(),
-		FailureDetails:         state.FailureDetails,
+		FailureDetails:         failure.FromProto(state.FailureDetails),
 		Tags:                   tagcodec.DecodeUserTagsOrPlain(state.Tags),
 	}
 	if state.ScheduledStartTimestamp != nil {

@@ -10,8 +10,6 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -55,7 +53,7 @@ func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.Orches
 
 		resp, err := c.client.QueryInstances(ctx, &protos.QueryInstancesRequest{Query: wireQuery})
 		if err != nil {
-			return nil, managementClientError(ctx, "failed to query orchestration instances", err)
+			return nil, clientRPCError(ctx, "failed to query orchestration instances", err)
 		}
 		scannedPages++
 
@@ -111,7 +109,7 @@ func (c *TaskHubGrpcClient) ListInstanceIDs(ctx context.Context, query api.Insta
 
 	resp, err := c.client.ListInstanceIds(ctx, req)
 	if err != nil {
-		return nil, managementClientError(ctx, "failed to list orchestration instance IDs", err)
+		return nil, clientRPCError(ctx, "failed to list orchestration instance IDs", err)
 	}
 	result := &api.InstanceIDQueryResult{
 		InstanceIDs:       make([]api.InstanceID, 0, len(resp.GetInstanceIds())),
@@ -127,12 +125,12 @@ func (c *TaskHubGrpcClient) RestartInstance(ctx context.Context, id api.Instance
 	req := &protos.RestartInstanceRequest{InstanceId: string(id)}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return api.EmptyInstanceID, fmt.Errorf("failed to configure restart request: %w", err)
+			return api.EmptyInstanceID, fmt.Errorf("failed to configure restart request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	resp, err := c.client.RestartInstance(ctx, req)
 	if err != nil {
-		return api.EmptyInstanceID, managementClientError(ctx, "failed to restart orchestration instance", err)
+		return api.EmptyInstanceID, clientRPCError(ctx, "failed to restart orchestration instance", err)
 	}
 	return api.InstanceID(resp.GetInstanceId()), nil
 }
@@ -141,11 +139,11 @@ func (c *TaskHubGrpcClient) RewindInstance(ctx context.Context, id api.InstanceI
 	req := &protos.RewindInstanceRequest{InstanceId: string(id)}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure rewind request: %w", err)
+			return fmt.Errorf("failed to configure rewind request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	if _, err := c.client.RewindInstance(ctx, req); err != nil {
-		return managementClientError(ctx, "failed to rewind orchestration instance", err)
+		return clientRPCError(ctx, "failed to rewind orchestration instance", err)
 	}
 	return nil
 }
@@ -178,7 +176,7 @@ func (c *TaskHubGrpcClient) PurgeInstances(ctx context.Context, request api.Purg
 		instanceIDs := make([]string, len(ids))
 		for i, id := range ids {
 			if id == api.EmptyInstanceID {
-				return nil, errors.New("purge instance ID cannot be empty")
+				return nil, api.WrapInvalidArgument(errors.New("purge instance ID cannot be empty"))
 			}
 			instanceIDs[i] = string(id)
 		}
@@ -206,7 +204,7 @@ func (c *TaskHubGrpcClient) pollPurgeInstances(ctx context.Context, req *protos.
 	for {
 		resp, err := c.client.PurgeInstances(ctx, req)
 		if err != nil {
-			return result, managementClientError(ctx, "failed to purge orchestration instances", err)
+			return result, clientRPCError(ctx, "failed to purge orchestration instances", err)
 		}
 		result.DeletedInstanceCount += int(resp.GetDeletedInstanceCount())
 		if resp.GetIsComplete() == nil || resp.GetIsComplete().GetValue() {
@@ -227,15 +225,15 @@ func (c *TaskHubGrpcClient) pollPurgeInstances(ctx context.Context, req *protos.
 
 func (c *TaskHubGrpcClient) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, reason string) ([]api.InstanceID, error) {
 	if len(ids) == 0 {
-		return nil, errors.New("at least one instance ID is required")
+		return nil, api.WrapInvalidArgument(errors.New("at least one instance ID is required"))
 	}
 	if len(ids) > api.MaxInstanceBatchSize {
-		return nil, fmt.Errorf("instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize)
+		return nil, api.WrapInvalidArgument(fmt.Errorf("instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize))
 	}
 	instanceIDs := make([]string, len(ids))
 	for i, id := range ids {
 		if id == api.EmptyInstanceID {
-			return nil, errors.New("instance ID cannot be empty")
+			return nil, api.WrapInvalidArgument(errors.New("instance ID cannot be empty"))
 		}
 		instanceIDs[i] = string(id)
 	}
@@ -244,7 +242,7 @@ func (c *TaskHubGrpcClient) SkipGracefulOrchestrationTerminations(ctx context.Co
 		Reason:        stringValue(reason),
 	})
 	if err != nil {
-		return nil, managementClientError(ctx, "failed to skip graceful orchestration terminations", err)
+		return nil, clientRPCError(ctx, "failed to skip graceful orchestration terminations", err)
 	}
 	unterminated := make([]api.InstanceID, 0, len(resp.GetUnterminatedInstanceIds()))
 	for _, id := range resp.GetUnterminatedInstanceIds() {
@@ -257,18 +255,18 @@ func (c *TaskHubGrpcClient) CreateTaskHub(ctx context.Context, opts ...api.Creat
 	req := &protos.CreateTaskHubRequest{}
 	for _, configure := range opts {
 		if err := configure(req); err != nil {
-			return fmt.Errorf("failed to configure task hub creation request: %w", err)
+			return fmt.Errorf("failed to configure task hub creation request: %w", api.WrapInvalidArgument(err))
 		}
 	}
 	if _, err := c.client.CreateTaskHub(ctx, req); err != nil {
-		return managementClientError(ctx, "failed to create task hub", err)
+		return clientRPCError(ctx, "failed to create task hub", err)
 	}
 	return nil
 }
 
 func (c *TaskHubGrpcClient) DeleteTaskHub(ctx context.Context) error {
 	if _, err := c.client.DeleteTaskHub(ctx, &protos.DeleteTaskHubRequest{}); err != nil {
-		return managementClientError(ctx, "failed to delete task hub", err)
+		return clientRPCError(ctx, "failed to delete task hub", err)
 	}
 	return nil
 }
@@ -308,20 +306,4 @@ func stringValue(value string) *wrapperspb.StringValue {
 		return nil
 	}
 	return wrapperspb.String(value)
-}
-
-func managementClientError(ctx context.Context, operation string, err error) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	switch status.Code(err) {
-	case codes.NotFound:
-		return fmt.Errorf("%s: %w", operation, api.ErrInstanceNotFound)
-	case codes.FailedPrecondition:
-		return fmt.Errorf("%s: %w: %s", operation, api.ErrInvalidState, status.Convert(err).Message())
-	case codes.Unimplemented:
-		return fmt.Errorf("%s: %w", operation, api.ErrFeatureNotSupported)
-	default:
-		return fmt.Errorf("%s: %w", operation, err)
-	}
 }

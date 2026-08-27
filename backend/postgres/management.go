@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
@@ -803,7 +804,7 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 		valueOrEmpty(input),
 		valueOrEmpty(output),
 		valueOrEmpty(customStatus),
-		failureDetails,
+		failure.FromProto(failureDetails),
 	)
 	metadata.ExecutionID = executionID
 	if scheduledStartAt != nil {

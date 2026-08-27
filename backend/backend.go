@@ -24,10 +24,7 @@ var (
 	ErrNotExecutionStarted   = errors.New("HistoryEvent must be an ExecutionStartedEvent")
 )
 
-type (
-	HistoryEvent       = protos.HistoryEvent
-	TaskFailureDetails = protos.TaskFailureDetails
-)
+type HistoryEvent = protos.HistoryEvent
 
 type OrchestrationIdReusePolicyOptions func(*api.OrchestrationIdReusePolicy) error
 

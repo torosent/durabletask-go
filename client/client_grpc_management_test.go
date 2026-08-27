@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -14,6 +15,22 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+type lifecycleErrorBackend struct {
+	backend.Backend
+}
+
+func (*lifecycleErrorBackend) CreateTaskHub(context.Context) error {
+	return backend.ErrTaskHubExists
+}
+
+func (*lifecycleErrorBackend) DeleteTaskHub(context.Context) error {
+	return backend.ErrTaskHubNotFound
+}
+
+func (*lifecycleErrorBackend) Stop(context.Context) error {
+	return nil
+}
 
 func TestTaskHubGrpcManagementOverBufconn(t *testing.T) {
 	listener := bufconn.Listen(1024 * 1024)
@@ -54,4 +71,42 @@ func TestTaskHubGrpcManagementOverBufconn(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, ids.InstanceIDs)
 	require.NoError(t, client.DeleteTaskHub(ctx))
+}
+
+func TestTaskHubLifecycleErrorsRoundTripOverGRPC(t *testing.T) {
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	executor, register := backend.NewGrpcExecutor(
+		&lifecycleErrorBackend{},
+		backend.DefaultLogger(),
+		backend.WithTaskHubLifecycleManagement(),
+	)
+	register(grpcServer)
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = executor.Shutdown(context.Background())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, connection.Close()) })
+	client := NewTaskHubGrpcClient(connection, backend.DefaultLogger())
+
+	if err := client.CreateTaskHub(ctx); !errors.Is(err, backend.ErrTaskHubExists) {
+		t.Fatalf("CreateTaskHub() error = %v", err)
+	}
+	if err := client.DeleteTaskHub(ctx); !errors.Is(err, backend.ErrTaskHubNotFound) {
+		t.Fatalf("DeleteTaskHub() error = %v", err)
+	}
 }

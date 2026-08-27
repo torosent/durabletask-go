@@ -441,16 +441,6 @@ func NewTerminateOrchestrationAction(taskID int32, iid string, recurse bool, raw
 	}
 }
 
-func NewTaskFailureDetails(err error) *protos.TaskFailureDetails {
-	if err == nil {
-		return nil
-	}
-	return &protos.TaskFailureDetails{
-		ErrorType:    reflect.TypeOf(err).String(),
-		ErrorMessage: err.Error(),
-	}
-}
-
 func HistoryListSummary(list []*protos.HistoryEvent) string {
 	var sb strings.Builder
 	sb.WriteString("[")

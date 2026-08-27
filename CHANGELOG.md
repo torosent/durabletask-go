@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added orchestration tags to scheduling, metadata, queries, sub-orchestrations, continue-as-new, restart, and rewind.
 - Added explicit worker capability advertisement and orchestration/activity name/version filters with local fallback enforcement.
 - Added pluggable large-payload store/resolver support with size limits, SHA-256 integrity validation, memory/file implementations, and opt-in DTS capability advertisement.
+- Added API-owned structured failure details, typed task and entity operation errors, stable cross-language error types, bounded panic stacks, nested causes, and custom error-property enrichment.
+- Added centralized request/response gRPC error mapping that preserves both `errors.Is` categories and original gRPC status codes.
 
 ### Changed
 
@@ -23,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TaskHubGrpcClient` now rejects the ambiguous legacy `IGNORE` reuse action by default. Known-compatible local sidecars can opt in with `client.WithLegacyOrchestrationIDReusePolicyWire`; DTS callers must use the representable `ERROR` or `TERMINATE` semantics.
 - The standalone gRPC sidecar enables current-proto `replaceableStatus` semantics. Embedded hosts must opt in with `backend.WithCurrentOrchestrationIDReusePolicyWire`; without it, field-1-only policies fail closed because legacy `ERROR` and current `TERMINATE` requests are wire-identical.
 - Orchestration metadata now includes execution ID, completion/scheduled timestamps, parent ID, failure details, and tags when provided by the backend or service.
+- Replaced protobuf failure details in public metadata with `api.FailureDetails`. `RetryPolicy.Handle` now receives deterministic `task.RetryContext`, and non-retriable or canceled failures bypass the handler.
+- `FetchEntityMetadata` now returns `api.ErrInstanceNotFound` when the entity does not exist.
 
 ## [v0.6.0] - 2025-02-05
 

@@ -18,6 +18,7 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/internal/tagcodec"
@@ -41,6 +42,7 @@ type OrchestrationContext struct {
 
 	baseContext              context.Context
 	contextFields            api.ContextFields
+	errorProperties          api.ErrorPropertiesProvider
 	orchestrationTags        map[string]string
 	logger                   *slog.Logger
 	metrics                  backend.MetricsHooks
@@ -173,6 +175,7 @@ func NewOrchestrationContext(registry *TaskRegistry, id api.InstanceID, oldEvent
 		slog.Default(),
 		backend.MetricsHooks{},
 		nil,
+		nil,
 	)
 }
 
@@ -186,11 +189,13 @@ func newOrchestrationContext(
 	logger *slog.Logger,
 	metrics backend.MetricsHooks,
 	contextFields api.ContextFields,
+	errorProperties api.ErrorPropertiesProvider,
 ) *OrchestrationContext {
 	ctx := &OrchestrationContext{
 		ID:                        id,
 		baseContext:               baseContext,
 		contextFields:             contextFields,
+		errorProperties:           errorProperties,
 		logger:                    logger,
 		metrics:                   metrics,
 		orchestrationOptions:      options,
@@ -508,7 +513,7 @@ func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivity
 	options := new(callActivityOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			return ctx.newFailedTask(engine, err)
+			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
 	if ctx.scope.isCanceled() {
@@ -533,7 +538,7 @@ func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivity
 // cancellation scope. Used when option validation fails before any action is scheduled.
 func (ctx *OrchestrationContext) newFailedTask(engine *OrchestrationContext, err error) Task {
 	failedTask := newTaskInScope(engine, ctx.scope)
-	failedTask.fail(helpers.NewTaskFailureDetails(err))
+	failedTask.failLocal(err)
 	return failedTask
 }
 
@@ -584,6 +589,8 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 	ctx.pendingActions[scheduleTaskAction.Id] = scheduleTaskAction
 
 	task := newTaskInScope(ctx, scope)
+	task.taskName = scheduleTaskAction.GetScheduleTask().GetName()
+	task.taskID = scheduleTaskAction.Id
 	ctx.pendingTasks[scheduleTaskAction.Id] = task
 	return task
 }
@@ -596,7 +603,7 @@ func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...s
 	options := new(callSubOrchestratorOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			return ctx.newFailedTask(engine, err)
+			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
 	if ctx.scope.isCanceled() {
@@ -652,6 +659,8 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 	ctx.pendingActions[createSubOrchestrationAction.Id] = createSubOrchestrationAction
 
 	task := newTaskInScope(ctx, scope)
+	task.taskName = createSubOrchestrationAction.GetCreateSubOrchestration().GetName()
+	task.taskID = createSubOrchestrationAction.Id
 	ctx.pendingTasks[createSubOrchestrationAction.Id] = task
 	return task
 }
@@ -687,7 +696,11 @@ func (ctx *OrchestrationContext) internalScheduleTaskWithRetries(
 			}
 			ctx.reportRetry(retryInfo, count+1, policy, nextDelay, err)
 			if timerErr := ctx.createTimerInternal(nextDelay, owner.scope).Await(nil); timerErr != nil {
-				result.fail(helpers.NewTaskFailureDetails(errors.Join(timerErr, err)))
+				if errors.Is(timerErr, ErrTaskCanceled) {
+					result.cancel()
+				} else {
+					result.failLocal(errors.Join(timerErr, err))
+				}
 				return
 			}
 			count++
@@ -701,15 +714,21 @@ func (t *completableTask) completeFrom(source Task, fallback error) {
 	state, ok := taskState(source)
 	if !ok {
 		if fallback != nil {
-			t.fail(helpers.NewTaskFailureDetails(fallback))
+			t.failLocal(fallback)
 		} else {
 			t.complete(nil)
 		}
 		return
 	}
+	t.taskName = state.taskName
+	t.taskID = state.taskID
+	t.entityID = state.entityID
+	t.entityOperation = state.entityOperation
 	switch {
 	case state.failureDetails != nil:
 		t.fail(state.failureDetails)
+	case state.localErr != nil:
+		t.failLocal(state.localErr)
 	case state.isCanceled:
 		t.cancel()
 	default:
@@ -718,20 +737,32 @@ func (t *completableTask) completeFrom(source Task, fallback error) {
 }
 
 func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int, firstAttempt time.Time, err error) time.Duration {
-	if policy.Handle(err) {
-		isExpired := false
-		if policy.RetryTimeout != math.MaxInt64 {
-			isExpired = currentTimeUtc.After(firstAttempt.Add(policy.RetryTimeout))
-		}
-		if !isExpired {
-			nextDelayMs := float64(policy.InitialRetryInterval.Milliseconds()) * math.Pow(policy.BackoffCoefficient, float64(attempt))
-			if nextDelayMs < float64(policy.MaxRetryInterval.Milliseconds()) {
-				return time.Duration(int64(nextDelayMs) * int64(time.Millisecond))
-			}
-			return policy.MaxRetryInterval
-		}
+	if errors.Is(err, ErrTaskCanceled) {
+		return 0
 	}
-	return 0
+	details := failureDetailsFromError(err)
+	if details == nil || details.NonRetriable() {
+		return 0
+	}
+	totalRetryTime := currentTimeUtc.Sub(firstAttempt)
+	if totalRetryTime < 0 {
+		totalRetryTime = 0
+	}
+	if policy.RetryTimeout != math.MaxInt64 && currentTimeUtc.After(firstAttempt.Add(policy.RetryTimeout)) {
+		return 0
+	}
+	if policy.Handle != nil && !policy.Handle(RetryContext{
+		LastAttemptNumber: attempt + 1,
+		LastFailure:       details,
+		TotalRetryTime:    totalRetryTime,
+	}) {
+		return 0
+	}
+	nextDelayMs := float64(policy.InitialRetryInterval.Milliseconds()) * math.Pow(policy.BackoffCoefficient, float64(attempt))
+	if nextDelayMs < float64(policy.MaxRetryInterval.Milliseconds()) {
+		return time.Duration(int64(nextDelayMs) * int64(time.Millisecond))
+	}
+	return policy.MaxRetryInterval
 }
 
 // CreateTimer schedules a durable timer that expires after the specified delay.
@@ -808,19 +839,21 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName string, opts ...callEntityOption) Task {
 	engine := ctx.engineContext()
 	if engine.isTerminated || ctx.scope.isCanceled() {
-		return ctx.newFailedTask(engine, ErrTaskCanceled)
+		task := newTaskInScope(engine, ctx.scope)
+		task.cancel()
+		return task
 	}
 	options := new(callEntityOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			return ctx.newFailedTask(engine, err)
+			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
-		return ctx.newFailedTask(engine, err)
+		return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 	}
 	if operationName == "" {
-		return ctx.newFailedTask(engine, fmt.Errorf("entity operation name must not be empty"))
+		return ctx.newFailedTask(engine, api.WrapInvalidArgument(errors.New("entity operation name must not be empty")))
 	}
 	entityKey := entityID.String()
 	if engine.criticalSectionID != "" {
@@ -849,6 +882,8 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 	)
 	engine.pendingActions[action.Id] = action
 	task := newTaskInScope(engine, ctx.scope)
+	task.entityID = entityID
+	task.entityOperation = operationName
 	engine.pendingEntityTasks[requestID] = task
 	if sectionID := engine.criticalSectionID; sectionID != "" {
 		task.onCompleted(func() {
@@ -869,14 +904,14 @@ func (ctx *OrchestrationContext) SignalEntity(entityID api.EntityID, operationNa
 	options := new(signalEntityOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			return err
+			return api.WrapInvalidArgument(err)
 		}
 	}
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
-		return err
+		return api.WrapInvalidArgument(err)
 	}
 	if operationName == "" {
-		return fmt.Errorf("entity operation name must not be empty")
+		return api.WrapInvalidArgument(errors.New("entity operation name must not be empty"))
 	}
 	entityKey := entityID.String()
 	if engine.criticalSectionID != "" && engine.criticalSectionAvailable != nil {
@@ -999,7 +1034,11 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 		// try looking for a "default" orchestrator
 		orchestrator, ok = ctx.registry.orchestrators["*"]
 		if !ok {
-			return fmt.Errorf("orchestrator named '%s' is not registered", es.Name)
+			return newTaskNotRegisteredError(
+				orchestratorTaskNotFoundErrorType,
+				es.Name,
+				es.GetVersion().GetValue(),
+			)
 		}
 	}
 	ctx.Name = es.Name
@@ -1363,7 +1402,7 @@ func (ctx *OrchestrationContext) setFailed(appError error) error {
 	return ctx.setCompleteInternal(
 		nil,
 		protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
-		helpers.NewTaskFailureDetails(appError),
+		failure.FromError(appError, ctx.errorProperties),
 	)
 }
 
@@ -1437,11 +1476,7 @@ func (ctx *OrchestrationContext) setHistoryLimitFailed(err error) error {
 	return ctx.setCompleteInternal(
 		nil,
 		protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
-		&protos.TaskFailureDetails{
-			ErrorType:      "HistoryLimitExceeded",
-			ErrorMessage:   err.Error(),
-			IsNonRetriable: true,
-		},
+		failure.FromError(err, ctx.errorProperties),
 	)
 }
 

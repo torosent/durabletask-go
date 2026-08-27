@@ -74,7 +74,7 @@ type OrchestrationMetadata struct {
 	SerializedInput        string
 	SerializedOutput       string
 	SerializedCustomStatus string
-	FailureDetails         *protos.TaskFailureDetails
+	FailureDetails         *FailureDetails
 	Tags                   map[string]string
 }
 
@@ -115,7 +115,7 @@ func WithOrchestrationIdReusePolicy(policy *OrchestrationIdReusePolicy) NewOrche
 		switch policy.Action {
 		case REUSE_ID_ACTION_ERROR, REUSE_ID_ACTION_IGNORE, REUSE_ID_ACTION_TERMINATE:
 		default:
-			return fmt.Errorf("invalid orchestration ID reuse action: %d", policy.Action)
+			return invalidArgument(fmt.Sprintf("invalid orchestration ID reuse action: %d", policy.Action))
 		}
 
 		wirePolicy := &protos.OrchestrationIdReusePolicy{
@@ -173,10 +173,10 @@ func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
 		for key := range fields {
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
-				return fmt.Errorf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
+				return invalidArgument(fmt.Sprintf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix))
 			}
 			if strings.HasPrefix(key, tagcodec.UserTagPrefix) {
-				return fmt.Errorf("context field %q uses reserved prefix %q", key, tagcodec.UserTagPrefix)
+				return invalidArgument(fmt.Sprintf("context field %q uses reserved prefix %q", key, tagcodec.UserTagPrefix))
 			}
 		}
 		req.Tags = tagcodec.Merge(req.Tags, tagcodec.EncodeContextFields(fields))
@@ -189,13 +189,13 @@ func WithTags(tags map[string]string) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
 		for key := range tags {
 			if key == "" {
-				return errors.New("tag key cannot be empty")
+				return invalidArgument("tag key cannot be empty")
 			}
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
-				return fmt.Errorf("tag %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
+				return invalidArgument(fmt.Sprintf("tag %q uses reserved prefix %q", key, ReservedContextFieldPrefix))
 			}
 			if strings.HasPrefix(key, tagcodec.UserTagPrefix) {
-				return fmt.Errorf("tag %q uses reserved prefix %q", key, tagcodec.UserTagPrefix)
+				return invalidArgument(fmt.Sprintf("tag %q uses reserved prefix %q", key, tagcodec.UserTagPrefix))
 			}
 		}
 		req.Tags = tagcodec.Merge(req.Tags, tagcodec.EncodeUserTags(tags))
@@ -275,7 +275,7 @@ func NewOrchestrationMetadata(
 	serializedInput string,
 	serializedOutput string,
 	serializedCustomStatus string,
-	failureDetails *protos.TaskFailureDetails,
+	failureDetails *FailureDetails,
 ) *OrchestrationMetadata {
 	return &OrchestrationMetadata{
 		InstanceID:             iid,
@@ -290,182 +290,88 @@ func NewOrchestrationMetadata(
 	}
 }
 
-func (m *OrchestrationMetadata) MarshalJSON() ([]byte, error) {
-	obj := make(map[string]any, 16)
-
-	// Required values
-	obj["id"] = m.InstanceID
-	obj["name"] = m.Name
-	obj["status"] = helpers.ToRuntimeStatusString(m.RuntimeStatus)
-	obj["createdAt"] = m.CreatedAt
-	obj["lastUpdatedAt"] = m.LastUpdatedAt
-
-	// Optional values
-	if m.SerializedInput != "" {
-		obj["serializedInput"] = m.SerializedInput
-	}
-	if m.Version != "" {
-		obj["version"] = m.Version
-	}
-	if m.ExecutionID != "" {
-		obj["executionId"] = m.ExecutionID
-	}
-	if m.ParentInstanceID != "" {
-		obj["parentInstanceId"] = m.ParentInstanceID
-	}
-	if !m.ScheduledStartAt.IsZero() {
-		obj["scheduledStartAt"] = m.ScheduledStartAt
-	}
-	if !m.CompletedAt.IsZero() {
-		obj["completedAt"] = m.CompletedAt
-	}
-	if m.SerializedOutput != "" {
-		obj["serializedOutput"] = m.SerializedOutput
-	}
-	if m.SerializedCustomStatus != "" {
-		obj["serializedCustomStatus"] = m.SerializedCustomStatus
-	}
-	if len(m.Tags) > 0 {
-		obj["tags"] = maps.Clone(m.Tags)
-	}
-
-	// Optional failure details (recursive)
-	if m.FailureDetails != nil {
-		const fieldCount = 4
-		root := make(map[string]any, fieldCount)
-		current := root
-		f := m.FailureDetails
-		for {
-			current["type"] = f.ErrorType
-			current["message"] = f.ErrorMessage
-			if f.StackTrace != nil {
-				current["stackTrace"] = f.StackTrace.GetValue()
-			}
-			if f.InnerFailure == nil {
-				// base case
-				break
-			}
-			// recursive case
-			f = f.InnerFailure
-			inner := make(map[string]any, fieldCount)
-			current["innerFailure"] = inner
-			current = inner
-		}
-		obj["failureDetails"] = root
-	}
-	return json.Marshal(obj)
+type orchestrationMetadataJSON struct {
+	InstanceID             *InstanceID       `json:"id"`
+	Name                   *string           `json:"name"`
+	Status                 *string           `json:"status"`
+	CreatedAt              *time.Time        `json:"createdAt"`
+	LastUpdatedAt          *time.Time        `json:"lastUpdatedAt"`
+	Version                string            `json:"version,omitempty"`
+	ExecutionID            string            `json:"executionId,omitempty"`
+	ParentInstanceID       InstanceID        `json:"parentInstanceId,omitempty"`
+	ScheduledStartAt       *time.Time        `json:"scheduledStartAt,omitempty"`
+	CompletedAt            *time.Time        `json:"completedAt,omitempty"`
+	SerializedInput        string            `json:"serializedInput,omitempty"`
+	SerializedOutput       string            `json:"serializedOutput,omitempty"`
+	SerializedCustomStatus string            `json:"serializedCustomStatus,omitempty"`
+	FailureDetails         *FailureDetails   `json:"failureDetails,omitempty"`
+	Tags                   map[string]string `json:"tags,omitempty"`
 }
 
-func (m *OrchestrationMetadata) UnmarshalJSON(data []byte) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			if rerr, ok := r.(error); ok {
-				err = fmt.Errorf("failed to unmarshal the JSON payload: %w", rerr)
-			} else {
-				err = errors.New("failed to unmarshal the JSON payload")
-			}
-		}
-	}()
+func (m *OrchestrationMetadata) MarshalJSON() ([]byte, error) {
+	status := helpers.ToRuntimeStatusString(m.RuntimeStatus)
+	payload := orchestrationMetadataJSON{
+		InstanceID:             &m.InstanceID,
+		Name:                   &m.Name,
+		Status:                 &status,
+		CreatedAt:              &m.CreatedAt,
+		LastUpdatedAt:          &m.LastUpdatedAt,
+		Version:                m.Version,
+		ExecutionID:            m.ExecutionID,
+		ParentInstanceID:       m.ParentInstanceID,
+		SerializedInput:        m.SerializedInput,
+		SerializedOutput:       m.SerializedOutput,
+		SerializedCustomStatus: m.SerializedCustomStatus,
+		FailureDetails:         m.FailureDetails,
+		Tags:                   maps.Clone(m.Tags),
+	}
+	if !m.ScheduledStartAt.IsZero() {
+		payload.ScheduledStartAt = &m.ScheduledStartAt
+	}
+	if !m.CompletedAt.IsZero() {
+		payload.CompletedAt = &m.CompletedAt
+	}
+	return json.Marshal(payload)
+}
 
-	var obj map[string]any
-	if err := json.Unmarshal(data, &obj); err != nil {
+func (m *OrchestrationMetadata) UnmarshalJSON(data []byte) error {
+	var payload orchestrationMetadataJSON
+	if err := json.Unmarshal(data, &payload); err != nil {
 		return fmt.Errorf("failed to unmarshal orchestration metadata json: %w", err)
 	}
-
-	if id, ok := obj["id"]; ok {
-		m.InstanceID = InstanceID(id.(string))
-	} else {
+	if payload.InstanceID == nil {
 		return errors.New("missing 'id' field")
 	}
-	if name, ok := obj["name"]; ok {
-		m.Name = name.(string)
-	} else {
+	if payload.Name == nil {
 		return errors.New("missing 'name' field")
 	}
-	if status, ok := obj["status"]; ok {
-		m.RuntimeStatus = helpers.FromRuntimeStatusString(status.(string))
-	} else {
-		return errors.New("missing 'name' field")
+	if payload.Status == nil {
+		return errors.New("missing 'status' field")
 	}
-	if createdAt, ok := obj["createdAt"]; ok {
-		if time, err := time.Parse(time.RFC3339, createdAt.(string)); err == nil {
-			m.CreatedAt = time
-		} else {
-			return errors.New("invalid 'createdAt' field: must be RFC3339 format")
-		}
-	} else {
+	if payload.CreatedAt == nil {
 		return errors.New("missing 'createdAt' field")
 	}
-	if lastUpdatedAt, ok := obj["lastUpdatedAt"]; ok {
-		if time, err := time.Parse(time.RFC3339, lastUpdatedAt.(string)); err == nil {
-			m.LastUpdatedAt = time
-		} else {
-			return errors.New("invalid 'lastUpdatedAt' field: must be RFC3339 format")
-		}
-	} else {
+	if payload.LastUpdatedAt == nil {
 		return errors.New("missing 'lastUpdatedAt' field")
 	}
-	if input, ok := obj["serializedInput"]; ok {
-		m.SerializedInput = input.(string)
+	m.InstanceID = *payload.InstanceID
+	m.Name = *payload.Name
+	m.RuntimeStatus = helpers.FromRuntimeStatusString(*payload.Status)
+	m.CreatedAt = *payload.CreatedAt
+	m.LastUpdatedAt = *payload.LastUpdatedAt
+	m.Version = payload.Version
+	m.ExecutionID = payload.ExecutionID
+	m.ParentInstanceID = payload.ParentInstanceID
+	m.SerializedInput = payload.SerializedInput
+	m.SerializedOutput = payload.SerializedOutput
+	m.SerializedCustomStatus = payload.SerializedCustomStatus
+	m.FailureDetails = payload.FailureDetails
+	m.Tags = maps.Clone(payload.Tags)
+	if payload.ScheduledStartAt != nil {
+		m.ScheduledStartAt = *payload.ScheduledStartAt
 	}
-	if version, ok := obj["version"]; ok {
-		m.Version = version.(string)
-	}
-	if executionID, ok := obj["executionId"]; ok {
-		m.ExecutionID = executionID.(string)
-	}
-	if parentInstanceID, ok := obj["parentInstanceId"]; ok {
-		m.ParentInstanceID = InstanceID(parentInstanceID.(string))
-	}
-	if scheduledStartAt, ok := obj["scheduledStartAt"]; ok {
-		parsed, err := time.Parse(time.RFC3339, scheduledStartAt.(string))
-		if err != nil {
-			return errors.New("invalid 'scheduledStartAt' field: must be RFC3339 format")
-		}
-		m.ScheduledStartAt = parsed
-	}
-	if completedAt, ok := obj["completedAt"]; ok {
-		parsed, err := time.Parse(time.RFC3339, completedAt.(string))
-		if err != nil {
-			return errors.New("invalid 'completedAt' field: must be RFC3339 format")
-		}
-		m.CompletedAt = parsed
-	}
-	if output, ok := obj["serializedOutput"]; ok {
-		m.SerializedOutput = output.(string)
-	}
-	if output, ok := obj["serializedCustomStatus"]; ok {
-		m.SerializedCustomStatus = output.(string)
-	}
-	if tags, ok := obj["tags"]; ok {
-		m.Tags = make(map[string]string, len(tags.(map[string]any)))
-		for key, value := range tags.(map[string]any) {
-			m.Tags[key] = value.(string)
-		}
-	}
-
-	failureDetails, ok := obj["failureDetails"]
-	if ok {
-		m.FailureDetails = &protos.TaskFailureDetails{}
-		current := m.FailureDetails
-		obj = failureDetails.(map[string]any)
-		for {
-			current.ErrorType = obj["type"].(string)
-			current.ErrorMessage = obj["message"].(string)
-			if stackTrace, ok := obj["stackTrace"]; ok {
-				current.StackTrace = wrapperspb.String(stackTrace.(string))
-			}
-			if innerFailure, ok := obj["innerFailure"]; ok {
-				// recursive case
-				next := &protos.TaskFailureDetails{}
-				current.InnerFailure = next
-				current = next
-				obj = innerFailure.(map[string]any)
-			} else {
-				// base case
-				break
-			}
-		}
+	if payload.CompletedAt != nil {
+		m.CompletedAt = *payload.CompletedAt
 	}
 	return nil
 }
