@@ -2,7 +2,9 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
@@ -17,17 +19,40 @@ import (
 // REVIEW: Can this be merged with backend/client.go somehow?
 
 type TaskHubGrpcClient struct {
-	client protos.TaskHubSidecarServiceClient
-	logger backend.Logger
+	client                       protos.TaskHubSidecarServiceClient
+	connection                   grpc.ClientConnInterface
+	logger                       backend.Logger
+	allowLegacyIDReusePolicyWire bool
+
+	listenerMu sync.Mutex
+	listener   *TaskHubGrpcWorker
+}
+
+type TaskHubGrpcClientOption func(*TaskHubGrpcClient)
+
+var ErrUnsupportedOrchestrationIDReusePolicy = errors.New("orchestration ID reuse policy is not supported by the current gRPC wire contract")
+
+// WithLegacyOrchestrationIDReusePolicyWire allows the client to send the legacy
+// IGNORE action to a known-compatible sidecar. Do not use this option with DTS:
+// current DTS servers interpret the shared status field as a replacement policy.
+func WithLegacyOrchestrationIDReusePolicyWire() TaskHubGrpcClientOption {
+	return func(c *TaskHubGrpcClient) {
+		c.allowLegacyIDReusePolicyWire = true
+	}
 }
 
 // NewTaskHubGrpcClient creates a client that can be used to manage orchestrations over a gRPC connection.
 // The gRPC connection must be to a task hub worker that understands the Durable Task gRPC protocol.
-func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger) *TaskHubGrpcClient {
-	return &TaskHubGrpcClient{
-		client: protos.NewTaskHubSidecarServiceClient(cc),
-		logger: logger,
+func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
+	c := &TaskHubGrpcClient{
+		client:     protos.NewTaskHubSidecarServiceClient(cc),
+		connection: cc,
+		logger:     logger,
 	}
+	for _, configure := range opts {
+		configure(c)
+	}
+	return c
 }
 
 // ScheduleNewOrchestration schedules a new orchestration instance with a specified set of options for execution.
@@ -37,6 +62,9 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		if err := configure(req); err != nil {
 			return api.EmptyInstanceID, fmt.Errorf("failed to configure orchestration request: %w", err)
 		}
+	}
+	if err := c.prepareOrchestrationIDReusePolicy(req); err != nil {
+		return api.EmptyInstanceID, err
 	}
 	if req.InstanceId == "" {
 		u, err := uuid.NewV7()
@@ -55,6 +83,32 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		return api.EmptyInstanceID, fmt.Errorf("failed to start orchestrator: %w", err)
 	}
 	return api.InstanceID(resp.InstanceId), nil
+}
+
+func (c *TaskHubGrpcClient) prepareOrchestrationIDReusePolicy(req *protos.CreateInstanceRequest) error {
+	policy := req.OrchestrationIdReusePolicy
+	action, hasLegacyAction, err := protos.GetLegacyOrchestrationIDReuseAction(policy)
+	if err != nil {
+		return fmt.Errorf("invalid orchestration ID reuse policy: %w", err)
+	}
+	if !hasLegacyAction {
+		return nil
+	}
+
+	switch api.CreateOrchestrationAction(action) {
+	case api.REUSE_ID_ACTION_TERMINATE:
+		return nil
+	case api.REUSE_ID_ACTION_ERROR:
+		req.OrchestrationIdReusePolicy = nil
+		return nil
+	case api.REUSE_ID_ACTION_IGNORE:
+		if c.allowLegacyIDReusePolicyWire {
+			return nil
+		}
+		return fmt.Errorf("%w: IGNORE cannot be distinguished from TERMINATE by current DTS servers", ErrUnsupportedOrchestrationIDReusePolicy)
+	default:
+		return fmt.Errorf("invalid orchestration ID reuse action: %d", action)
+	}
 }
 
 // FetchOrchestrationMetadata fetches metadata for the specified orchestration from the configured task hub.

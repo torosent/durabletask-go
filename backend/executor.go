@@ -419,7 +419,11 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 	defer span.End()
 
 	e := helpers.NewExecutionStartedEvent(req.Name, instanceID, req.Input, nil, helpers.TraceContextFromSpan(span), req.ScheduledStartTimestamp, req.Version)
-	if err := g.backend.CreateOrchestrationInstance(ctx, e, WithOrchestrationIdReusePolicy(req.OrchestrationIdReusePolicy)); err != nil {
+	policy, err := orchestrationIDReusePolicyFromProto(req.OrchestrationIdReusePolicy)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid orchestration ID reuse policy: %v", err)
+	}
+	if err := g.backend.CreateOrchestrationInstance(ctx, e, WithOrchestrationIdReusePolicy(policy)); err != nil {
 		return nil, err
 	}
 

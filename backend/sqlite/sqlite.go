@@ -335,7 +335,7 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 		for _, msg := range wi.State.PendingMessages() {
 			if es := msg.HistoryEvent.GetExecutionStarted(); es != nil {
 				// Need to insert a new row into the DB
-				if _, err := be.createOrchestrationInstanceInternal(ctx, msg.HistoryEvent, tx, backend.WithOrchestrationIdReusePolicy(&protos.OrchestrationIdReusePolicy{
+				if _, err := be.createOrchestrationInstanceInternal(ctx, msg.HistoryEvent, tx, backend.WithOrchestrationIdReusePolicy(&api.OrchestrationIdReusePolicy{
 					OperationStatus: []protos.OrchestrationStatus{protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED},
 					Action:          api.REUSE_ID_ACTION_TERMINATE,
 				})); err != nil {
@@ -449,7 +449,7 @@ func (be *sqliteBackend) createOrchestrationInstanceInternal(ctx context.Context
 	}
 	instanceID := startEvent.OrchestrationInstance.InstanceId
 
-	policy := &protos.OrchestrationIdReusePolicy{}
+	policy := &api.OrchestrationIdReusePolicy{}
 
 	for _, opt := range opts {
 		if err := opt(policy); err != nil {
@@ -508,7 +508,7 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx *sql.Tx, e *bac
 	return rows, nil
 }
 
-func (be *sqliteBackend) handleInstanceExists(ctx context.Context, tx *sql.Tx, startEvent *protos.ExecutionStartedEvent, policy *protos.OrchestrationIdReusePolicy, e *backend.HistoryEvent) error {
+func (be *sqliteBackend) handleInstanceExists(ctx context.Context, tx *sql.Tx, startEvent *protos.ExecutionStartedEvent, policy *api.OrchestrationIdReusePolicy, e *backend.HistoryEvent) error {
 	// query RuntimeStatus for the existing instance
 	queryRow := tx.QueryRowContext(
 		ctx,
@@ -530,11 +530,11 @@ func (be *sqliteBackend) handleInstanceExists(ctx context.Context, tx *sql.Tx, s
 
 	// status match
 	switch policy.Action {
-	case protos.CreateOrchestrationAction_IGNORE:
+	case api.REUSE_ID_ACTION_IGNORE:
 		// Log an warning message and ignore creating new instance
 		be.logger.Warnf("An instance with ID '%s' already exists; dropping duplicate create request", startEvent.OrchestrationInstance.InstanceId)
 		return api.ErrIgnoreInstance
-	case protos.CreateOrchestrationAction_TERMINATE:
+	case api.REUSE_ID_ACTION_TERMINATE:
 		// terminate existing instance
 		if err := be.cleanupOrchestrationStateInternal(ctx, tx, api.InstanceID(startEvent.OrchestrationInstance.InstanceId), false); err != nil {
 			return fmt.Errorf("failed to cleanup orchestration status: %w", err)

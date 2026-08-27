@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Added the top-level `durabletaskscheduler` transport package, a dedicated resilient gRPC worker, DTS emulator tests, and an environment-driven sample.
+
 ### Changed
 
 - Removed the `submodules/durabletask-protobuf` git submodule. The `orchestrator_service.proto` file is now vendored under `vendored/durabletask-protobuf/protos/`, with the source provenance (URL, branch/ref, commit hash) tracked in `vendored/durabletask-protobuf/PROTO_SOURCE_COMMIT_HASH` and a helper script (`vendored/durabletask-protobuf/update-proto.sh`) for refreshing the proto from upstream.
+- Refreshed the vendored Durable Task protobuf contract. `api.OrchestrationIdReusePolicy` and `api.CreateOrchestrationAction` are now API-owned types instead of aliases for generated protobuf types; callers should construct policies with the `api` types.
+- `TaskHubGrpcClient` now rejects the ambiguous legacy `IGNORE` reuse action by default. Known-compatible local sidecars can opt in with `client.WithLegacyOrchestrationIDReusePolicyWire`; DTS callers must use the representable `ERROR` or `TERMINATE` semantics.
 
 ## [v0.6.0] - 2025-02-05
 
