@@ -500,7 +500,7 @@ func (ctx *OrchestrationContext) NewWaitGroup() WaitGroup {
 	if engine.scheduler == nil {
 		panic("orchestration wait group created outside orchestrator execution")
 	}
-	return newOrchestrationWaitGroup(engine.scheduler, ctx.scope)
+	return newOrchestrationWaitGroup(engine.scheduler)
 }
 
 func (ctx *OrchestrationContext) internalScheduleActivity(
@@ -936,7 +936,11 @@ func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) e
 
 func (ctx *OrchestrationContext) onEventSent(eventID int32, event *protos.EventSentEvent) error {
 	action, ok := ctx.pendingActions[eventID]
-	if !ok || action.GetSendEvent() == nil {
+	sent := action.GetSendEvent()
+	if !ok || sent == nil ||
+		sent.GetInstance().GetInstanceId() != event.GetInstanceId() ||
+		sent.GetName() != event.GetName() ||
+		sent.GetData().GetValue() != event.GetInput().GetValue() {
 		return fmt.Errorf(
 			"a previous execution sent event %q to %q with sequence number %d, but the current execution doesn't have this action",
 			event.GetName(),

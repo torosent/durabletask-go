@@ -609,7 +609,7 @@ func createOrchestrationInstance(t assert.TestingT, be backend.Backend, instance
 			},
 		},
 	}
-	policy := &protos.OrchestrationIdReusePolicy{}
+	policy := &api.OrchestrationIdReusePolicy{}
 	err := be.CreateOrchestrationInstance(ctx, e, backend.WithOrchestrationIdReusePolicy(policy))
 	return assert.NoError(t, err)
 }

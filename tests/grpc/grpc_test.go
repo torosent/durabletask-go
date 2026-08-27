@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 			log.Printf("failed to close connection: %v", err)
 		}
 	}()
-	grpcClient = client.NewTaskHubGrpcClient(conn, logger)
+	grpcClient = client.NewTaskHubGrpcClient(conn, logger, client.WithLegacyOrchestrationIDReusePolicyWire())
 
 	// Run the test exitCode
 	exitCode := m.Run()
@@ -90,7 +90,18 @@ func TestMain(m *testing.M) {
 func startGrpcListener(t *testing.T, r *task.TaskRegistry) context.CancelFunc {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	require.NoError(t, grpcClient.StartWorkItemListener(cancelCtx, r))
-	return cancel
+	return func() {
+		cancel()
+		timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		err := grpcClient.StopWorkItemListener(timeoutCtx)
+		defer timeoutCancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			timeoutCtx, timeoutCancel = context.WithTimeout(context.Background(), 5*time.Second)
+			defer timeoutCancel()
+			err = grpcClient.StopWorkItemListener(timeoutCtx)
+		}
+		require.NoError(t, err)
+	}
 }
 
 func Test_Grpc_WaitForInstanceStart_Timeout(t *testing.T) {
