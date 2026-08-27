@@ -47,6 +47,14 @@ jobs:
         ports:
           # Maps tcp port 5432 on service container to the host
           - 5432:5432
+
+      dts:
+        image: mcr.microsoft.com/dts/dts-emulator:latest
+        env:
+          DTS_TASK_HUB_NAMES: default
+        ports:
+          - 8080:8080
+          - 8082:8082
         
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE
@@ -81,7 +89,12 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
 
+      - name: Wait for DTS emulator
+        run: curl --fail --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:8082/
+
       - name: Run integration tests
         env:
           POSTGRES_ENABLED: "true"
+          DTS_EMULATOR_ENDPOINT: "http://127.0.0.1:8080"
+          DTS_TASK_HUB: "default"
         run: go test ./tests/... -coverpkg ./api,./task,./client,./backend/...,./internal/helpers

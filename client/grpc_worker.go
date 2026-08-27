@@ -394,6 +394,9 @@ func (w *TaskHubGrpcWorker) execute(run *grpcWorkerRun, connection *grpcWorkerCo
 		if err := w.executor.Shutdown(context.Background()); err != nil && run.err == nil {
 			run.err = fmt.Errorf("failed to shut down worker executor: %w", err)
 		}
+		if run.err != nil {
+			w.logger.Errorf("gRPC worker stopped: %v", run.err)
+		}
 
 		w.mu.Lock()
 		if w.run == run {

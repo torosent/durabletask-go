@@ -50,7 +50,7 @@ func orchestrationIDReusePolicyFromProto(policy *protos.OrchestrationIdReusePoli
 		return nil, fmt.Errorf("invalid orchestration ID reuse policy: %w", err)
 	}
 	result := &api.OrchestrationIdReusePolicy{
-		Action:          api.REUSE_ID_ACTION_TERMINATE,
+		Action:          api.REUSE_ID_ACTION_ERROR,
 		OperationStatus: append([]api.OrchestrationStatus(nil), policy.ReplaceableStatus...),
 	}
 	if hasLegacyAction {
