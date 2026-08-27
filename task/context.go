@@ -9,6 +9,20 @@ import (
 
 type taskLoggerKey struct{}
 
+func mergeContextFields(base, overrides api.ContextFields) api.ContextFields {
+	if len(base) == 0 && len(overrides) == 0 {
+		return nil
+	}
+	merged := make(api.ContextFields, len(base)+len(overrides))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range overrides {
+		merged[key] = value
+	}
+	return merged
+}
+
 // Context returns an immutable Go context with orchestration identity and caller fields.
 func (ctx *OrchestrationContext) Context() context.Context {
 	engine := ctx.engineContext()
@@ -16,7 +30,7 @@ func (ctx *OrchestrationContext) Context() context.Context {
 	if base == nil {
 		base = context.Background()
 	}
-	base = api.WithContextFields(base, engine.contextFields)
+	base = api.ContextWithFields(base, engine.contextFields)
 	base = api.WithOrchestrationContextInfo(base, api.OrchestrationContextInfo{
 		InstanceID:       engine.ID,
 		Name:             engine.Name,

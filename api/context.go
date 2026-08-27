@@ -47,8 +47,8 @@ func ActivityContextInfoFromContext(ctx context.Context) (ActivityContextInfo, b
 	return info, ok
 }
 
-// WithContextFields returns a context containing a defensive copy of fields.
-func WithContextFields(ctx context.Context, fields ContextFields) context.Context {
+// ContextWithFields returns a context containing a defensive copy of fields.
+func ContextWithFields(ctx context.Context, fields ContextFields) context.Context {
 	if len(fields) == 0 {
 		return ctx
 	}

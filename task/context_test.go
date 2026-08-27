@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -156,5 +157,53 @@ func TestActivityContextPropagatesIdentityFieldsAndLogger(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "activity log") {
 		t.Fatalf("activity logger output missing: %s", logs.String())
+	}
+}
+
+func TestActivityContextDecodesDurableContextTags(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddActivityN("inspect-tags", func(ctx ActivityContext) (any, error) {
+		orchestration, _ := api.OrchestrationContextInfoFromContext(ctx.Context())
+		return struct {
+			Orchestration api.OrchestrationContextInfo
+			Fields        api.ContextFields
+		}{
+			Orchestration: orchestration,
+			Fields:        api.ContextFieldsFromContext(ctx.Context()),
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	event := helpers.NewTaskScheduledEvent(4, "inspect-tags", nil, nil, nil)
+	event.GetTaskScheduled().Tags = contextprop.Encode(api.OrchestrationContextInfo{
+		InstanceID:       "tagged-instance",
+		Name:             "tagged-parent",
+		Version:          "v4",
+		ParentInstanceID: "root",
+	}, api.ContextFields{"tenant": "tagged"})
+	response, err := NewTaskExecutor(registry).ExecuteActivity(
+		context.Background(),
+		"tagged-instance",
+		event,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var output struct {
+		Orchestration api.OrchestrationContextInfo
+		Fields        api.ContextFields
+	}
+	if err := json.Unmarshal([]byte(response.GetTaskCompleted().GetResult().GetValue()), &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.Orchestration.Name != "tagged-parent" ||
+		output.Orchestration.Version != "v4" ||
+		output.Orchestration.ParentInstanceID != "root" {
+		t.Fatalf("unexpected orchestration identity: %+v", output.Orchestration)
+	}
+	if output.Fields["tenant"] != "tagged" {
+		t.Fatalf("tenant = %q, want tagged", output.Fields["tenant"])
 	}
 }

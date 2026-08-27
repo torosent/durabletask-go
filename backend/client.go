@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -59,6 +60,7 @@ func (c *backendClient) ScheduleNewOrchestration(ctx context.Context, orchestrat
 
 	tc := helpers.TraceContextFromSpan(span)
 	e := helpers.NewExecutionStartedEvent(req.Name, req.InstanceId, req.Input, nil, tc, req.ScheduledStartTimestamp, req.Version)
+	e.GetExecutionStarted().Tags = maps.Clone(req.Tags)
 	policy, err := orchestrationIDReusePolicyFromProto(req.OrchestrationIdReusePolicy)
 	if err != nil {
 		return api.EmptyInstanceID, fmt.Errorf("failed to decode orchestration ID reuse policy: %w", err)
