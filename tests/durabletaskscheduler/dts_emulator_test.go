@@ -60,6 +60,7 @@ func startEmulatorClientAndWorker(
 		logger,
 		durabletaskclient.WithMaxConcurrentOrchestrationWorkItems(4),
 		durabletaskclient.WithMaxConcurrentActivityWorkItems(8),
+		durabletaskclient.WithMaxConcurrentEntityWorkItems(8),
 		durabletaskclient.WithWorkerSilentDisconnectTimeout(15*time.Second),
 	)
 	require.NoError(t, err)
@@ -87,6 +88,7 @@ func TestDTSEmulatorSequenceMetadataAndPurge(t *testing.T) {
 			if err := ctx.CallActivity("DTSSayHello", task.WithActivityInput(city)).Await(&output); err != nil {
 				return nil, err
 			}
+
 			outputs = append(outputs, output)
 		}
 		return outputs, nil
@@ -126,6 +128,109 @@ func TestDTSEmulatorSequenceMetadataAndPurge(t *testing.T) {
 	require.NoError(t, managementClient.PurgeOrchestrationState(ctx, id))
 	_, err = managementClient.FetchOrchestrationMetadata(ctx, id)
 	require.ErrorIs(t, err, api.ErrInstanceNotFound)
+}
+
+func TestDTSEmulatorDurableEntities(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddEntityN("counter", func(ctx *task.EntityContext) (any, error) {
+		var value int
+		if ctx.HasState() {
+			if err := ctx.GetState(&value); err != nil {
+				return nil, err
+			}
+		}
+		switch ctx.Operation {
+		case "add":
+			var amount int
+			if err := ctx.GetInput(&amount); err != nil {
+				return nil, err
+			}
+			value += amount
+			if err := ctx.SetState(value); err != nil {
+				return nil, err
+			}
+		case "get":
+		case "delete":
+			ctx.DeleteState()
+		default:
+			return nil, fmt.Errorf("unknown operation %q", ctx.Operation)
+		}
+		return value, nil
+	}))
+	entityID := api.NewEntityID("counter", uuid.NewString())
+	require.NoError(t, registry.AddOrchestratorN("DTSEntityCall", func(ctx *task.OrchestrationContext) (any, error) {
+		var value int
+		if err := ctx.CallEntity(entityID, "add", task.WithEntityInput(2)).Await(&value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSEntityLock", func(ctx *task.OrchestrationContext) (any, error) {
+		unlock, err := ctx.LockEntities(entityID)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		var value int
+		if err := ctx.CallEntity(entityID, "add", task.WithEntityInput(1)).Await(&value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	require.NoError(t, managementClient.SignalEntity(ctx, entityID, "add", api.WithSignalInput(5)))
+	require.Eventually(t, func() bool {
+		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		return err == nil && metadata != nil && metadata.SerializedState == "5"
+	}, 20*time.Second, 100*time.Millisecond)
+
+	scheduledAt := time.Now().UTC().Add(750 * time.Millisecond)
+	require.NoError(t, managementClient.SignalEntity(
+		ctx,
+		entityID,
+		"add",
+		api.WithSignalInput(5),
+		api.WithSignalScheduledTime(scheduledAt),
+	))
+	require.Never(t, func() bool {
+		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		return err == nil && metadata != nil && metadata.SerializedState == "10"
+	}, 300*time.Millisecond, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		return err == nil && metadata != nil && metadata.SerializedState == "10"
+	}, 20*time.Second, 100*time.Millisecond)
+
+	callID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSEntityCall",
+		api.WithInstanceID(uniqueInstanceID("go-entity-call")),
+	)
+	require.NoError(t, err)
+	callResult, err := managementClient.WaitForOrchestrationCompletion(ctx, callID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, "12", callResult.SerializedOutput)
+
+	lockID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSEntityLock",
+		api.WithInstanceID(uniqueInstanceID("go-entity-lock")),
+	)
+	require.NoError(t, err)
+	lockResult, err := managementClient.WaitForOrchestrationCompletion(ctx, lockID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, "13", lockResult.SerializedOutput)
+
+	query, err := managementClient.QueryEntities(ctx, api.EntityQuery{
+		InstanceIDStartsWith: entityID.String(),
+		IncludeState:         true,
+	})
+	require.NoError(t, err)
+	require.Len(t, query.Entities, 1)
+	require.Equal(t, "13", query.Entities[0].SerializedState)
 }
 
 func TestDTSEmulatorEventsSuspendResumeAndTerminate(t *testing.T) {

@@ -39,7 +39,12 @@ func TestMain(m *testing.M) {
 	registerFn(grpcServer)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, grpcExecutor, logger)
 	activityWorker := backend.NewActivityTaskWorker(be, grpcExecutor, logger)
-	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger)
+	entityWorker := backend.NewEntityWorker(
+		be.(backend.EntityBackend),
+		grpcExecutor.(backend.EntityExecutor),
+		logger,
+	)
+	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger, entityWorker)
 	if err := taskHubWorker.Start(ctx); err != nil {
 		log.Fatalf("failed to start worker: %v", err)
 	}
@@ -198,6 +203,65 @@ func Test_Grpc_HelloOrchestration(t *testing.T) {
 	assert.Equal(t, `"Hello, 世界!"`, metadata.SerializedOutput)
 	assert.Equal(t, "hello-test", metadata.SerializedCustomStatus)
 	time.Sleep(1 * time.Second)
+}
+
+func Test_Grpc_DurableEntitySignalCallAndQuery(t *testing.T) {
+	r := task.NewTaskRegistry()
+	require.NoError(t, r.AddEntityN("counter", func(ctx *task.EntityContext) (any, error) {
+		var value int
+		if ctx.HasState() {
+			if err := ctx.GetState(&value); err != nil {
+				return nil, err
+			}
+		}
+		switch ctx.Operation {
+		case "add":
+			var amount int
+			if err := ctx.GetInput(&amount); err != nil {
+				return nil, err
+			}
+			value += amount
+		case "get":
+		default:
+			return nil, fmt.Errorf("unknown operation %q", ctx.Operation)
+		}
+		if err := ctx.SetState(value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}))
+	entityID := api.NewEntityID("counter", "grpc")
+	require.NoError(t, r.AddOrchestratorN("entity-call", func(ctx *task.OrchestrationContext) (any, error) {
+		var value int
+		if err := ctx.CallEntity(entityID, "add", task.WithEntityInput(2)).Await(&value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}))
+
+	cancelListener := startGrpcListener(t, r)
+	defer cancelListener()
+	require.NoError(t, grpcClient.SignalEntity(ctx, entityID, "add", api.WithSignalInput(5)))
+	require.Eventually(t, func() bool {
+		metadata, err := grpcClient.FetchEntityMetadata(ctx, entityID, true)
+		return err == nil && metadata != nil && metadata.SerializedState == "5"
+	}, 10*time.Second, 50*time.Millisecond)
+
+	instanceID, err := grpcClient.ScheduleNewOrchestration(ctx, "entity-call")
+	require.NoError(t, err)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	metadata, err := grpcClient.WaitForOrchestrationCompletion(timeoutCtx, instanceID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	assert.Equal(t, "7", metadata.SerializedOutput)
+
+	query, err := grpcClient.QueryEntities(ctx, api.EntityQuery{
+		InstanceIDStartsWith: entityID.String(),
+		IncludeState:         true,
+	})
+	require.NoError(t, err)
+	require.Len(t, query.Entities, 1)
+	assert.Equal(t, "7", query.Entities[0].SerializedState)
 }
 
 func Test_Grpc_SuspendResume(t *testing.T) {

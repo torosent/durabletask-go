@@ -46,16 +46,22 @@ cancels them only if the shutdown context expires.
 | Schedule, query, and wait for orchestrations | Supported |
 | Raise events, suspend/resume, terminate, and purge | Supported |
 | Orchestration and activity execution | Supported |
-| Bounded orchestration/activity concurrency | Supported |
+| Bounded orchestration/activity/entity concurrency | Supported |
+| Work-item filters for orchestrations, activities, and entities | Supported |
 | Completion tokens and abandon RPCs | Supported |
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
 | Streamed orchestration history | Supported and advertised |
 | Version-aware dispatch | Supported with `client.WithTaskExecutorOptions(task.WithVersioning(...))` |
 | Scheduled-task capability | Not advertised |
 | Large-payload capability | Not advertised |
-| Durable entities | Not implemented; tokenized entity work is abandoned |
+| Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
 | Legacy instance-ID `IGNORE` | Known-compatible local sidecars only, with `client.WithLegacyOrchestrationIDReusePolicyWire`; rejected for DTS because the current wire format is ambiguous |
+
+The current V2 protobuf cannot carry per-operation trace context or request time
+to an entity worker, and it has no properties map for legacy extended-session
+state elision. V2 backends therefore send entity state on every work item; causal
+trace metadata on entity-emitted actions is best-effort.
 
 ## Emulator tests
 

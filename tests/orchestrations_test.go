@@ -1552,7 +1552,13 @@ func initTaskHubWorkerWithExecutorOptions(
 	executor := task.NewTaskExecutor(r, executorOpts...)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger, workerOpts...)
 	activityWorker := backend.NewActivityTaskWorker(be, executor, logger, workerOpts...)
-	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger)
+	entityWorker := backend.NewEntityWorker(
+		be.(backend.EntityBackend),
+		executor.(backend.EntityExecutor),
+		logger,
+		workerOpts...,
+	)
+	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger, entityWorker)
 	if err := taskHubWorker.Start(ctx); err != nil {
 		panic(err)
 	}

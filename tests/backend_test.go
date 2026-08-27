@@ -3,18 +3,20 @@ package tests
 import (
 	"context"
 	"fmt"
-	"github.com/microsoft/durabletask-go/backend/postgres"
 	"os"
 	"reflect"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/backend/postgres"
 	"github.com/microsoft/durabletask-go/backend/sqlite"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -53,6 +55,147 @@ const (
 	defaultName  = "testing"
 	defaultInput = "Hello, 世界!"
 )
+
+func Test_EntityBackend_PersistenceOrderingAbandonAndCleanup(t *testing.T) {
+	for index, be := range backends {
+		entityBackend, ok := be.(backend.EntityBackend)
+		if !ok {
+			t.Fatalf("backend %T does not implement EntityBackend", be)
+		}
+		initTest(t, be, index, true)
+		entityID := api.NewEntityID("counter", fmt.Sprintf("backend-%d", index))
+		firstID := uuid.NewString()
+		secondID := uuid.NewString()
+		for _, request := range []*protos.SignalEntityRequest{
+			{InstanceId: entityID.String(), RequestId: firstID, Name: "add", Input: wrapperspb.String("1")},
+			{InstanceId: entityID.String(), RequestId: secondID, Name: "add", Input: wrapperspb.String("2")},
+		} {
+			require.NoError(t, entityBackend.SignalEntity(ctx, request))
+		}
+
+		workItem, err := entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		require.Len(t, workItem.Operations, 2)
+		assert.Equal(t, firstID, workItem.Operations[0].GetEntityOperationSignaled().RequestId)
+		assert.Equal(t, secondID, workItem.Operations[1].GetEntityOperationSignaled().RequestId)
+		require.NoError(t, entityBackend.AbandonEntityWorkItem(ctx, workItem))
+
+		workItem, err = entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, workItem.RetryCount, int32(1))
+		workItem.Result = &protos.EntityBatchResult{
+			EntityState: wrapperspb.String("3"),
+			Results: []*protos.OperationResult{
+				{ResultType: &protos.OperationResult_Success{Success: &protos.OperationResultSuccess{Result: wrapperspb.String("1")}}},
+				{ResultType: &protos.OperationResult_Success{Success: &protos.OperationResultSuccess{Result: wrapperspb.String("3")}}},
+			},
+			OperationInfos: []*protos.OperationInfo{{RequestId: firstID}, {RequestId: secondID}},
+		}
+		require.NoError(t, entityBackend.CompleteEntityWorkItem(ctx, workItem))
+
+		metadata, err := entityBackend.GetEntityMetadata(ctx, entityID, true)
+		require.NoError(t, err)
+		require.NotNil(t, metadata)
+		assert.Equal(t, "3", metadata.SerializedState)
+		assert.Zero(t, metadata.BacklogQueueSize)
+
+		scheduledID := uuid.NewString()
+		scheduledTime := time.Now().UTC().Add(150 * time.Millisecond)
+		require.NoError(t, entityBackend.SignalEntity(ctx, &protos.SignalEntityRequest{
+			InstanceId:    entityID.String(),
+			RequestId:     scheduledID,
+			Name:          "add",
+			Input:         wrapperspb.String("1"),
+			ScheduledTime: timestamppb.New(scheduledTime),
+		}))
+		_, err = entityBackend.GetEntityWorkItem(ctx)
+		require.ErrorIs(t, err, backend.ErrNoWorkItems)
+		time.Sleep(time.Until(scheduledTime) + 25*time.Millisecond)
+		workItem, err = entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		require.Len(t, workItem.Operations, 1)
+		assert.Equal(t, scheduledID, workItem.Operations[0].GetEntityOperationSignaled().RequestId)
+		workItem.Result = &protos.EntityBatchResult{
+			EntityState: wrapperspb.String("4"),
+			Results: []*protos.OperationResult{{
+				ResultType: &protos.OperationResult_Success{Success: &protos.OperationResultSuccess{Result: wrapperspb.String("4")}},
+			}},
+			OperationInfos: []*protos.OperationInfo{{RequestId: scheduledID}},
+		}
+		require.NoError(t, entityBackend.CompleteEntityWorkItem(ctx, workItem))
+
+		query, err := entityBackend.QueryEntities(ctx, api.EntityQuery{
+			InstanceIDStartsWith: entityID.String(),
+			IncludeState:         true,
+		})
+		require.NoError(t, err)
+		require.Len(t, query.Entities, 1)
+		assert.Equal(t, "4", query.Entities[0].SerializedState)
+
+		deleteID := uuid.NewString()
+		require.NoError(t, entityBackend.SignalEntity(ctx, &protos.SignalEntityRequest{
+			InstanceId: entityID.String(),
+			RequestId:  deleteID,
+			Name:       "delete",
+		}))
+		workItem, err = entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		workItem.Result = &protos.EntityBatchResult{
+			Results:        []*protos.OperationResult{{ResultType: &protos.OperationResult_Success{Success: &protos.OperationResultSuccess{}}}},
+			OperationInfos: []*protos.OperationInfo{{RequestId: deleteID}},
+		}
+		require.NoError(t, entityBackend.CompleteEntityWorkItem(ctx, workItem))
+		cleaned, err := entityBackend.CleanEntityStorage(ctx, api.CleanEntityStorageRequest{RemoveEmptyEntities: true})
+		require.NoError(t, err)
+		assert.Equal(t, int32(1), cleaned.EmptyEntitiesRemoved)
+		metadata, err = entityBackend.GetEntityMetadata(ctx, entityID, true)
+		require.NoError(t, err)
+		assert.Nil(t, metadata)
+	}
+}
+
+func Test_EntityBackend_CriticalSectionChain(t *testing.T) {
+	for index, be := range backends {
+		entityBackend, ok := be.(backend.EntityBackend)
+		if !ok {
+			t.Fatalf("backend %T does not implement EntityBackend", be)
+		}
+		initTest(t, be, index, false)
+		first := api.NewEntityID("lockable", fmt.Sprintf("%d-a", index))
+		second := api.NewEntityID("lockable", fmt.Sprintf("%d-b", index))
+		registry := task.NewTaskRegistry()
+		require.NoError(t, registry.AddEntityN("lockable", func(*task.EntityContext) (any, error) {
+			return nil, nil
+		}))
+		require.NoError(t, registry.AddOrchestratorN("lock-chain", func(ctx *task.OrchestrationContext) (any, error) {
+			if _, err := ctx.LockEntities(second, first, second); err != nil {
+				return nil, err
+			}
+			return "locked", nil
+		}))
+		executor := task.NewTaskExecutor(registry)
+		orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger, backend.WithMaxParallelism(4))
+		activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
+		entityWorker := backend.NewEntityWorker(entityBackend, executor.(backend.EntityExecutor), logger, backend.WithMaxParallelism(4))
+		hubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger, entityWorker)
+		testCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		require.NoError(t, hubWorker.Start(testCtx))
+		client := backend.NewTaskHubClient(be)
+		instanceID, err := client.ScheduleNewOrchestration(testCtx, "lock-chain")
+		require.NoError(t, err)
+		metadata, err := client.WaitForOrchestrationCompletion(testCtx, instanceID)
+		require.NoError(t, err)
+		assert.Equal(t, api.RUNTIME_STATUS_COMPLETED, metadata.RuntimeStatus)
+		for _, entityID := range []api.EntityID{first, second} {
+			require.Eventually(t, func() bool {
+				entity, err := entityBackend.GetEntityMetadata(testCtx, entityID, false)
+				return err == nil && entity != nil && entity.LockedBy == ""
+			}, 10*time.Second, 50*time.Millisecond)
+		}
+		require.NoError(t, hubWorker.Shutdown(context.Background()))
+		cancel()
+	}
+}
 
 // Test_NewOrchestrationWorkItem_Single enqueues a single work item into the backend
 // store and attempts to fetch it immediately afterwards.
