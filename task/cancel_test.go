@@ -320,3 +320,70 @@ func TestCanceledSelectRemovesEventSubscription(t *testing.T) {
 		t.Fatalf("event subscriptions remain after cancellation: %v", captured.eventWaiters)
 	}
 }
+
+func TestCanceledPendingEventWaiterDoesNotConsumeEvent(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("cancel-pending-event", func(ctx *OrchestrationContext) (any, error) {
+		child, cancel := ctx.WithCancel()
+		completed := ctx.NewWaitGroup()
+		completed.Add(2)
+
+		child.Go(func(child *OrchestrationContext) {
+			defer completed.Done()
+			_ = child.WaitForSingleEvent("payload", -1).Await(nil)
+		})
+		ctx.Go(func(ctx *OrchestrationContext) {
+			defer completed.Done()
+			if err := ctx.CreateTimer(time.Second).Await(nil); err != nil {
+				panic(err)
+			}
+			cancel()
+		})
+
+		completed.Wait(ctx)
+		var payload string
+		if err := ctx.WaitForSingleEvent("payload", -1).Await(&payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	instanceID := api.InstanceID("cancel-pending-event-instance")
+	started := helpers.NewOrchestratorStartedEvent()
+	executionStarted := helpers.NewExecutionStartedEvent(
+		"cancel-pending-event",
+		string(instanceID),
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	firstTurn := executeOrchestrationTurn(
+		t,
+		registry,
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{started, executionStarted},
+	)
+	timer := firstTurn.Actions[0].GetCreateTimer()
+	result := executeOrchestrationTurn(
+		t,
+		registry,
+		instanceID,
+		[]*protos.HistoryEvent{
+			started,
+			executionStarted,
+			helpers.NewTimerCreatedEvent(0, timer.GetFireAt()),
+		},
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewTimerFiredEvent(0, timer.GetFireAt(), nil),
+			helpers.NewEventRaisedEvent("payload", wrapperspb.String(`"value"`)),
+		},
+	)
+	if got, want := completionResult(t, result), `"value"`; got != want {
+		t.Fatalf("result = %s, want %s", got, want)
+	}
+}

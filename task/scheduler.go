@@ -141,11 +141,13 @@ func (s *coroutineScheduler) requestCancellation(scope *cancellationScope) {
 }
 
 func (s *coroutineScheduler) applyPendingCancellations() {
-	for _, scope := range s.pendingCancel {
-		scope.cancel(s)
+	for len(s.pendingCancel) > 0 {
+		scope := s.pendingCancel[0]
+		s.pendingCancel = s.pendingCancel[1:]
 		delete(s.pendingCancelSet, scope)
+		scope.cancel(s)
 	}
-	s.pendingCancel = s.pendingCancel[:0]
+	s.pendingCancel = nil
 }
 
 func (s *coroutineScheduler) makeRunnable(c *coroutine) {
