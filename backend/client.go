@@ -2,7 +2,6 @@ package backend
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -17,7 +16,6 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type TaskHubClient interface {
@@ -268,35 +266,7 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 		}
 		return nil
 	}
-
-	request := helpers.EntityRequestMessage{
-		ID:        req.RequestId,
-		IsSignal:  true,
-		Operation: req.Name,
-	}
-	if req.Input != nil {
-		request.Input = req.Input.Value
-	}
-	payload, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal entity signal: %w", err)
-	}
-	startEvent := helpers.NewExecutionStartedEvent(entityID.Name, req.InstanceId, nil, nil, nil, nil, nil)
-	createErr := c.be.CreateOrchestrationInstance(ctx, startEvent, WithOrchestrationIdReusePolicy(&api.OrchestrationIdReusePolicy{
-		Action:          api.REUSE_ID_ACTION_IGNORE,
-		OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_RUNNING, api.RUNTIME_STATUS_PENDING},
-	}))
-	if createErr != nil && !errors.Is(createErr, api.ErrDuplicateInstance) && !errors.Is(createErr, api.ErrIgnoreInstance) {
-		return fmt.Errorf("failed to create compatibility entity instance: %w", createErr)
-	}
-	event := helpers.NewEventRaisedEvent(helpers.EntityRequestEventName, wrapperspb.String(string(payload)))
-	if req.ScheduledTime != nil {
-		event.Timestamp = req.ScheduledTime
-	}
-	if err := c.be.AddNewOrchestrationEvent(ctx, api.InstanceID(req.InstanceId), event); err != nil {
-		return fmt.Errorf("failed to enqueue compatibility entity signal: %w", err)
-	}
-	return nil
+	return api.ErrFeatureNotSupported
 }
 
 func (c *backendClient) QueryInstances(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
@@ -432,28 +402,14 @@ func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.En
 	if entityBackend, ok := c.be.(EntityQueryBackend); ok {
 		return entityBackend.GetEntityMetadata(ctx, entityID, includeState)
 	}
-	metadata, err := c.be.GetOrchestrationMetadata(ctx, api.InstanceID(entityID.String()))
-	if errors.Is(err, api.ErrInstanceNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get compatibility entity metadata: %w", err)
-	}
-	result := &api.EntityMetadata{
-		InstanceID:       entityID,
-		LastModifiedTime: metadata.LastUpdatedAt,
-	}
-	if includeState {
-		result.SerializedState = metadata.SerializedCustomStatus
-	}
-	return result, nil
+	return nil, api.ErrFeatureNotSupported
 }
 
 // QueryEntities queries native entity storage.
 func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
 	entityBackend, ok := c.be.(EntityQueryBackend)
 	if !ok {
-		return nil, fmt.Errorf("QueryEntities requires an EntityBackend with native entity support")
+		return nil, api.ErrFeatureNotSupported
 	}
 	return entityBackend.QueryEntities(ctx, query)
 }
@@ -462,7 +418,7 @@ func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery
 func (c *backendClient) CleanEntityStorage(ctx context.Context, req api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
 	entityBackend, ok := c.be.(EntityQueryBackend)
 	if !ok {
-		return nil, fmt.Errorf("CleanEntityStorage requires an EntityBackend with native entity support")
+		return nil, api.ErrFeatureNotSupported
 	}
 	return entityBackend.CleanEntityStorage(ctx, req)
 }

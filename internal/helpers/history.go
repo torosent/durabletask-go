@@ -321,7 +321,6 @@ func NewEntityOperationCalledAction(
 	parentExecutionID string,
 	operation string,
 	input *wrapperspb.StringValue,
-	scheduledTime *timestamppb.Timestamp,
 ) *protos.OrchestratorAction {
 	return &protos.OrchestratorAction{
 		Id: id,
@@ -331,7 +330,6 @@ func NewEntityOperationCalledAction(
 					EntityOperationCalled: &protos.EntityOperationCalledEvent{
 						RequestId:         requestID,
 						Operation:         operation,
-						ScheduledTime:     scheduledTime,
 						Input:             input,
 						ParentInstanceId:  wrapperspb.String(parentInstanceID),
 						ParentExecutionId: wrapperspb.String(parentExecutionID),

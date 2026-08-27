@@ -11,7 +11,6 @@ import (
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // EntityExecutor is an optional extension implemented by executors that can
@@ -291,11 +290,4 @@ func NewEntitySignalMessage(
 			},
 		},
 	}
-}
-
-func StringValue(value *string) *wrapperspb.StringValue {
-	if value == nil {
-		return nil
-	}
-	return wrapperspb.String(*value)
 }

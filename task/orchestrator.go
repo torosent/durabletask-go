@@ -842,7 +842,6 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 		engine.executionID,
 		operationName,
 		options.rawInput,
-		nil,
 	)
 	engine.pendingActions[action.Id] = action
 	task := newTaskInScope(engine, ctx.scope)

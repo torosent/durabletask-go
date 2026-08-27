@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -18,6 +17,16 @@ import (
 
 func newEntityClient(be backend.Backend) backend.EntityTaskHubClient {
 	return backend.NewTaskHubClient(be).(backend.EntityTaskHubClient)
+}
+
+type signalCaptureBackend struct {
+	backend.Backend
+	request *protos.SignalEntityRequest
+}
+
+func (be *signalCaptureBackend) SignalEntity(_ context.Context, request *protos.SignalEntityRequest) error {
+	be.request = request
+	return nil
 }
 
 func Test_EntityClient_CleanEntityStorage_Defaults(t *testing.T) {
@@ -198,91 +207,58 @@ func Test_EntityClient_QueryEntities_WithFilter(t *testing.T) {
 	assert.Equal(t, "page2", result.ContinuationToken)
 }
 
-// Tests that backend without EntityBackend returns errors for query/clean operations
-func Test_EntityClient_NonEntityBackend_Fallbacks(t *testing.T) {
+func Test_EntityClient_NonEntityBackendReturnsUnsupported(t *testing.T) {
 	be := &mocks.Backend{}
 	client := newEntityClient(be)
 	ctx := context.Background()
 
 	t.Run("QueryEntities returns error", func(t *testing.T) {
 		_, err := client.QueryEntities(ctx, api.EntityQuery{})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "EntityBackend")
+		require.ErrorIs(t, err, api.ErrFeatureNotSupported)
 	})
 
 	t.Run("CleanEntityStorage returns error", func(t *testing.T) {
 		_, err := client.CleanEntityStorage(ctx, api.CleanEntityStorageRequest{})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "EntityBackend")
+		require.ErrorIs(t, err, api.ErrFeatureNotSupported)
 	})
 
-	t.Run("FetchEntityMetadata falls back to orchestration metadata", func(t *testing.T) {
+	t.Run("FetchEntityMetadata returns error", func(t *testing.T) {
 		entityID := api.NewEntityID("counter", "fallback")
-		now := time.Now().Truncate(time.Second)
+		_, err := client.FetchEntityMetadata(ctx, entityID, true)
+		require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+	})
 
-		be.EXPECT().GetOrchestrationMetadata(ctx, api.InstanceID("@counter@fallback")).Return(
-			&api.OrchestrationMetadata{
-				InstanceID:             api.InstanceID("@counter@fallback"),
-				LastUpdatedAt:          now,
-				SerializedCustomStatus: `{"value":7}`,
-			}, nil).Once()
-
-		result, err := client.FetchEntityMetadata(ctx, entityID, true)
-		require.NoError(t, err)
-		require.NotNil(t, result)
-		assert.Equal(t, entityID, result.InstanceID)
-		assert.Equal(t, now, result.LastModifiedTime)
-		assert.Equal(t, `{"value":7}`, result.SerializedState)
+	t.Run("SignalEntity returns error", func(t *testing.T) {
+		err := client.SignalEntity(ctx, api.NewEntityID("counter", "fallback"), "increment")
+		require.ErrorIs(t, err, api.ErrFeatureNotSupported)
 	})
 }
 
 func Test_EntityClient_SignalEntity(t *testing.T) {
-	be := &mocks.Backend{}
+	be := &signalCaptureBackend{}
 	client := newEntityClient(be)
 	ctx := context.Background()
 
 	entityID := api.NewEntityID("counter", "signalTest")
 
-	// SignalEntity auto-creates the entity instance, then sends the event
-	be.EXPECT().CreateOrchestrationInstance(
-		ctx,
-		mock.AnythingOfType("*protos.HistoryEvent"),
-		mock.AnythingOfType("backend.OrchestrationIdReusePolicyOptions"),
-	).Return(nil).Once()
-
-	be.EXPECT().AddNewOrchestrationEvent(
-		ctx,
-		api.InstanceID("@counter@signalTest"),
-		mock.AnythingOfType("*protos.HistoryEvent"),
-	).Return(nil).Once()
-
 	err := client.SignalEntity(ctx, entityID, "increment", api.WithSignalInput(5))
 	require.NoError(t, err)
+	require.NotNil(t, be.request)
+	assert.Equal(t, entityID.String(), be.request.InstanceId)
+	assert.Equal(t, "increment", be.request.Name)
+	assert.Equal(t, "5", be.request.Input.GetValue())
 }
 
 func Test_EntityClient_SignalEntity_PreservesScheduledTime(t *testing.T) {
-	be := &mocks.Backend{}
+	be := &signalCaptureBackend{}
 	client := newEntityClient(be)
 	ctx := context.Background()
 
 	entityID := api.NewEntityID("counter", "signalTest")
 	scheduledTime := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	be.EXPECT().CreateOrchestrationInstance(
-		ctx,
-		mock.AnythingOfType("*protos.HistoryEvent"),
-		mock.AnythingOfType("backend.OrchestrationIdReusePolicyOptions"),
-	).Return(nil).Once()
-
-	be.EXPECT().AddNewOrchestrationEvent(
-		ctx,
-		api.InstanceID("@counter@signalTest"),
-		mock.AnythingOfType("*protos.HistoryEvent"),
-	).Run(func(_ context.Context, _ api.InstanceID, e *protos.HistoryEvent) {
-		require.NotNil(t, e.Timestamp)
-		require.WithinDuration(t, scheduledTime, e.Timestamp.AsTime(), time.Millisecond)
-	}).Return(nil).Once()
-
 	err := client.SignalEntity(ctx, entityID, "increment", api.WithSignalScheduledTime(scheduledTime))
 	require.NoError(t, err)
+	require.NotNil(t, be.request.ScheduledTime)
+	require.WithinDuration(t, scheduledTime, be.request.ScheduledTime.AsTime(), time.Millisecond)
 }
