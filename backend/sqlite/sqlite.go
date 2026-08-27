@@ -1179,37 +1179,15 @@ func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.En
 
 	selected := make([]sqliteEntityMessage, 0, be.options.MaxEntityOperationBatchSize)
 	for _, message := range messages {
-		switch message.descriptor.Kind {
-		case "signal", "call":
-			selected = append(selected, message)
-			if len(selected) == be.options.MaxEntityOperationBatchSize {
-				break
-			}
-		case "lock":
+		if isEntityControlMessage(message.descriptor.Kind) {
+			// Lock and unlock messages change the critical section owner, so they are
+			// processed alone. If operations were already selected for this batch, the
+			// control message stays queued and is handled by a later fetch.
 			if len(selected) > 0 {
 				break
 			}
-			if err := be.processEntityLockTx(ctx, tx, instanceID, message); err != nil {
+			if err := be.processEntityControlMessageTx(ctx, tx, instanceID, criticalSectionOwner, message); err != nil {
 				return nil, false, err
-			}
-			if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
-				return nil, false, err
-			}
-			if err := tx.Commit(); err != nil {
-				return nil, false, err
-			}
-			return nil, true, nil
-		case "unlock":
-			if len(selected) > 0 {
-				break
-			}
-			if _, err := tx.ExecContext(ctx, "DELETE FROM EntityMessages WHERE [SequenceNumber] = ?", message.sequenceNumber); err != nil {
-				return nil, false, err
-			}
-			if criticalSectionOwner.Valid && criticalSectionOwner.String == message.descriptor.ParentInstanceID {
-				if _, err := tx.ExecContext(ctx, "UPDATE Entities SET [LockedBy] = NULL WHERE [InstanceID] = ?", instanceID); err != nil {
-					return nil, false, err
-				}
 			}
 			if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
 				return nil, false, err
@@ -1219,8 +1197,8 @@ func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.En
 			}
 			return nil, true, nil
 		}
-		if len(selected) == be.options.MaxEntityOperationBatchSize ||
-			(message.descriptor.Kind == "lock" || message.descriptor.Kind == "unlock") {
+		selected = append(selected, message)
+		if len(selected) == be.options.MaxEntityOperationBatchSize {
 			break
 		}
 	}
@@ -1275,6 +1253,29 @@ func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.En
 		return nil, false, err
 	}
 	return workItem, false, nil
+}
+
+// processEntityControlMessageTx applies a lock or unlock message, both of which
+// transfer ownership of the entity's critical section, and dequeues it.
+func (be *sqliteBackend) processEntityControlMessageTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	instanceID string,
+	criticalSectionOwner sql.NullString,
+	message sqliteEntityMessage,
+) error {
+	if message.descriptor.Kind == "lock" {
+		return be.processEntityLockTx(ctx, tx, instanceID, message)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM EntityMessages WHERE [SequenceNumber] = ?", message.sequenceNumber); err != nil {
+		return err
+	}
+	if criticalSectionOwner.Valid && criticalSectionOwner.String == message.descriptor.ParentInstanceID {
+		if _, err := tx.ExecContext(ctx, "UPDATE Entities SET [LockedBy] = NULL WHERE [InstanceID] = ?", instanceID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (be *sqliteBackend) processEntityLockTx(
@@ -1746,6 +1747,12 @@ func (be *sqliteBackend) releaseEntityWorkLockTx(ctx context.Context, tx *sql.Tx
 		return backend.ErrWorkItemLockLost
 	}
 	return nil
+}
+
+// isEntityControlMessage reports whether an entity message kind transfers ownership
+// of the entity's critical section rather than being an operation to execute.
+func isEntityControlMessage(kind string) bool {
+	return kind == "lock" || kind == "unlock"
 }
 
 func nullString(value string) any {

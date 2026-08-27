@@ -80,7 +80,6 @@ type OrchestrationContext struct {
 	criticalSectionID        string
 	criticalSectionLocks     []string
 	criticalSectionAvailable map[string]bool
-	lockAcquisitionPending   bool
 }
 
 // callSubOrchestratorOptions is a struct that holds the options for the CallSubOrchestrator orchestrator method.
@@ -272,10 +271,7 @@ func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) 
 	ctx.pendingActions = make(map[int32]*protos.OrchestratorAction)
 	ctx.pendingTasks = make(map[int32]*completableTask)
 	ctx.pendingEntityTasks = make(map[string]*completableTask)
-	ctx.criticalSectionID = ""
-	ctx.criticalSectionLocks = nil
-	ctx.criticalSectionAvailable = nil
-	ctx.lockAcquisitionPending = false
+	ctx.clearCriticalSection()
 	ctx.scheduler = newCoroutineScheduler(ctx)
 	defer func() {
 		ctx.scheduler.shutdown()
@@ -923,14 +919,12 @@ func (ctx *OrchestrationContext) LockEntities(entityIDs ...api.EntityID) (func()
 	engine.pendingActions[action.Id] = action
 	engine.criticalSectionID = criticalSectionID
 	engine.criticalSectionLocks = append([]string(nil), lockSet...)
-	engine.lockAcquisitionPending = true
 	lockTask := newTaskInScope(engine, ctx.scope)
 	engine.pendingEntityTasks[criticalSectionID] = lockTask
 	if err := lockTask.Await(nil); err != nil {
 		engine.clearCriticalSection()
 		return nil, err
 	}
-	engine.lockAcquisitionPending = false
 	engine.criticalSectionAvailable = make(map[string]bool, len(lockSet))
 	for _, entity := range lockSet {
 		engine.criticalSectionAvailable[entity] = true
@@ -1271,22 +1265,16 @@ func (ctx *OrchestrationContext) onEntityOperationSent(eventID int32, requestID 
 }
 
 func (ctx *OrchestrationContext) onEntityOperationCompleted(event *protos.EntityOperationCompletedEvent) error {
-	task, ok := ctx.pendingEntityTasks[event.RequestId]
-	if !ok {
-		return nil
+	if task := ctx.takePendingEntityTask(event.RequestId); task != nil {
+		task.complete([]byte(event.Output.GetValue()))
 	}
-	delete(ctx.pendingEntityTasks, event.RequestId)
-	task.complete([]byte(event.Output.GetValue()))
 	return nil
 }
 
 func (ctx *OrchestrationContext) onEntityOperationFailed(event *protos.EntityOperationFailedEvent) error {
-	task, ok := ctx.pendingEntityTasks[event.RequestId]
-	if !ok {
-		return nil
+	if task := ctx.takePendingEntityTask(event.RequestId); task != nil {
+		task.fail(event.FailureDetails)
 	}
-	delete(ctx.pendingEntityTasks, event.RequestId)
-	task.fail(event.FailureDetails)
 	return nil
 }
 
@@ -1305,12 +1293,9 @@ func (ctx *OrchestrationContext) onEntityLockRequested(eventID int32, event *pro
 }
 
 func (ctx *OrchestrationContext) onEntityLockGranted(event *protos.EntityLockGrantedEvent) error {
-	task, ok := ctx.pendingEntityTasks[event.CriticalSectionId]
-	if !ok {
-		return nil
+	if task := ctx.takePendingEntityTask(event.CriticalSectionId); task != nil {
+		task.complete(nil)
 	}
-	delete(ctx.pendingEntityTasks, event.CriticalSectionId)
-	task.complete(nil)
 	return nil
 }
 
@@ -1326,6 +1311,18 @@ func (ctx *OrchestrationContext) onEntityUnlockSent(eventID int32, event *protos
 	}
 	delete(ctx.pendingActions, eventID)
 	return nil
+}
+
+// takePendingEntityTask removes and returns the task awaiting the given entity request
+// or critical section ID. Unknown IDs yield nil so that responses that no longer have a
+// waiter, such as those replayed after a ContinueAsNew, are ignored.
+func (ctx *OrchestrationContext) takePendingEntityTask(requestID string) *completableTask {
+	task, ok := ctx.pendingEntityTasks[requestID]
+	if !ok {
+		return nil
+	}
+	delete(ctx.pendingEntityTasks, requestID)
+	return task
 }
 
 func (ctx *OrchestrationContext) setComplete(output any) error {
@@ -1498,7 +1495,6 @@ func (ctx *OrchestrationContext) clearCriticalSection() {
 	ctx.criticalSectionID = ""
 	ctx.criticalSectionLocks = nil
 	ctx.criticalSectionAvailable = nil
-	ctx.lockAcquisitionPending = false
 }
 
 func (ctx *OrchestrationContext) getNextSequenceNumber() int32 {

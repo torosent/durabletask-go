@@ -1201,67 +1201,33 @@ func (be *postgresBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.
 		return nil, false, fmt.Errorf("failed to load entity messages: %w", err)
 	}
 
-	messages := make([]postgresEntityMessage, 0, be.options.MaxEntityOperationBatchSize+1)
-	for rows.Next() {
-		var raw postgresEntityMessage
-		var payload []byte
-		if err := rows.Scan(&raw.sequenceNumber, &payload, &raw.dequeueCount, &raw.enqueuedAt); err != nil {
-			rows.Close()
-			return nil, false, err
-		}
-		raw.event, err = backend.UnmarshalHistoryEvent(payload)
-		if err != nil {
-			rows.Close()
-			return nil, false, err
-		}
-		raw.descriptor, err = backend.DescribeEntityMessage(raw.event)
-		if err != nil {
-			rows.Close()
-			return nil, false, err
-		}
-		messages = append(messages, raw)
+	messages, err := loadPostgresEntityMessages(rows, be.options.MaxEntityOperationBatchSize+1)
+	if err != nil {
+		return nil, false, err
 	}
-	rows.Close()
 
 	selected := make([]postgresEntityMessage, 0, be.options.MaxEntityOperationBatchSize)
 	for _, message := range messages {
-		switch message.descriptor.Kind {
-		case "signal", "call":
-			selected = append(selected, message)
-		case "lock":
-			if len(selected) == 0 {
-				if err := be.processEntityLockTx(ctx, tx, instanceID, message); err != nil {
-					return nil, false, err
-				}
-				if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
-					return nil, false, err
-				}
-				if err := tx.Commit(ctx); err != nil {
-					return nil, false, err
-				}
-				return nil, true, nil
+		if isEntityControlMessage(message.descriptor.Kind) {
+			// Lock and unlock messages change the critical section owner, so they are
+			// processed alone. If operations were already selected for this batch, the
+			// control message stays queued and is handled by a later fetch.
+			if len(selected) > 0 {
+				break
 			}
-		case "unlock":
-			if len(selected) == 0 {
-				if _, err := tx.Exec(ctx, "DELETE FROM EntityMessages WHERE SequenceNumber = $1", message.sequenceNumber); err != nil {
-					return nil, false, err
-				}
-				if criticalSectionOwner != nil && *criticalSectionOwner == message.descriptor.ParentInstanceID {
-					if _, err := tx.Exec(ctx, "UPDATE Entities SET LockedBy = NULL WHERE InstanceID = $1", instanceID); err != nil {
-						return nil, false, err
-					}
-				}
-				if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
-					return nil, false, err
-				}
-				if err := tx.Commit(ctx); err != nil {
-					return nil, false, err
-				}
-				return nil, true, nil
+			if err := be.processEntityControlMessageTx(ctx, tx, instanceID, criticalSectionOwner, message); err != nil {
+				return nil, false, err
 			}
+			if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
+				return nil, false, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, false, err
+			}
+			return nil, true, nil
 		}
-		if len(selected) == be.options.MaxEntityOperationBatchSize ||
-			message.descriptor.Kind == "lock" || message.descriptor.Kind == "unlock" {
+		selected = append(selected, message)
+		if len(selected) == be.options.MaxEntityOperationBatchSize {
 			break
 		}
 	}
@@ -1314,6 +1280,62 @@ func (be *postgresBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.
 		return nil, false, err
 	}
 	return workItem, false, nil
+}
+
+// loadPostgresEntityMessages drains rows into entity messages and always closes them,
+// which is required before the enclosing transaction issues its next query.
+func loadPostgresEntityMessages(rows pgx.Rows, capacity int) ([]postgresEntityMessage, error) {
+	defer rows.Close()
+
+	messages := make([]postgresEntityMessage, 0, capacity)
+	for rows.Next() {
+		var message postgresEntityMessage
+		var payload []byte
+		if err := rows.Scan(&message.sequenceNumber, &payload, &message.dequeueCount, &message.enqueuedAt); err != nil {
+			return nil, err
+		}
+		event, err := backend.UnmarshalHistoryEvent(payload)
+		if err != nil {
+			return nil, err
+		}
+		descriptor, err := backend.DescribeEntityMessage(event)
+		if err != nil {
+			return nil, err
+		}
+		message.event = event
+		message.descriptor = descriptor
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
+// isEntityControlMessage reports whether an entity message kind transfers ownership
+// of the entity's critical section rather than being an operation to execute.
+func isEntityControlMessage(kind string) bool {
+	return kind == "lock" || kind == "unlock"
+}
+
+// processEntityControlMessageTx applies a lock or unlock message, both of which
+// transfer ownership of the entity's critical section, and dequeues it.
+func (be *postgresBackend) processEntityControlMessageTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	instanceID string,
+	criticalSectionOwner *string,
+	message postgresEntityMessage,
+) error {
+	if message.descriptor.Kind == "lock" {
+		return be.processEntityLockTx(ctx, tx, instanceID, message)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM EntityMessages WHERE SequenceNumber = $1", message.sequenceNumber); err != nil {
+		return err
+	}
+	if criticalSectionOwner != nil && *criticalSectionOwner == message.descriptor.ParentInstanceID {
+		if _, err := tx.Exec(ctx, "UPDATE Entities SET LockedBy = NULL WHERE InstanceID = $1", instanceID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (be *postgresBackend) processEntityLockTx(

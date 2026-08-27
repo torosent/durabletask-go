@@ -78,29 +78,27 @@ func callEntityMethod(ctx *EntityContext, receiver reflect.Value, method reflect
 
 	args := make([]reflect.Value, 1, methodType.NumIn())
 	args[0] = receiver
-	inputCount := 0
-	contextCount := 0
-	entityIDCount := 0
+	var sawContext, sawEntityID, sawInput bool
 	for i := 1; i < methodType.NumIn(); i++ {
 		parameterType := methodType.In(i)
 		switch parameterType {
 		case entityContextType:
-			contextCount++
-			if contextCount > 1 {
+			if sawContext {
 				return nil, fmt.Errorf("entity operation %q accepts *EntityContext more than once", ctx.Operation)
 			}
+			sawContext = true
 			args = append(args, reflect.ValueOf(ctx))
 		case entityIDType:
-			entityIDCount++
-			if entityIDCount > 1 {
+			if sawEntityID {
 				return nil, fmt.Errorf("entity operation %q accepts api.EntityID more than once", ctx.Operation)
 			}
+			sawEntityID = true
 			args = append(args, reflect.ValueOf(ctx.ID))
 		default:
-			inputCount++
-			if inputCount > 1 {
+			if sawInput {
 				return nil, fmt.Errorf("entity operation %q accepts more than one input parameter", ctx.Operation)
 			}
+			sawInput = true
 			input := reflect.New(parameterType)
 			if err := ctx.GetInput(input.Interface()); err != nil {
 				return nil, fmt.Errorf("failed to deserialize input for operation %q: %w", ctx.Operation, err)
@@ -109,31 +107,28 @@ func callEntityMethod(ctx *EntityContext, receiver reflect.Value, method reflect
 		}
 	}
 
-	switch methodType.NumOut() {
-	case 0:
-	case 1:
-		if methodType.Out(0).Implements(errorType) {
-			results := method.Func.Call(args)
-			return nil, reflectError(results[0])
-		}
+	numOut := methodType.NumOut()
+	returnsError := numOut > 0 && methodType.Out(numOut-1).Implements(errorType)
+	switch numOut {
+	case 0, 1:
 	case 2:
-		if !methodType.Out(1).Implements(errorType) {
+		if !returnsError {
 			return nil, fmt.Errorf("entity operation %q second return value must implement error", ctx.Operation)
 		}
 	default:
-		return nil, fmt.Errorf("entity operation %q has unsupported return count %d", ctx.Operation, methodType.NumOut())
+		return nil, fmt.Errorf("entity operation %q has unsupported return count %d", ctx.Operation, numOut)
 	}
 
 	results := method.Func.Call(args)
-	switch len(results) {
-	case 0:
+	switch {
+	case numOut == 0:
 		return nil, nil
-	case 1:
+	case numOut == 1 && returnsError:
+		return nil, reflectError(results[0])
+	case numOut == 1:
 		return reflectResult(results[0]), nil
-	case 2:
-		return reflectResult(results[0]), reflectError(results[1])
 	default:
-		panic("validated entity method returned an unexpected result count")
+		return reflectResult(results[0]), reflectError(results[1])
 	}
 }
 

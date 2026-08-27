@@ -468,17 +468,9 @@ func (g *grpcExecutor) CompleteEntityTask(ctx context.Context, response *protos.
 	if token == "" {
 		return nil, status.Error(codes.InvalidArgument, "entity completion token is required")
 	}
-	value, ok := g.pendingEntities.LoadAndDelete(token)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "unknown entity completion token %q", token)
+	if err := g.resolveEntityTask(token, response); err != nil {
+		return nil, err
 	}
-	pending := value.(*entityExecutionResult)
-	g.pendingEntityInstances.Delete(pending.instanceID)
-	pending.response = response
-	if pending.pending != nil {
-		pending.pending <- token
-	}
-	close(pending.complete)
 	return emptyCompleteTaskResponse, nil
 }
 
@@ -487,17 +479,28 @@ func (g *grpcExecutor) AbandonTaskEntityWorkItem(_ context.Context, request *pro
 	if request.GetCompletionToken() == "" {
 		return nil, status.Error(codes.InvalidArgument, "entity completion token is required")
 	}
-	value, ok := g.pendingEntities.LoadAndDelete(request.CompletionToken)
+	// A nil response makes the waiting ExecuteEntity call report an aborted operation.
+	if err := g.resolveEntityTask(request.CompletionToken, nil); err != nil {
+		return nil, err
+	}
+	return &protos.AbandonEntityTaskResponse{}, nil
+}
+
+// resolveEntityTask releases the entity batch identified by completionToken and hands
+// response, which may be nil when the batch was abandoned, to the waiting caller.
+func (g *grpcExecutor) resolveEntityTask(completionToken string, response *protos.EntityBatchResult) error {
+	value, ok := g.pendingEntities.LoadAndDelete(completionToken)
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "unknown entity completion token %q", request.CompletionToken)
+		return status.Errorf(codes.NotFound, "unknown entity completion token %q", completionToken)
 	}
 	pending := value.(*entityExecutionResult)
 	g.pendingEntityInstances.Delete(pending.instanceID)
+	pending.response = response
 	if pending.pending != nil {
-		pending.pending <- request.CompletionToken
+		pending.pending <- completionToken
 	}
 	close(pending.complete)
-	return &protos.AbandonEntityTaskResponse{}, nil
+	return nil
 }
 
 // CreateTaskHub implements protos.TaskHubSidecarServiceServer
@@ -629,9 +632,9 @@ func (g *grpcExecutor) SignalEntity(ctx context.Context, req *protos.SignalEntit
 
 // GetEntity implements protos.TaskHubSidecarServiceServer.
 func (g *grpcExecutor) GetEntity(ctx context.Context, req *protos.GetEntityRequest) (*protos.GetEntityResponse, error) {
-	entityBackend, ok := g.backend.(EntityQueryBackend)
-	if !ok {
-		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	entityBackend, err := g.entityQueryBackend()
+	if err != nil {
+		return nil, err
 	}
 	entityID, err := api.EntityIDFromString(req.InstanceId)
 	if err != nil {
@@ -649,9 +652,9 @@ func (g *grpcExecutor) GetEntity(ctx context.Context, req *protos.GetEntityReque
 
 // QueryEntities implements protos.TaskHubSidecarServiceServer.
 func (g *grpcExecutor) QueryEntities(ctx context.Context, req *protos.QueryEntitiesRequest) (*protos.QueryEntitiesResponse, error) {
-	entityBackend, ok := g.backend.(EntityQueryBackend)
-	if !ok {
-		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	entityBackend, err := g.entityQueryBackend()
+	if err != nil {
+		return nil, err
 	}
 	query := api.EntityQuery{}
 	if req.Query != nil {
@@ -686,9 +689,9 @@ func (g *grpcExecutor) QueryEntities(ctx context.Context, req *protos.QueryEntit
 
 // CleanEntityStorage implements protos.TaskHubSidecarServiceServer.
 func (g *grpcExecutor) CleanEntityStorage(ctx context.Context, req *protos.CleanEntityStorageRequest) (*protos.CleanEntityStorageResponse, error) {
-	entityBackend, ok := g.backend.(EntityQueryBackend)
-	if !ok {
-		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	entityBackend, err := g.entityQueryBackend()
+	if err != nil {
+		return nil, err
 	}
 	result, err := entityBackend.CleanEntityStorage(ctx, api.CleanEntityStorageRequest{
 		ContinuationToken:    req.ContinuationToken.GetValue(),
@@ -706,6 +709,16 @@ func (g *grpcExecutor) CleanEntityStorage(ctx context.Context, req *protos.Clean
 		EmptyEntitiesRemoved:  result.EmptyEntitiesRemoved,
 		OrphanedLocksReleased: result.OrphanedLocksReleased,
 	}, nil
+}
+
+// entityQueryBackend returns the configured backend's entity query support, or a
+// gRPC status error when the backend does not implement durable entities.
+func (g *grpcExecutor) entityQueryBackend() (EntityQueryBackend, error) {
+	entityBackend, ok := g.backend.(EntityQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	}
+	return entityBackend, nil
 }
 
 func entityMetadataToProto(entity *api.EntityMetadata) *protos.EntityMetadata {
