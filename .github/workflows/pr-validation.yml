@@ -78,6 +78,11 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Check orchestrator goroutines
+        run: |
+          go build -o "$RUNNER_TEMP/orchestratorvet" ./cmd/orchestratorvet
+          go vet -vettool="$RUNNER_TEMP/orchestratorvet" ./...
+
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
 
