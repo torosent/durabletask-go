@@ -1,12 +1,30 @@
 package client
 
 import (
+	"context"
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGrpcClientDefaultVersionAndExplicitUnversionedOverride(t *testing.T) {
+	sidecar := new(largePayloadSidecarClient)
+	client := &TaskHubGrpcClient{
+		client:         sidecar,
+		defaultVersion: "v2",
+	}
+
+	_, err := client.ScheduleNewOrchestration(context.Background(), "orchestration")
+	require.NoError(t, err)
+	require.Equal(t, "v2", sidecar.start.GetVersion().GetValue())
+
+	_, err = client.ScheduleNewOrchestration(context.Background(), "orchestration", api.WithVersion(""))
+	require.NoError(t, err)
+	require.NotNil(t, sidecar.start.Version)
+	require.Empty(t, sidecar.start.GetVersion().GetValue())
+}
 
 func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
 	tests := []struct {
@@ -46,7 +64,7 @@ func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
 				Action:          tt.action,
 				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_RUNNING},
 			})
-			require.NoError(t, configure(req))
+			require.NoError(t, configure(req, api.DefaultDataConverter()))
 
 			c := &TaskHubGrpcClient{allowLegacyIDReusePolicyWire: tt.allowLegacy}
 			err := c.prepareOrchestrationIDReusePolicy(req)

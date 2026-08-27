@@ -545,8 +545,7 @@ func workItemFilterMatcher(workItem *protos.WorkItem) func(*protos.WorkItemFilte
 				return true
 			}
 			for _, filter := range filters.GetActivities() {
-				if filter.GetName() == name &&
-					(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), version)) {
+				if matchesTaskFilter(filter.GetName(), filter.GetVersions(), name, version) {
 					return true
 				}
 			}
@@ -641,12 +640,18 @@ func orchestrationRequestIdentity(request *protos.OrchestratorRequest) (string, 
 
 func matchesOrchestrationFilters(filters []*protos.OrchestrationFilter, name, version string) bool {
 	for _, filter := range filters {
-		if filter.GetName() == name &&
-			(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), version)) {
+		if matchesTaskFilter(filter.GetName(), filter.GetVersions(), name, version) {
 			return true
 		}
 	}
 	return false
+}
+
+func matchesTaskFilter(filterName string, filterVersions []string, taskName, taskVersion string) bool {
+	return strings.EqualFold(filterName, taskName) &&
+		(len(filterVersions) == 0 || slices.ContainsFunc(filterVersions, func(candidate string) bool {
+			return strings.EqualFold(candidate, taskVersion)
+		}))
 }
 
 // CompleteOrchestratorTask implements protos.TaskHubSidecarServiceServer

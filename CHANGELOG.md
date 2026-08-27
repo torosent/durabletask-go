@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added pluggable large-payload store/resolver support with size limits, SHA-256 integrity validation, memory/file implementations, and opt-in DTS capability advertisement.
 - Added API-owned structured failure details, typed task and entity operation errors, stable cross-language error types, bounded panic stacks, nested causes, and custom error-property enrichment.
 - Added centralized request/response gRPC error mapping that preserves both `errors.Is` categories and original gRPC status codes.
+- Added version-keyed orchestrator and activity registrations, exact-match dispatch with controlled unversioned fallback, client/worker default versions, activity inheritance, registry-derived filters, and ContinueAsNew version migration.
+- Added API-owned pluggable data conversion across orchestration, activity, entity, event, status, management, metadata, and ContinueAsNew payloads, with JSON as the compatibility default and raw API bypasses.
 
 ### Changed
 

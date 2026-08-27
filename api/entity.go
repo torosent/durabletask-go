@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -47,26 +46,27 @@ type EntityMetadata struct {
 	BacklogQueueSize int32
 	LockedBy         string
 	SerializedState  string
+	Converter        DataConverter `json:"-"`
 }
 
 // SignalEntityOptions is a functional option type for signaling an entity.
-type SignalEntityOptions func(*protos.SignalEntityRequest) error
+type SignalEntityOptions func(*protos.SignalEntityRequest, DataConverter) error
 
 // WithSignalInput configures the input for an entity signal.
 func WithSignalInput(input any) SignalEntityOptions {
-	return func(req *protos.SignalEntityRequest) error {
-		bytes, err := json.Marshal(input)
+	return func(req *protos.SignalEntityRequest, converter DataConverter) error {
+		payload, err := SerializeData(converter, input)
 		if err != nil {
 			return err
 		}
-		req.Input = wrapperspb.String(string(bytes))
+		req.Input = wrapperspb.String(payload)
 		return nil
 	}
 }
 
 // WithRawSignalInput configures a raw string input for an entity signal.
 func WithRawSignalInput(input string) SignalEntityOptions {
-	return func(req *protos.SignalEntityRequest) error {
+	return func(req *protos.SignalEntityRequest, _ DataConverter) error {
 		req.Input = wrapperspb.String(input)
 		return nil
 	}
@@ -74,10 +74,15 @@ func WithRawSignalInput(input string) SignalEntityOptions {
 
 // WithSignalScheduledTime configures a scheduled time for the entity signal.
 func WithSignalScheduledTime(t time.Time) SignalEntityOptions {
-	return func(req *protos.SignalEntityRequest) error {
+	return func(req *protos.SignalEntityRequest, _ DataConverter) error {
 		req.ScheduledTime = timestamppb.New(t)
 		return nil
 	}
+}
+
+// ReadState deserializes entity state with the metadata converter.
+func (m *EntityMetadata) ReadState(target any) error {
+	return deserializePayload(m.Converter, m.SerializedState, target)
 }
 
 // EntityQuery defines filter criteria for querying entities.

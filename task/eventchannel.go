@@ -88,7 +88,7 @@ func (c *EventChannel[T]) TryReceiveErr() (T, bool, error) {
 		return value, false, nil
 	}
 	raw := []byte(buffered.event.GetEventRaised().GetInput().GetValue())
-	if err := unmarshalData(raw, &value); err != nil {
+	if err := unmarshalData(c.ctx.converter, raw, &value); err != nil {
 		return value, true, fmt.Errorf("failed to decode event %q as %s: %w", c.name, reflect.TypeOf(value), err)
 	}
 	return value, true, nil

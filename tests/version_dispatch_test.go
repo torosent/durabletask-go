@@ -192,3 +192,70 @@ func enqueueVersionedActivity(t *testing.T, be backend.Backend, instanceID strin
 	workItem.State = state
 	require.NoError(t, be.CompleteOrchestrationWorkItem(ctx, workItem))
 }
+
+func TestVersionChangingContinueAsNewHandsOffBetweenStrictWorkers(t *testing.T) {
+	for i, be := range backends {
+		initTest(t, be, i, true)
+
+		v1Registry := task.NewTaskRegistry()
+		require.NoError(t, v1Registry.AddOrchestratorNVersion("rolling", "1.0", func(ctx *task.OrchestrationContext) (any, error) {
+			ctx.ContinueAsNew("next", task.WithContinueAsNewVersion("2.0"))
+			return nil, nil
+		}))
+		v2Registry := task.NewTaskRegistry()
+		require.NoError(t, v2Registry.AddOrchestratorNVersion("rolling", "2.0", func(ctx *task.OrchestrationContext) (any, error) {
+			var input string
+			if err := ctx.GetInput(&input); err != nil {
+				return nil, err
+			}
+			return "completed-" + input, nil
+		}))
+
+		v1Worker := backend.NewOrchestrationWorker(
+			be,
+			task.NewTaskExecutor(v1Registry, task.WithVersioning(task.VersioningOptions{
+				Version:         "1.0",
+				MatchStrategy:   task.VersionMatchStrict,
+				FailureStrategy: task.VersionFailureReject,
+			})),
+			logger,
+		)
+		v2Worker := backend.NewOrchestrationWorker(
+			be,
+			task.NewTaskExecutor(v2Registry, task.WithVersioning(task.VersioningOptions{
+				Version:         "2.0",
+				MatchStrategy:   task.VersionMatchStrict,
+				FailureStrategy: task.VersionFailureReject,
+			})),
+			logger,
+		)
+		client := backend.NewTaskHubClient(be)
+		instanceID, err := client.ScheduleNewOrchestration(
+			context.Background(),
+			"rolling",
+			api.WithVersion("1.0"),
+		)
+		require.NoError(t, err)
+		processed, err := v1Worker.ProcessNext(context.Background())
+		require.NoError(t, err)
+		require.True(t, processed)
+		require.Eventually(t, func() bool {
+			metadata, metadataErr := client.FetchOrchestrationMetadata(context.Background(), instanceID)
+			return metadataErr == nil &&
+				metadata.RuntimeStatus == api.RUNTIME_STATUS_PENDING &&
+				metadata.Version == "2.0"
+		}, 5*time.Second, 10*time.Millisecond)
+		v1Worker.StopAndDrain()
+
+		processed, err = v2Worker.ProcessNext(context.Background())
+		require.NoError(t, err)
+		require.True(t, processed)
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		metadata, err := client.WaitForOrchestrationCompletion(waitCtx, instanceID)
+		waitCancel()
+		v2Worker.StopAndDrain()
+		require.NoError(t, err)
+		require.Equal(t, "2.0", metadata.Version)
+		require.Equal(t, `"completed-next"`, metadata.SerializedOutput)
+	}
+}
