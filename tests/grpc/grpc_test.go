@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 			log.Printf("failed to close connection: %v", err)
 		}
 	}()
-	grpcClient = client.NewTaskHubGrpcClient(conn, logger)
+	grpcClient = client.NewTaskHubGrpcClient(conn, logger, client.WithLegacyOrchestrationIDReusePolicyWire())
 
 	// Run the test exitCode
 	exitCode := m.Run()
