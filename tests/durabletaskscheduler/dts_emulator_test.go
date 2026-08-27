@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,4 +252,128 @@ func TestDTSEmulatorWorkerStopAndRestart(t *testing.T) {
 	metadata, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID, api.WithFetchPayloads(true))
 	require.NoError(t, err)
 	require.Equal(t, `"restarted"`, metadata.SerializedOutput)
+}
+
+func TestDTSEmulatorSelectEventCancelsTimer(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSSelect", func(ctx *task.OrchestrationContext) (any, error) {
+		timerCtx, cancelTimer := ctx.WithCancel()
+		timer := timerCtx.CreateTimer(time.Minute)
+		events := task.NewEventChannel[string](ctx, "approval")
+		selected := ""
+		ctx.Select(
+			task.OnTask(timer, func(task.Task) { selected = "timeout" }),
+			task.OnEvent(events, func(value string) { selected = value }),
+		)
+		cancelTimer()
+		return selected, nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSSelect",
+		api.WithInstanceID(uniqueInstanceID("go-select")),
+	)
+	require.NoError(t, err)
+	_, err = managementClient.WaitForOrchestrationStart(ctx, instanceID)
+	require.NoError(t, err)
+	require.NoError(t, managementClient.RaiseEvent(
+		ctx,
+		instanceID,
+		"approval",
+		api.WithEventPayload("approved"),
+	))
+	metadata, err := managementClient.WaitForOrchestrationCompletion(
+		ctx,
+		instanceID,
+		api.WithFetchPayloads(true),
+	)
+	require.NoError(t, err)
+	require.Equal(t, `"approved"`, metadata.SerializedOutput)
+}
+
+func TestDTSEmulatorConcurrentCoroutineFanOut(t *testing.T) {
+	const (
+		instanceCount = 16
+		fanOut        = 16
+		expected      = fanOut * (fanOut - 1)
+	)
+
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSConcurrentFanOut", func(ctx *task.OrchestrationContext) (any, error) {
+		results := make([]int, fanOut)
+		waitGroup := ctx.NewWaitGroup()
+		waitGroup.Add(fanOut)
+		for i := range fanOut {
+			i := i
+			ctx.Go(func(ctx *task.OrchestrationContext) {
+				defer waitGroup.Done()
+				if err := ctx.CallActivity(
+					"DTSDouble",
+					task.WithActivityInput(i),
+				).Await(&results[i]); err != nil {
+					panic(err)
+				}
+			})
+		}
+		waitGroup.Wait(ctx)
+		total := 0
+		for _, result := range results {
+			total += result
+		}
+		return total, nil
+	}))
+	require.NoError(t, registry.AddActivityN("DTSDouble", func(ctx task.ActivityContext) (any, error) {
+		var value int
+		if err := ctx.GetInput(&value); err != nil {
+			return nil, err
+		}
+		return value * 2, nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	instanceIDs := make([]api.InstanceID, instanceCount)
+	for i := range instanceCount {
+		instanceID, err := managementClient.ScheduleNewOrchestration(
+			ctx,
+			"DTSConcurrentFanOut",
+			api.WithInstanceID(uniqueInstanceID("go-fanout")),
+		)
+		require.NoError(t, err)
+		instanceIDs[i] = instanceID
+	}
+
+	errs := make(chan error, instanceCount)
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(instanceCount)
+	for _, instanceID := range instanceIDs {
+		instanceID := instanceID
+		go func() {
+			defer waitGroup.Done()
+			metadata, err := managementClient.WaitForOrchestrationCompletion(
+				ctx,
+				instanceID,
+				api.WithFetchPayloads(true),
+			)
+			if err == nil && metadata.SerializedOutput != fmt.Sprintf("%d", expected) {
+				err = fmt.Errorf(
+					"%s output = %s, want %d",
+					instanceID,
+					metadata.SerializedOutput,
+					expected,
+				)
+			}
+			errs <- err
+		}()
+	}
+	waitGroup.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }
