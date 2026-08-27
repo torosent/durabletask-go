@@ -147,7 +147,7 @@ func TestCallEntityCompletionAfterUnlockDoesNotPanic(t *testing.T) {
 			EntityOperationCompleted: &protos.EntityOperationCompletedEvent{RequestId: callAction.RequestId},
 		},
 	}
-	thirdHistory := append(secondHistory, callHistory, unlockHistory)
+	thirdHistory := append(append([]*protos.HistoryEvent(nil), secondHistory...), callHistory, unlockHistory)
 	var third *protos.OrchestratorResponse
 	require.NotPanics(t, func() {
 		third = executeOrchestrationTurn(

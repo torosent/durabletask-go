@@ -2,7 +2,10 @@ package backend
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -41,5 +44,65 @@ func TestOrchestrationRuntimeStateSnapshotIncludesRelationships(t *testing.T) {
 		snapshot.ChildInstanceIDs[0] != "a" ||
 		snapshot.ChildInstanceIDs[1] != "z" {
 		t.Fatalf("unexpected child IDs: %v", snapshot.ChildInstanceIDs)
+	}
+}
+
+func TestContinueAsNewDropsCorrelatedPendingWork(t *testing.T) {
+	state := NewOrchestrationRuntimeState("parent", []*HistoryEvent{
+		helpers.NewExecutionStartedEvent("parent", "parent", nil, nil, nil, nil),
+	})
+	signal := &protos.OrchestratorAction{
+		Id: 4,
+		OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+			SendEntityMessage: &protos.SendEntityMessageAction{
+				EntityMessageType: &protos.SendEntityMessageAction_EntityOperationSignaled{
+					EntityOperationSignaled: &protos.EntityOperationSignaledEvent{
+						RequestId:        uuid.NewString(),
+						Operation:        "signal",
+						TargetInstanceId: wrapperspb.String("@counter@one"),
+					},
+				},
+			},
+		},
+	}
+	continued, err := state.ApplyActions([]*protos.OrchestratorAction{
+		helpers.NewScheduleTaskAction(0, "activity", nil),
+		helpers.NewCreateTimerAction(1, time.Now().Add(time.Minute)),
+		helpers.NewCreateSubOrchestrationAction(2, "child", "child", nil),
+		func() *protos.OrchestratorAction {
+			action := helpers.NewSendEventAction("target", "event", wrapperspb.String("1"))
+			action.Id = 3
+			return action
+		}(),
+		signal,
+		helpers.NewTerminateOrchestrationAction(5, "victim", false, nil),
+		helpers.NewCompleteOrchestrationAction(
+			6,
+			protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW,
+			wrapperspb.String("1"),
+			nil,
+			nil,
+		),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !continued {
+		t.Fatal("expected ContinueAsNew")
+	}
+	if len(state.pendingTasks) != 0 || len(state.pendingTimers) != 0 {
+		t.Fatalf("correlated pending work carried over: tasks=%d timers=%d", len(state.pendingTasks), len(state.pendingTimers))
+	}
+	if len(state.pendingMessages) != 2 ||
+		state.pendingMessages[0].HistoryEvent.GetEventRaised() == nil ||
+		state.pendingMessages[1].HistoryEvent.GetExecutionTerminated() == nil {
+		t.Fatalf("unexpected orchestration messages: %v", state.pendingMessages)
+	}
+	if len(state.pendingEntityMessages) != 1 ||
+		state.pendingEntityMessages[0].HistoryEvent.GetEntityOperationSignaled() == nil {
+		t.Fatalf("unexpected entity messages: %v", state.pendingEntityMessages)
+	}
+	if state.instanceID != api.InstanceID("parent") {
+		t.Fatalf("instance ID changed: %s", state.instanceID)
 	}
 }

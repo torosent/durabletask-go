@@ -22,7 +22,7 @@ var (
 // return shapes are (), (result), (error), and (result, error).
 func NewEntityFor[S any]() Entity {
 	stateType := reflect.TypeFor[S]()
-	if stateType.Kind() == reflect.Ptr {
+	if stateType.Kind() == reflect.Pointer {
 		panic("NewEntityFor does not support pointer state types")
 	}
 
@@ -156,7 +156,7 @@ func reflectError(value reflect.Value) error {
 
 func isNilable(kind reflect.Kind) bool {
 	switch kind {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return true
 	default:
 		return false

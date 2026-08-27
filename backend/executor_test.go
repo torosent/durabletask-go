@@ -162,3 +162,67 @@ func Test_GrpcExecutor_StaleEntityCompletionPreservesNewInstanceGuard(t *testing
 	require.True(t, ok)
 	require.Equal(t, "new-token", value)
 }
+
+func Test_GrpcExecutor_AbandonOrchestratorTaskUnblocksPendingExecution(t *testing.T) {
+	executor, _ := NewGrpcExecutor(nil, DefaultLogger())
+	g := executor.(*grpcExecutor)
+	pending := &ExecutionResults{completionToken: "orchestration-token", complete: make(chan struct{})}
+	g.pendingOrchestrators.Store(api.InstanceID("instance"), pending)
+	g.pendingOrchestratorTokens.Store("orchestration-token", api.InstanceID("instance"))
+
+	_, err := g.AbandonTaskOrchestratorWorkItem(
+		context.Background(),
+		&protos.AbandonOrchestrationTaskRequest{CompletionToken: "orchestration-token"},
+	)
+	require.NoError(t, err)
+	select {
+	case <-pending.complete:
+	default:
+		t.Fatal("orchestration abandon did not unblock pending execution")
+	}
+	require.Nil(t, pending.Response)
+}
+
+func Test_GrpcExecutor_AbandonActivityTaskUnblocksPendingExecution(t *testing.T) {
+	executor, _ := NewGrpcExecutor(nil, DefaultLogger())
+	g := executor.(*grpcExecutor)
+	pending := &activityExecutionResult{completionToken: "activity-token", complete: make(chan struct{})}
+	g.pendingActivities.Store("instance/1", pending)
+	g.pendingActivityTokens.Store("activity-token", "instance/1")
+
+	_, err := g.AbandonTaskActivityWorkItem(
+		context.Background(),
+		&protos.AbandonActivityTaskRequest{CompletionToken: "activity-token"},
+	)
+	require.NoError(t, err)
+	select {
+	case <-pending.complete:
+	default:
+		t.Fatal("activity abandon did not unblock pending execution")
+	}
+	require.Nil(t, pending.response)
+}
+
+func Test_GrpcExecutor_StaleOrchestrationTokenDoesNotAbortReplacement(t *testing.T) {
+	executor, _ := NewGrpcExecutor(nil, DefaultLogger())
+	g := executor.(*grpcExecutor)
+	instanceID := api.InstanceID("instance")
+	replacement := &ExecutionResults{completionToken: "new-token", complete: make(chan struct{})}
+	g.pendingOrchestrators.Store(instanceID, replacement)
+	g.pendingOrchestratorTokens.Store("old-token", instanceID)
+	g.pendingOrchestratorTokens.Store("new-token", instanceID)
+
+	_, err := g.AbandonTaskOrchestratorWorkItem(
+		context.Background(),
+		&protos.AbandonOrchestrationTaskRequest{CompletionToken: "old-token"},
+	)
+	require.Error(t, err)
+	value, ok := g.pendingOrchestrators.Load(instanceID)
+	require.True(t, ok)
+	require.Same(t, replacement, value)
+	select {
+	case <-replacement.complete:
+		t.Fatal("stale token aborted the replacement execution")
+	default:
+	}
+}
