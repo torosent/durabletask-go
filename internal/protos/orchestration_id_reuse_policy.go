@@ -2,6 +2,7 @@ package protos
 
 import (
 	"fmt"
+	"math"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -54,7 +55,7 @@ func GetLegacyOrchestrationIDReuseAction(policy *OrchestrationIdReusePolicy) (in
 			if n < 0 {
 				return 0, false, protowire.ParseError(n)
 			}
-			if value > uint64(^uint32(0)>>1) {
+			if value > uint64(math.MaxInt32) {
 				return 0, false, fmt.Errorf("legacy orchestration ID reuse action %d overflows int32", value)
 			}
 			current := int32(value)

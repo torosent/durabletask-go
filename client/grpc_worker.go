@@ -21,7 +21,6 @@ import (
 
 var (
 	ErrTaskHubGrpcWorkerAlreadyRunning = errors.New("gRPC worker is already running")
-	ErrTaskHubGrpcWorkerNotRunning     = errors.New("gRPC worker is not running")
 	errSilentDisconnect                = errors.New("work item stream was silent beyond the configured timeout")
 )
 
@@ -175,8 +174,7 @@ type grpcWorkerConnection struct {
 	cancelStream context.CancelFunc
 	closer       io.Closer
 
-	pending    sync.WaitGroup
-	retireOnce sync.Once
+	pending sync.WaitGroup
 }
 
 // NewTaskHubGrpcWorker creates a worker that borrows a caller-owned connection.
@@ -408,7 +406,7 @@ func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerCo
 		if run.intakeCtx.Err() != nil {
 			return nil
 		}
-		if err != nil && !isTransientWorkerError(err) {
+		if !isTransientWorkerError(err) {
 			return fmt.Errorf("work item stream stopped with a non-retryable error: %w", err)
 		}
 		if observedMessage {
@@ -481,19 +479,17 @@ func (w *TaskHubGrpcWorker) connect(ctx context.Context) (*grpcWorkerConnection,
 }
 
 func (w *TaskHubGrpcWorker) retireConnection(run *grpcWorkerRun, connection *grpcWorkerConnection) {
-	connection.retireOnce.Do(func() {
-		connection.cancelStream()
-		run.retired.Add(1)
-		go func() {
-			defer run.retired.Done()
-			connection.pending.Wait()
-			if connection.closer != nil {
-				if err := connection.closer.Close(); err != nil {
-					w.logger.Warnf("failed to close retired gRPC worker connection: %v", err)
-				}
+	connection.cancelStream()
+	run.retired.Add(1)
+	go func() {
+		defer run.retired.Done()
+		connection.pending.Wait()
+		if connection.closer != nil {
+			if err := connection.closer.Close(); err != nil {
+				w.logger.Warnf("failed to close retired gRPC worker connection: %v", err)
 			}
-		}()
-	})
+		}
+	}()
 }
 
 func isTransientWorkerError(err error) bool {
@@ -504,7 +500,11 @@ func isTransientWorkerError(err error) bool {
 	if !ok {
 		return false
 	}
-	switch grpcStatus.Code() {
+	return isTransientWorkerGRPCCode(grpcStatus.Code())
+}
+
+func isTransientWorkerGRPCCode(code codes.Code) bool {
+	switch code {
 	case codes.Canceled,
 		codes.DeadlineExceeded,
 		codes.ResourceExhausted,

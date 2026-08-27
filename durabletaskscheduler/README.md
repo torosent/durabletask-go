@@ -51,7 +51,7 @@ cancels them only if the shutdown context expires.
 | Large-payload capability | Not advertised |
 | Durable entities | Not implemented; tokenized entity work is abandoned |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
-| Legacy instance-ID `IGNORE` | Local sidecars only; rejected for DTS because the current wire format is ambiguous |
+| Legacy instance-ID `IGNORE` | Known-compatible local sidecars only, with `client.WithLegacyOrchestrationIDReusePolicyWire`; rejected for DTS because the current wire format is ambiguous |
 
 ## Emulator tests
 
