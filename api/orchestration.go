@@ -127,6 +127,14 @@ func WithStartTime(startTime time.Time) NewOrchestrationOptions {
 	}
 }
 
+// WithVersion configures the orchestration version.
+func WithVersion(version string) NewOrchestrationOptions {
+	return func(req *protos.CreateInstanceRequest) error {
+		req.Version = wrapperspb.String(version)
+		return nil
+	}
+}
+
 // WithFetchPayloads configures whether to load orchestration inputs, outputs, and custom status values, which could be large.
 func WithFetchPayloads(fetchPayloads bool) FetchOrchestrationMetadataOptions {
 	return func(req *protos.GetInstanceRequest) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,10 +21,16 @@ import (
 // Orchestrator is the functional interface for orchestrator functions.
 type Orchestrator func(ctx *OrchestrationContext) (any, error)
 
+type replayEvent struct {
+	event       *protos.HistoryEvent
+	isReplaying bool
+}
+
 // OrchestrationContext is the parameter type for orchestrator functions.
 type OrchestrationContext struct {
 	ID             api.InstanceID
 	Name           string
+	Version        string
 	IsReplaying    bool
 	CurrentTimeUtc time.Time
 
@@ -31,8 +38,10 @@ type OrchestrationContext struct {
 	rawInput            []byte
 	oldEvents           []*protos.HistoryEvent
 	newEvents           []*protos.HistoryEvent
-	suspendedEvents     []*protos.HistoryEvent
+	suspendedEvents     []replayEvent
+	resumedEvents       []replayEvent
 	isSuspended         bool
+	isTerminated        bool
 	historyIndex        int
 	sequenceNumber      int32
 	pendingActions      map[int32]*protos.OrchestratorAction
@@ -40,9 +49,15 @@ type OrchestrationContext struct {
 	continuedAsNew      bool
 	continuedAsNewInput any
 	customStatus        string
+	scheduler           *coroutineScheduler
+	root                *OrchestrationContext
+	scope               *cancellationScope
+	derived             []*OrchestrationContext
 
 	bufferedExternalEvents     map[string]*list.List
 	pendingExternalEventTasks  map[string]*list.List
+	eventChannels              map[string]any
+	eventWaiters               map[string]map[*coroutine]struct{}
 	saveBufferedExternalEvents bool
 }
 
@@ -50,6 +65,7 @@ type OrchestrationContext struct {
 type callSubOrchestratorOptions struct {
 	instanceID string
 	rawInput   *wrapperspb.StringValue
+	version    *wrapperspb.StringValue
 
 	retryPolicy *RetryPolicy
 }
@@ -99,6 +115,14 @@ func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
 	}
 }
 
+// WithSubOrchestrationVersion configures the sub-orchestration version.
+func WithSubOrchestrationVersion(version string) subOrchestratorOption {
+	return func(opts *callSubOrchestratorOptions) error {
+		opts.version = wrapperspb.String(version)
+		return nil
+	}
+}
+
 func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) subOrchestratorOption {
 	return func(opt *callSubOrchestratorOptions) error {
 		if policy == nil {
@@ -115,14 +139,62 @@ func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) subOrchestratorOption 
 
 // NewOrchestrationContext returns a new [OrchestrationContext] struct with the specified parameters.
 func NewOrchestrationContext(registry *TaskRegistry, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) *OrchestrationContext {
-	return &OrchestrationContext{
+	ctx := &OrchestrationContext{
 		ID:                        id,
 		registry:                  registry,
 		oldEvents:                 oldEvents,
 		newEvents:                 newEvents,
 		bufferedExternalEvents:    make(map[string]*list.List),
 		pendingExternalEventTasks: make(map[string]*list.List),
+		eventChannels:             make(map[string]any),
+		eventWaiters:              make(map[string]map[*coroutine]struct{}),
 	}
+	ctx.scope = newCancellationScope(nil)
+	return ctx
+}
+
+func (ctx *OrchestrationContext) engineContext() *OrchestrationContext {
+	if ctx.root != nil {
+		return ctx.root
+	}
+	return ctx
+}
+
+func (ctx *OrchestrationContext) syncDerivedContexts() {
+	for _, derived := range ctx.derived {
+		derived.ID = ctx.ID
+		derived.Name = ctx.Name
+		derived.Version = ctx.Version
+		derived.IsReplaying = ctx.IsReplaying
+		derived.CurrentTimeUtc = ctx.CurrentTimeUtc
+		derived.scheduler = ctx.scheduler
+	}
+}
+
+// WithCancel creates a child orchestration context whose tasks, nested scopes,
+// and coroutines are canceled together at the next scheduler step.
+func (ctx *OrchestrationContext) WithCancel() (*OrchestrationContext, func()) {
+	engine := ctx.engineContext()
+	if engine.scheduler == nil {
+		panic("cancellation scope created outside orchestrator execution")
+	}
+	child := &OrchestrationContext{
+		ID:             engine.ID,
+		Name:           engine.Name,
+		Version:        engine.Version,
+		IsReplaying:    engine.IsReplaying,
+		CurrentTimeUtc: engine.CurrentTimeUtc,
+		root:           engine,
+		scope:          newCancellationScope(ctx.scope),
+		scheduler:      engine.scheduler,
+	}
+	engine.derived = append(engine.derived, child)
+	cancel := func() {
+		if engine.scheduler != nil {
+			engine.scheduler.requestCancellation(child.scope)
+		}
+	}
+	return child, cancel
 }
 
 func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) {
@@ -130,30 +202,63 @@ func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) 
 	ctx.sequenceNumber = 0
 	ctx.pendingActions = make(map[int32]*protos.OrchestratorAction)
 	ctx.pendingTasks = make(map[int32]*completableTask)
-
+	ctx.scheduler = newCoroutineScheduler(ctx)
 	defer func() {
-		result := recover()
-		if resultErr, ok := result.(error); ok && errors.Is(resultErr, ErrTaskBlocked) {
-			// Expected, normal part of execution
-			actions = ctx.actions()
-		} else if result != nil {
-			// Unexpected panic!
-			panic(result)
-		}
+		ctx.scheduler.shutdown()
+		ctx.scheduler = nil
 	}()
 
+	terminal := false
+	markTerminal := func() {
+		terminal = true
+		ctx.scheduler.shutdown()
+	}
 	for {
-		if ok, err := ctx.processNextEvent(); err != nil {
-			if setErr := ctx.setFailed(err); setErr != nil {
-				break
+		if !terminal && ctx.scheduler.terminalErr != nil {
+			_ = ctx.setFailed(ctx.scheduler.terminalErr)
+			markTerminal()
+		}
+
+		if !terminal && ctx.scheduler.hasRunnable() {
+			ctx.scheduler.runNext()
+			if ctx.scheduler.terminalErr != nil {
+				continue
 			}
+			if ctx.scheduler.isRootCompleted() && !ctx.scheduler.rootFinalized {
+				ctx.scheduler.rootFinalized = true
+				if err := ctx.completeRootCoroutine(); err != nil {
+					_ = ctx.setFailed(err)
+				}
+				markTerminal()
+			}
+			continue
+		}
+
+		ok, err := ctx.processNextEvent()
+		if err != nil {
+			_ = ctx.setFailed(err)
+			markTerminal()
 			break
-		} else if !ok {
-			// Orchestrator finished, break out of the loop and return any pending actions
+		}
+		if !ok {
 			break
+		}
+		if ctx.isTerminated && !terminal {
+			markTerminal()
 		}
 	}
 	return ctx.actions()
+}
+
+func (ctx *OrchestrationContext) completeRootCoroutine() error {
+	switch {
+	case ctx.scheduler.rootErr != nil:
+		return ctx.setFailed(ctx.scheduler.rootErr)
+	case ctx.continuedAsNew:
+		return ctx.setContinuedAsNew()
+	default:
+		return ctx.setComplete(ctx.scheduler.rootResult)
+	}
 }
 
 func (ctx *OrchestrationContext) processNextEvent() (bool, error) {
@@ -171,6 +276,13 @@ func (ctx *OrchestrationContext) processNextEvent() (bool, error) {
 }
 
 func (ctx *OrchestrationContext) getNextHistoryEvent() (*protos.HistoryEvent, bool) {
+	if len(ctx.resumedEvents) > 0 {
+		next := ctx.resumedEvents[0]
+		ctx.resumedEvents = ctx.resumedEvents[1:]
+		ctx.IsReplaying = next.isReplaying
+		return next.event, true
+	}
+
 	var historyList []*protos.HistoryEvent
 	index := ctx.historyIndex
 	switch {
@@ -191,9 +303,13 @@ func (ctx *OrchestrationContext) getNextHistoryEvent() (*protos.HistoryEvent, bo
 }
 
 func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
+	defer ctx.syncDerivedContexts()
 	// Buffer certain events if we're in a suspended state
 	if ctx.isSuspended && (e.GetExecutionResumed() == nil && e.GetExecutionTerminated() == nil) {
-		ctx.suspendedEvents = append(ctx.suspendedEvents, e)
+		ctx.suspendedEvents = append(ctx.suspendedEvents, replayEvent{
+			event:       e,
+			isReplaying: ctx.IsReplaying,
+		})
 		return nil
 	}
 
@@ -219,6 +335,8 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 		err = ctx.onTimerCreated(e)
 	} else if tf := e.GetTimerFired(); tf != nil {
 		err = ctx.onTimerFired(tf)
+	} else if es := e.GetEventSent(); es != nil {
+		err = ctx.onEventSent(e.EventId, es)
 	} else if er := e.GetEventRaised(); er != nil {
 		err = ctx.onExternalEventRaised(e)
 	} else if es := e.GetExecutionSuspended(); es != nil {
@@ -236,111 +354,190 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 }
 
 func (octx *OrchestrationContext) SetCustomStatus(cs string) {
-	octx.customStatus = cs
+	octx.engineContext().customStatus = cs
 }
 
 // GetInput unmarshals the serialized orchestration input and stores it in [v].
 func (octx *OrchestrationContext) GetInput(v any) error {
-	return unmarshalData(octx.rawInput, v)
+	return unmarshalData(octx.engineContext().rawInput, v)
 }
 
 // CallActivity schedules an asynchronous invocation of an activity function. The [activity]
 // parameter can be either the name of an activity as a string or can be a pointer to the function
 // that implements the activity, in which case the name is obtained via reflection.
 func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivityOption) Task {
+	engine := ctx.engineContext()
 	options := new(callActivityOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			failedTask := newTask(ctx)
-			failedTask.fail(helpers.NewTaskFailureDetails(err))
-			return failedTask
+			return ctx.newFailedTask(engine, err)
 		}
+	}
+	if ctx.scope.isCanceled() {
+		return newTaskInScope(engine, ctx.scope)
 	}
 
 	if options.retryPolicy != nil {
-		return ctx.internalScheduleTaskWithRetries(ctx.CurrentTimeUtc, func() Task {
-			return ctx.internalScheduleActivity(activity, options)
-		}, *options.retryPolicy, 0)
+		return engine.internalScheduleTaskWithRetries(engine.CurrentTimeUtc, func() Task {
+			return engine.internalScheduleActivity(activity, options, ctx.scope)
+		}, *options.retryPolicy, 0, ctx)
 	}
 
-	return ctx.internalScheduleActivity(activity, options)
+	return engine.internalScheduleActivity(activity, options, ctx.scope)
 }
 
-func (ctx *OrchestrationContext) internalScheduleActivity(activity any, options *callActivityOptions) Task {
+// newFailedTask creates a completed, already-failed task in the calling context's
+// cancellation scope. Used when option validation fails before any action is scheduled.
+func (ctx *OrchestrationContext) newFailedTask(engine *OrchestrationContext, err error) Task {
+	failedTask := newTaskInScope(engine, ctx.scope)
+	failedTask.fail(helpers.NewTaskFailureDetails(err))
+	return failedTask
+}
+
+// Go starts a coroutine that is cooperatively scheduled with the orchestration.
+// Only one orchestration coroutine runs at a time, in monotonically increasing ID order.
+func (ctx *OrchestrationContext) Go(fn func(ctx *OrchestrationContext)) {
+	if fn == nil {
+		panic("orchestration coroutine function must be non-nil")
+	}
+	engine := ctx.engineContext()
+	if engine.scheduler == nil {
+		panic("orchestration coroutine started outside orchestrator execution")
+	}
+	engine.scheduler.spawn(ctx, func() {
+		fn(ctx)
+	})
+}
+
+// NewWaitGroup creates a deterministic coroutine wait group.
+func (ctx *OrchestrationContext) NewWaitGroup() WaitGroup {
+	engine := ctx.engineContext()
+	if engine.scheduler == nil {
+		panic("orchestration wait group created outside orchestrator execution")
+	}
+	return newOrchestrationWaitGroup(engine.scheduler, ctx.scope)
+}
+
+func (ctx *OrchestrationContext) internalScheduleActivity(
+	activity any,
+	options *callActivityOptions,
+	scope *cancellationScope,
+) Task {
+	if scope.isCanceled() {
+		return newTaskInScope(ctx, scope)
+	}
 	scheduleTaskAction := helpers.NewScheduleTaskAction(
 		ctx.getNextSequenceNumber(),
 		helpers.GetTaskFunctionName(activity),
-		options.rawInput)
+		options.rawInput,
+		options.version)
 
 	ctx.pendingActions[scheduleTaskAction.Id] = scheduleTaskAction
 
-	task := newTask(ctx)
+	task := newTaskInScope(ctx, scope)
 	ctx.pendingTasks[scheduleTaskAction.Id] = task
 	return task
 }
 
 func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...subOrchestratorOption) Task {
+	engine := ctx.engineContext()
 	options := new(callSubOrchestratorOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
-			failedTask := newTask(ctx)
-			failedTask.fail(helpers.NewTaskFailureDetails(err))
-			return failedTask
+			return ctx.newFailedTask(engine, err)
 		}
+	}
+	if ctx.scope.isCanceled() {
+		return newTaskInScope(engine, ctx.scope)
 	}
 
 	if options.retryPolicy != nil {
-		return ctx.internalScheduleTaskWithRetries(ctx.CurrentTimeUtc, func() Task {
-			return ctx.internalCallSubOrchestrator(orchestrator, options)
-		}, *options.retryPolicy, 0)
+		return engine.internalScheduleTaskWithRetries(engine.CurrentTimeUtc, func() Task {
+			return engine.internalCallSubOrchestrator(orchestrator, options, ctx.scope)
+		}, *options.retryPolicy, 0, ctx)
 	}
 
-	return ctx.internalCallSubOrchestrator(orchestrator, options)
+	return engine.internalCallSubOrchestrator(orchestrator, options, ctx.scope)
 }
 
-func (ctx *OrchestrationContext) internalCallSubOrchestrator(orchestrator any, options *callSubOrchestratorOptions) Task {
+func (ctx *OrchestrationContext) internalCallSubOrchestrator(
+	orchestrator any,
+	options *callSubOrchestratorOptions,
+	scope *cancellationScope,
+) Task {
+	if scope.isCanceled() {
+		return newTaskInScope(ctx, scope)
+	}
 	createSubOrchestrationAction := helpers.NewCreateSubOrchestrationAction(
 		ctx.getNextSequenceNumber(),
 		helpers.GetTaskFunctionName(orchestrator),
 		options.instanceID,
 		options.rawInput,
+		options.version,
 	)
 	ctx.pendingActions[createSubOrchestrationAction.Id] = createSubOrchestrationAction
 
-	task := newTask(ctx)
+	task := newTaskInScope(ctx, scope)
 	ctx.pendingTasks[createSubOrchestrationAction.Id] = task
 	return task
 }
 
-func (ctx *OrchestrationContext) internalScheduleTaskWithRetries(initialAttempt time.Time, schedule func() Task, policy RetryPolicy, retryCount int) Task {
-	return &taskWrapper{
-		delegate: schedule(),
-		onAwaitResult: func(v any, err error) error {
+func (ctx *OrchestrationContext) internalScheduleTaskWithRetries(
+	initialAttempt time.Time,
+	schedule func() Task,
+	policy RetryPolicy,
+	retryCount int,
+	owner *OrchestrationContext,
+) Task {
+	result := newTaskInScope(ctx, owner.scope)
+	attempt := schedule()
+	ctx.scheduler.spawn(owner, func() {
+		current := attempt
+		count := retryCount
+		for {
+			err := current.Await(nil)
 			if err == nil {
-				return nil
+				result.completeFrom(current, nil)
+				return
+			}
+			if count+1 >= policy.MaxAttempts {
+				result.completeFrom(current, err)
+				return
 			}
 
-			if retryCount+1 >= policy.MaxAttempts {
-				// next try will exceed the max attempts, dont continue
-				return err
-			}
-
-			nextDelay := computeNextDelay(ctx.CurrentTimeUtc, policy, retryCount, initialAttempt, err)
+			nextDelay := computeNextDelay(ctx.CurrentTimeUtc, policy, count, initialAttempt, err)
 			if nextDelay == 0 {
-				return err
+				result.completeFrom(current, err)
+				return
 			}
+			if timerErr := ctx.createTimerInternal(nextDelay, owner.scope).Await(nil); timerErr != nil {
+				result.fail(helpers.NewTaskFailureDetails(errors.Join(timerErr, err)))
+				return
+			}
+			count++
+			current = schedule()
+		}
+	})
+	return result
+}
 
-			timerErr := ctx.createTimerInternal(nextDelay).Await(nil)
-			if timerErr != nil {
-				return errors.Join(timerErr, err)
-			}
-
-			err = ctx.internalScheduleTaskWithRetries(initialAttempt, schedule, policy, retryCount+1).Await(v)
-			if err == nil {
-				return nil
-			}
-			return err
-		},
+func (t *completableTask) completeFrom(source Task, fallback error) {
+	state, ok := taskState(source)
+	if !ok {
+		if fallback != nil {
+			t.fail(helpers.NewTaskFailureDetails(fallback))
+		} else {
+			t.complete(nil)
+		}
+		return
+	}
+	switch {
+	case state.failureDetails != nil:
+		t.fail(state.failureDetails)
+	case state.isCanceled:
+		t.cancel()
+	default:
+		t.complete(state.rawResult)
 	}
 }
 
@@ -363,15 +560,25 @@ func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int,
 
 // CreateTimer schedules a durable timer that expires after the specified delay.
 func (ctx *OrchestrationContext) CreateTimer(delay time.Duration) Task {
-	return ctx.createTimerInternal(delay)
+	engine := ctx.engineContext()
+	if ctx.scope.isCanceled() {
+		return newTaskInScope(engine, ctx.scope)
+	}
+	return engine.createTimerInternal(delay, ctx.scope)
 }
 
-func (ctx *OrchestrationContext) createTimerInternal(delay time.Duration) *completableTask {
+func (ctx *OrchestrationContext) createTimerInternal(
+	delay time.Duration,
+	scope *cancellationScope,
+) *completableTask {
+	if scope.isCanceled() {
+		return newTaskInScope(ctx, scope)
+	}
 	fireAt := ctx.CurrentTimeUtc.Add(delay)
 	timerAction := helpers.NewCreateTimerAction(ctx.getNextSequenceNumber(), fireAt)
 	ctx.pendingActions[timerAction.Id] = timerAction
 
-	task := newTask(ctx)
+	task := newTaskInScope(ctx, scope)
 	ctx.pendingTasks[timerAction.Id] = task
 	return task
 }
@@ -390,17 +597,21 @@ func (ctx *OrchestrationContext) createTimerInternal(delay time.Duration) *compl
 //
 // Note that event names are case-insensitive.
 func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout time.Duration) Task {
-	task := newTask(ctx)
+	engine := ctx.engineContext()
+	task := newTaskInScope(engine, ctx.scope)
+	if ctx.scope.isCanceled() {
+		return task
+	}
 	key := strings.ToUpper(eventName)
-	if eventList, ok := ctx.bufferedExternalEvents[key]; ok {
+	if eventList, ok := engine.bufferedExternalEvents[key]; ok {
 		// An event with this name arrived already and can be consumed immediately.
 		next := eventList.Front()
 		if eventList.Len() > 1 {
 			eventList.Remove(next)
 		} else {
-			delete(ctx.bufferedExternalEvents, key)
+			delete(engine.bufferedExternalEvents, key)
 		}
-		rawValue := []byte(next.Value.(*protos.HistoryEvent).GetEventRaised().GetInput().GetValue())
+		rawValue := []byte(next.Value.(*bufferedEvent).event.GetEventRaised().GetInput().GetValue())
 		task.complete(rawValue)
 	} else if timeout == 0 {
 		// Zero-timeout means fail immediately if the event isn't already buffered.
@@ -409,19 +620,19 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 		// Keep a reference to this task so we can complete it when the event of this name arrives
 		var taskList *list.List
 		var ok bool
-		if taskList, ok = ctx.pendingExternalEventTasks[key]; !ok {
+		if taskList, ok = engine.pendingExternalEventTasks[key]; !ok {
 			taskList = list.New()
-			ctx.pendingExternalEventTasks[key] = taskList
+			engine.pendingExternalEventTasks[key] = taskList
 		}
 		taskElement := taskList.PushBack(task)
 
 		if timeout > 0 {
-			ctx.createTimerInternal(timeout).onCompleted(func() {
+			engine.createTimerInternal(timeout, ctx.scope).onCompleted(func() {
 				task.cancel()
 				if taskList.Len() > 1 {
 					taskList.Remove(taskElement)
 				} else {
-					delete(ctx.pendingExternalEventTasks, key)
+					delete(engine.pendingExternalEventTasks, key)
 				}
 			})
 		}
@@ -430,11 +641,29 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 }
 
 func (ctx *OrchestrationContext) ContinueAsNew(newInput any, options ...ContinueAsNewOption) {
-	ctx.continuedAsNew = true
-	ctx.continuedAsNewInput = newInput
+	engine := ctx.engineContext()
+	engine.continuedAsNew = true
+	engine.continuedAsNewInput = newInput
 	for _, option := range options {
-		option(ctx)
+		option(engine)
 	}
+}
+
+// SendEvent sends an event to another orchestration instance as part of the
+// current durable orchestration transaction.
+func (ctx *OrchestrationContext) SendEvent(instanceID api.InstanceID, eventName string, payload any) error {
+	raw, err := marshalData(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event payload: %w", err)
+	}
+	engine := ctx.engineContext()
+	if engine.isTerminated || ctx.scope.isCanceled() {
+		return ErrTaskCanceled
+	}
+	action := helpers.NewSendEventAction(string(instanceID), eventName, wrapperspb.String(string(raw)))
+	action.Id = engine.getNextSequenceNumber()
+	engine.pendingActions[action.Id] = action
+	return nil
 }
 
 func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedEvent) error {
@@ -447,29 +676,12 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 		}
 	}
 	ctx.Name = es.Name
+	ctx.Version = es.GetVersion().GetValue()
 	if es.Input != nil {
 		ctx.rawInput = []byte(es.Input.Value)
 	}
 
-	output, appError := orchestrator(ctx)
-
-	var err error
-	switch {
-	case appError != nil:
-		err = ctx.setFailed(appError)
-	case ctx.continuedAsNew:
-		err = ctx.setContinuedAsNew()
-	default:
-		err = ctx.setComplete(output)
-	}
-
-	if appError == nil && err != nil {
-		completionErr := fmt.Errorf("failed to complete the orchestration: %w", err)
-		if err2 := ctx.setFailed(completionErr); err2 != nil {
-			return completionErr
-		}
-	}
-	return nil
+	return ctx.scheduler.startRoot(orchestrator)
 }
 
 func (ctx *OrchestrationContext) onTaskScheduled(taskID int32, ts *protos.TaskScheduledEvent) error {
@@ -616,9 +828,71 @@ func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) e
 			eventList = list.New()
 			ctx.bufferedExternalEvents[key] = eventList
 		}
-		eventList.PushBack(e)
+		eventList.PushBack(&bufferedEvent{
+			event: e,
+			order: ctx.scheduler.nextCompletionID(),
+		})
+		for waiter := range ctx.eventWaiters[key] {
+			ctx.scheduler.makeRunnable(waiter)
+		}
 	}
 	return nil
+}
+
+func (ctx *OrchestrationContext) onEventSent(eventID int32, event *protos.EventSentEvent) error {
+	action, ok := ctx.pendingActions[eventID]
+	if !ok || action.GetSendEvent() == nil {
+		return fmt.Errorf(
+			"a previous execution sent event %q to %q with sequence number %d, but the current execution doesn't have this action",
+			event.GetName(),
+			event.GetInstanceId(),
+			eventID,
+		)
+	}
+	delete(ctx.pendingActions, eventID)
+	return nil
+}
+
+func (ctx *OrchestrationContext) peekBufferedEvent(key string) (*bufferedEvent, bool) {
+	eventList, ok := ctx.bufferedExternalEvents[key]
+	if !ok || eventList.Len() == 0 {
+		return nil, false
+	}
+	return eventList.Front().Value.(*bufferedEvent), true
+}
+
+func (ctx *OrchestrationContext) takeBufferedEvent(key string) (*bufferedEvent, bool) {
+	eventList, ok := ctx.bufferedExternalEvents[key]
+	if !ok || eventList.Len() == 0 {
+		return nil, false
+	}
+	next := eventList.Front()
+	event := next.Value.(*bufferedEvent)
+	eventList.Remove(next)
+	if eventList.Len() == 0 {
+		delete(ctx.bufferedExternalEvents, key)
+	}
+	return event, true
+}
+
+func (ctx *OrchestrationContext) addEventWaiter(key string, co *coroutine) {
+	waiters, ok := ctx.eventWaiters[key]
+	if !ok {
+		waiters = make(map[*coroutine]struct{})
+		ctx.eventWaiters[key] = waiters
+	}
+	waiters[co] = struct{}{}
+}
+
+func (ctx *OrchestrationContext) removeEventWaiter(key string, co *coroutine) {
+	waiters, ok := ctx.eventWaiters[key]
+	if !ok {
+		return
+	}
+	delete(waiters, co)
+	if len(waiters) == 0 {
+		delete(ctx.eventWaiters, key)
+	}
 }
 
 func (ctx *OrchestrationContext) onExecutionSuspended(er *protos.ExecutionSuspendedEvent) error {
@@ -628,16 +902,13 @@ func (ctx *OrchestrationContext) onExecutionSuspended(er *protos.ExecutionSuspen
 
 func (ctx *OrchestrationContext) onExecutionResumed(er *protos.ExecutionResumedEvent) error {
 	ctx.isSuspended = false
-	for _, e := range ctx.suspendedEvents {
-		if err := ctx.processEvent(e); err != nil {
-			return err
-		}
-	}
+	ctx.resumedEvents = append(ctx.resumedEvents, ctx.suspendedEvents...)
 	ctx.suspendedEvents = nil
 	return nil
 }
 
 func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTerminatedEvent) error {
+	ctx.isTerminated = true
 	if err := ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil); err != nil {
 		return err
 	}
@@ -661,6 +932,11 @@ func (ctx *OrchestrationContext) setComplete(output any) error {
 }
 
 func (ctx *OrchestrationContext) setFailed(appError error) error {
+	for id, action := range ctx.pendingActions {
+		if action.GetCompleteOrchestration() != nil {
+			delete(ctx.pendingActions, id)
+		}
+	}
 	fd := helpers.NewTaskFailureDetails(appError)
 	failedStatus := protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED
 	if err := ctx.setCompleteInternal(nil, failedStatus, fd); err != nil {
@@ -713,16 +989,26 @@ func (ctx *OrchestrationContext) actions() []*protos.OrchestratorAction {
 		return nil
 	}
 
-	var actions []*protos.OrchestratorAction
-	for _, a := range ctx.pendingActions {
+	actions := make([]*protos.OrchestratorAction, 0, len(ctx.pendingActions))
+	for id := int32(0); id < ctx.sequenceNumber; id++ {
+		a, ok := ctx.pendingActions[id]
+		if !ok {
+			continue
+		}
 		actions = append(actions, a)
 		if ctx.continuedAsNew && ctx.saveBufferedExternalEvents {
 			if co := a.GetCompleteOrchestration(); co != nil {
+				events := make([]*bufferedEvent, 0)
 				for _, eventList := range ctx.bufferedExternalEvents {
 					for item := eventList.Front(); item != nil; item = item.Next() {
-						e := item.Value.(*protos.HistoryEvent)
-						co.CarryoverEvents = append(co.CarryoverEvents, e)
+						events = append(events, item.Value.(*bufferedEvent))
 					}
+				}
+				sort.Slice(events, func(i, j int) bool {
+					return events[i].order < events[j].order
+				})
+				for _, event := range events {
+					co.CarryoverEvents = append(co.CarryoverEvents, event.event)
 				}
 			}
 		}
