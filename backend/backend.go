@@ -28,16 +28,40 @@ type (
 	TaskFailureDetails = protos.TaskFailureDetails
 )
 
-type OrchestrationIdReusePolicyOptions func(*protos.OrchestrationIdReusePolicy) error
+type OrchestrationIdReusePolicyOptions func(*api.OrchestrationIdReusePolicy) error
 
-func WithOrchestrationIdReusePolicy(policy *protos.OrchestrationIdReusePolicy) OrchestrationIdReusePolicyOptions {
-	return func(po *protos.OrchestrationIdReusePolicy) error {
+func WithOrchestrationIdReusePolicy(policy *api.OrchestrationIdReusePolicy) OrchestrationIdReusePolicyOptions {
+	return func(po *api.OrchestrationIdReusePolicy) error {
 		if policy != nil {
 			po.Action = policy.Action
-			po.OperationStatus = policy.OperationStatus
+			po.OperationStatus = append(po.OperationStatus[:0], policy.OperationStatus...)
 		}
 		return nil
 	}
+}
+
+func orchestrationIDReusePolicyFromProto(policy *protos.OrchestrationIdReusePolicy) (*api.OrchestrationIdReusePolicy, error) {
+	if policy == nil {
+		return nil, nil
+	}
+
+	action, hasLegacyAction, err := protos.GetLegacyOrchestrationIDReuseAction(policy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid orchestration ID reuse policy: %w", err)
+	}
+	result := &api.OrchestrationIdReusePolicy{
+		Action:          api.REUSE_ID_ACTION_TERMINATE,
+		OperationStatus: append([]api.OrchestrationStatus(nil), policy.ReplaceableStatus...),
+	}
+	if hasLegacyAction {
+		result.Action = api.CreateOrchestrationAction(action)
+		switch result.Action {
+		case api.REUSE_ID_ACTION_ERROR, api.REUSE_ID_ACTION_IGNORE, api.REUSE_ID_ACTION_TERMINATE:
+		default:
+			return nil, fmt.Errorf("invalid orchestration ID reuse action: %d", action)
+		}
+	}
+	return result, nil
 }
 
 type Backend interface {
