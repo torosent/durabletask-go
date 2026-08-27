@@ -14,8 +14,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const modulePath = "github.com/microsoft/durabletask-go"
@@ -24,7 +26,7 @@ const retryServiceConfig = `{
   "methodConfig": [{
     "name": [{}],
     "retryPolicy": {
-      "maxAttempts": 10,
+      "maxAttempts": 5,
       "initialBackoff": "0.050s",
       "maxBackoff": "0.250s",
       "backoffMultiplier": 2,
@@ -59,7 +61,7 @@ func (c *schedulerPerRPCCredentials) GetRequestMetadata(ctx context.Context, _ .
 	if c.credential != nil {
 		token, err := c.credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{c.scope}})
 		if err != nil {
-			return nil, fmt.Errorf("failed to acquire DTS access token: %w", err)
+			return nil, status.Errorf(codes.Unavailable, "failed to acquire DTS access token: %v", err)
 		}
 		metadata["authorization"] = "Bearer " + token.Token
 	}
@@ -159,7 +161,7 @@ func prepareOptions(options *Options) (Options, error) {
 }
 
 func connect(
-	ctx context.Context,
+	_ context.Context,
 	options *Options,
 	role connectionRole,
 	workerID string,
@@ -203,13 +205,19 @@ func connect(
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithPerRPCCredentials(perRPCCredentials),
-		grpc.WithDefaultServiceConfig(retryServiceConfig),
+	}
+	if role == clientRole {
+		dialOptions = append(dialOptions, grpc.WithDefaultServiceConfig(retryServiceConfig))
 	}
 	if options.dialer != nil {
 		dialOptions = append(dialOptions, grpc.WithContextDialer(options.dialer))
 	}
 
-	connection, err := grpc.DialContext(ctx, host, dialOptions...)
+	target := "dns:///" + host
+	if options.dialer != nil {
+		target = "passthrough:///" + host
+	}
+	connection, err := grpc.NewClient(target, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DTS gRPC connection: %w", err)
 	}

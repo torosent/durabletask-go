@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -257,8 +258,12 @@ func TestDTSEmulatorWorkerStopAndRestart(t *testing.T) {
 func TestDTSEmulatorSelectEventCancelsTimer(t *testing.T) {
 	registry := task.NewTaskRegistry()
 	require.NoError(t, registry.AddOrchestratorN("DTSSelect", func(ctx *task.OrchestrationContext) (any, error) {
+		var timerDelay time.Duration
+		if err := ctx.GetInput(&timerDelay); err != nil {
+			return nil, err
+		}
 		timerCtx, cancelTimer := ctx.WithCancel()
-		timer := timerCtx.CreateTimer(time.Minute)
+		timer := timerCtx.CreateTimer(timerDelay)
 		events := task.NewEventChannel[string](ctx, "approval")
 		selected := ""
 		ctx.Select(
@@ -276,6 +281,7 @@ func TestDTSEmulatorSelectEventCancelsTimer(t *testing.T) {
 		ctx,
 		"DTSSelect",
 		api.WithInstanceID(uniqueInstanceID("go-select")),
+		api.WithInput(time.Minute),
 	)
 	require.NoError(t, err)
 	_, err = managementClient.WaitForOrchestrationStart(ctx, instanceID)
@@ -293,6 +299,21 @@ func TestDTSEmulatorSelectEventCancelsTimer(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, `"approved"`, metadata.SerializedOutput)
+
+	timerID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSSelect",
+		api.WithInstanceID(uniqueInstanceID("go-select-timer")),
+		api.WithInput(10*time.Millisecond),
+	)
+	require.NoError(t, err)
+	timerMetadata, err := managementClient.WaitForOrchestrationCompletion(
+		ctx,
+		timerID,
+		api.WithFetchPayloads(true),
+	)
+	require.NoError(t, err)
+	require.Equal(t, `"timeout"`, timerMetadata.SerializedOutput)
 }
 
 func TestDTSEmulatorConcurrentCoroutineFanOut(t *testing.T) {
@@ -376,4 +397,113 @@ func TestDTSEmulatorConcurrentCoroutineFanOut(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
+}
+
+func TestDTSEmulatorSendEventReplay(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSEventReceiver", func(ctx *task.OrchestrationContext) (any, error) {
+		return task.NewEventChannel[string](ctx, "ping").Receive(ctx), nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSEventSender", func(ctx *task.OrchestrationContext) (any, error) {
+		var target api.InstanceID
+		if err := ctx.GetInput(&target); err != nil {
+			return nil, err
+		}
+		if err := ctx.SendEvent(target, "ping", "pong"); err != nil {
+			return nil, err
+		}
+		if err := ctx.CreateTimer(10 * time.Millisecond).Await(nil); err != nil {
+			return nil, err
+		}
+		return "sent", nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	receiverID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSEventReceiver",
+		api.WithInstanceID(uniqueInstanceID("go-event-receiver")),
+	)
+	require.NoError(t, err)
+	_, err = managementClient.WaitForOrchestrationStart(ctx, receiverID)
+	require.NoError(t, err)
+	senderID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSEventSender",
+		api.WithInstanceID(uniqueInstanceID("go-event-sender")),
+		api.WithInput(receiverID),
+	)
+	require.NoError(t, err)
+
+	sender, err := managementClient.WaitForOrchestrationCompletion(ctx, senderID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, `"sent"`, sender.SerializedOutput)
+	receiver, err := managementClient.WaitForOrchestrationCompletion(ctx, receiverID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, `"pong"`, receiver.SerializedOutput)
+}
+
+func TestDTSEmulatorSubOrchestrationRetryAndContinueAsNew(t *testing.T) {
+	var attempts atomic.Int32
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSFlaky", func(task.ActivityContext) (any, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("retry me")
+		}
+		return "recovered", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSChild", func(ctx *task.OrchestrationContext) (any, error) {
+		var result string
+		err := ctx.CallActivity(
+			"DTSFlaky",
+			task.WithActivityRetryPolicy(&task.RetryPolicy{
+				MaxAttempts:          2,
+				InitialRetryInterval: 10 * time.Millisecond,
+			}),
+		).Await(&result)
+		return result, err
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSParent", func(ctx *task.OrchestrationContext) (any, error) {
+		var result string
+		err := ctx.CallSubOrchestrator("DTSChild").Await(&result)
+		return result, err
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSContinueAsNew", func(ctx *task.OrchestrationContext) (any, error) {
+		var generation int
+		if err := ctx.GetInput(&generation); err != nil {
+			return nil, err
+		}
+		if generation < 2 {
+			ctx.ContinueAsNew(generation + 1)
+			return nil, nil
+		}
+		return generation, nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	parentID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSParent",
+		api.WithInstanceID(uniqueInstanceID("go-parent")),
+	)
+	require.NoError(t, err)
+	parent, err := managementClient.WaitForOrchestrationCompletion(ctx, parentID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, `"recovered"`, parent.SerializedOutput)
+	require.EqualValues(t, 2, attempts.Load())
+
+	continueID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSContinueAsNew",
+		api.WithInstanceID(uniqueInstanceID("go-continue")),
+		api.WithInput(0),
+	)
+	require.NoError(t, err)
+	continued, err := managementClient.WaitForOrchestrationCompletion(ctx, continueID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, "2", continued.SerializedOutput)
 }
