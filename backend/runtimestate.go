@@ -39,6 +39,25 @@ type OrchestratorMessage struct {
 	TargetInstanceID string
 }
 
+// OrchestrationRuntimeSnapshot is an immutable diagnostic view of runtime state.
+type OrchestrationRuntimeSnapshot struct {
+	InstanceID       api.InstanceID
+	Name             string
+	Version          string
+	ParentInstanceID api.InstanceID
+	ChildInstanceIDs []api.InstanceID
+	RuntimeStatus    protos.OrchestrationStatus
+	CreatedTime      time.Time
+	LastUpdatedTime  time.Time
+	CompletedTime    time.Time
+	HistoryLength    int
+	PendingTasks     int
+	PendingTimers    int
+	PendingMessages  int
+	IsSuspended      bool
+	ContinuedAsNew   bool
+}
+
 func NewOrchestrationRuntimeState(instanceID api.InstanceID, existingHistory []*HistoryEvent) *OrchestrationRuntimeState {
 	s := &OrchestrationRuntimeState{
 		instanceID: instanceID,
@@ -207,11 +226,14 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 			)
 			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: startEvent, TargetInstanceID: createSO.InstanceId})
 		} else if sendEvent := action.GetSendEvent(); sendEvent != nil {
-			e := helpers.NewSendEventEvent(action.Id, sendEvent.Instance.InstanceId, sendEvent.Name, sendEvent.Data)
-			if err := s.AddEvent(e); err != nil {
+			sentEvent := helpers.NewSendEventEvent(action.Id, sendEvent.Instance.InstanceId, sendEvent.Name, sendEvent.Data)
+			if err := s.AddEvent(sentEvent); err != nil {
 				return false, fmt.Errorf("failed to add send event: %w", err)
 			}
-			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: e, TargetInstanceID: sendEvent.Instance.InstanceId})
+			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{
+				HistoryEvent:     helpers.NewEventRaisedEvent(sendEvent.Name, sendEvent.Data),
+				TargetInstanceID: sendEvent.Instance.InstanceId,
+			})
 		} else if terminate := action.GetTerminateOrchestration(); terminate != nil {
 			// Send a message to terminate the target orchestration
 			msg := OrchestratorMessage{
@@ -229,6 +251,55 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 
 func (s *OrchestrationRuntimeState) InstanceID() api.InstanceID {
 	return s.instanceID
+}
+
+// Snapshot returns an immutable diagnostic view of the current runtime state.
+func (s *OrchestrationRuntimeState) Snapshot() OrchestrationRuntimeSnapshot {
+	snapshot := OrchestrationRuntimeSnapshot{
+		InstanceID:       s.instanceID,
+		ChildInstanceIDs: s.ChildInstanceIDs(),
+		RuntimeStatus:    s.RuntimeStatus(),
+		CreatedTime:      s.createdTime,
+		LastUpdatedTime:  s.lastUpdatedTime,
+		CompletedTime:    s.completedTime,
+		HistoryLength:    s.HistoryLength(),
+		PendingTasks:     len(s.pendingTasks),
+		PendingTimers:    len(s.pendingTimers),
+		PendingMessages:  len(s.pendingMessages),
+		IsSuspended:      s.isSuspended,
+		ContinuedAsNew:   s.continuedAsNew,
+	}
+	if s.startEvent != nil {
+		snapshot.Name = s.startEvent.GetName()
+		snapshot.Version = s.startEvent.GetVersion().GetValue()
+		if parentInstanceID, ok := s.ParentInstanceID(); ok {
+			snapshot.ParentInstanceID = parentInstanceID
+		}
+	}
+	return snapshot
+}
+
+// ParentInstanceID returns the parent orchestration instance ID, when present.
+func (s *OrchestrationRuntimeState) ParentInstanceID() (api.InstanceID, bool) {
+	if s.startEvent == nil {
+		return "", false
+	}
+	parent := s.startEvent.GetParentInstance()
+	if parent == nil {
+		return "", false
+	}
+	instanceID := api.InstanceID(parent.GetOrchestrationInstance().GetInstanceId())
+	return instanceID, instanceID != ""
+}
+
+// ChildInstanceIDs returns a sorted copy of child orchestration instance IDs.
+func (s *OrchestrationRuntimeState) ChildInstanceIDs() []api.InstanceID {
+	return getSubOrchestrationInstances(s.oldEvents, s.newEvents)
+}
+
+// HistoryLength returns the total persisted and pending history event count.
+func (s *OrchestrationRuntimeState) HistoryLength() int {
+	return len(s.oldEvents) + len(s.newEvents)
 }
 
 func (s *OrchestrationRuntimeState) Name() (string, error) {

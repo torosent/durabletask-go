@@ -650,7 +650,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 
 	row := be.db.QueryRowContext(
 		ctx,
-		`SELECT [InstanceID], [Name], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [Input], [Output], [CustomStatus], [FailureDetails]
+		`SELECT [InstanceID], [Name], [Version], [ParentInstanceID], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [Input], [Output], [CustomStatus], [FailureDetails]
 		FROM Instances WHERE [InstanceID] = ?`,
 		string(iid),
 	)
@@ -664,6 +664,8 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 
 	var instanceID *string
 	var name *string
+	var version *string
+	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
 	var lastUpdatedAt *time.Time
@@ -673,7 +675,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err = row.Scan(&instanceID, &name, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err = row.Scan(&instanceID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -710,6 +712,12 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 		*customStatus,
 		failureDetails,
 	)
+	if version != nil {
+		metadata.Version = *version
+	}
+	if parentInstanceID != nil {
+		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
+	}
 	return metadata, nil
 }
 
@@ -802,7 +810,7 @@ func (be *sqliteBackend) GetOrchestrationWorkItem(ctx context.Context) (*backend
 			WHERE [InstanceID] = ? AND ([VisibleTime] IS NULL OR [VisibleTime] <= ?)
 			LIMIT 1000
 		)
-		RETURNING [EventPayload], [DequeueCount]`,
+		RETURNING [EventPayload], [DequeueCount], [Timestamp]`,
 		be.workerName,
 		instanceID,
 		now,
@@ -812,17 +820,22 @@ func (be *sqliteBackend) GetOrchestrationWorkItem(ctx context.Context) (*backend
 	}
 
 	maxDequeueCount := int32(0)
+	var enqueuedAt time.Time
 
 	newEvents := make([]*protos.HistoryEvent, 0, 10)
 	for events.Next() {
 		var eventPayload []byte
 		var dequeueCount int32
-		if err := events.Scan(&eventPayload, &dequeueCount); err != nil {
+		var timestamp time.Time
+		if err := events.Scan(&eventPayload, &dequeueCount, &timestamp); err != nil {
 			return nil, fmt.Errorf("failed to read history event: %w", err)
 		}
 
 		if dequeueCount > maxDequeueCount {
 			maxDequeueCount = dequeueCount
+		}
+		if enqueuedAt.IsZero() || timestamp.Before(enqueuedAt) {
+			enqueuedAt = timestamp
 		}
 
 		e, err := backend.UnmarshalHistoryEvent(eventPayload)
@@ -842,6 +855,7 @@ func (be *sqliteBackend) GetOrchestrationWorkItem(ctx context.Context) (*backend
 		NewEvents:  newEvents,
 		LockedBy:   be.workerName,
 		RetryCount: maxDequeueCount - 1,
+		EnqueuedAt: enqueuedAt,
 	}
 
 	return wi, nil
@@ -853,7 +867,7 @@ func (be *sqliteBackend) GetActivityWorkItem(ctx context.Context) (*backend.Acti
 	}
 
 	now := time.Now().UTC()
-	newLockExpiration := now.Add(be.options.OrchestrationLockTimeout)
+	newLockExpiration := now.Add(be.options.ActivityLockTimeout)
 
 	row := be.db.QueryRowContext(
 		ctx,
@@ -863,7 +877,7 @@ func (be *sqliteBackend) GetActivityWorkItem(ctx context.Context) (*backend.Acti
 			WHERE T.[LockExpiration] IS NULL OR T.[LockExpiration] < ?
 			ORDER BY T.[SequenceNumber] ASC
 			LIMIT 1
-		) RETURNING [SequenceNumber], [InstanceID], [EventPayload]`,
+		) RETURNING [SequenceNumber], [InstanceID], [EventPayload], [Timestamp], [DequeueCount]`,
 		be.workerName,
 		newLockExpiration,
 		now,
@@ -876,8 +890,10 @@ func (be *sqliteBackend) GetActivityWorkItem(ctx context.Context) (*backend.Acti
 	var sequenceNumber int64
 	var instanceID string
 	var eventPayload []byte
+	var enqueuedAt time.Time
+	var dequeueCount int32
 
-	if err := row.Scan(&sequenceNumber, &instanceID, &eventPayload); err != nil {
+	if err := row.Scan(&sequenceNumber, &instanceID, &eventPayload, &enqueuedAt, &dequeueCount); err != nil {
 		if err == sql.ErrNoRows {
 			// No new activity tasks to process
 			return nil, backend.ErrNoWorkItems
@@ -896,8 +912,56 @@ func (be *sqliteBackend) GetActivityWorkItem(ctx context.Context) (*backend.Acti
 		InstanceID:     api.InstanceID(instanceID),
 		NewEvent:       e,
 		LockedBy:       be.workerName,
+		RetryCount:     dequeueCount - 1,
+		EnqueuedAt:     enqueuedAt,
 	}
 	return wi, nil
+}
+
+func (be *sqliteBackend) GetOrchestrationBacklog(ctx context.Context) (backend.BacklogMetric, error) {
+	if err := be.ensureDB(); err != nil {
+		return backend.BacklogMetric{}, err
+	}
+	now := time.Now().UTC()
+	row := be.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(DISTINCT [InstanceID]),
+			COALESCE((julianday(?) - julianday(MIN([Timestamp]))) * 86400.0, 0)
+		FROM NewEvents
+		WHERE [LockedBy] IS NULL AND ([VisibleTime] IS NULL OR [VisibleTime] <= ?)`,
+		now,
+		now,
+	)
+	return scanSqliteBacklog(row, backend.WorkItemKindOrchestration)
+}
+
+func (be *sqliteBackend) GetActivityBacklog(ctx context.Context) (backend.BacklogMetric, error) {
+	if err := be.ensureDB(); err != nil {
+		return backend.BacklogMetric{}, err
+	}
+	now := time.Now().UTC()
+	row := be.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*),
+			COALESCE((julianday(?) - julianday(MIN([Timestamp]))) * 86400.0, 0)
+		FROM NewTasks
+		WHERE [LockExpiration] IS NULL OR [LockExpiration] < ?`,
+		now,
+		now,
+	)
+	return scanSqliteBacklog(row, backend.WorkItemKindActivity)
+}
+
+func scanSqliteBacklog(row *sql.Row, kind backend.WorkItemKind) (backend.BacklogMetric, error) {
+	metric := backend.BacklogMetric{Kind: kind}
+	var oldestAgeSeconds float64
+	if err := row.Scan(&metric.Depth, &oldestAgeSeconds); err != nil {
+		return backend.BacklogMetric{}, fmt.Errorf("failed to inspect %s backlog: %w", kind, err)
+	}
+	if oldestAgeSeconds > 0 {
+		metric.OldestAge = time.Duration(oldestAgeSeconds * float64(time.Second))
+	}
+	return metric, nil
 }
 
 func (be *sqliteBackend) CompleteActivityWorkItem(ctx context.Context, wi *backend.ActivityWorkItem) error {

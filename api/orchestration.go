@@ -52,6 +52,8 @@ type InstanceID string
 type OrchestrationMetadata struct {
 	InstanceID             InstanceID
 	Name                   string
+	Version                string
+	ParentInstanceID       InstanceID
 	RuntimeStatus          protos.OrchestrationStatus
 	CreatedAt              time.Time
 	LastUpdatedAt          time.Time
@@ -236,6 +238,12 @@ func (m *OrchestrationMetadata) MarshalJSON() ([]byte, error) {
 	if m.SerializedInput != "" {
 		obj["serializedInput"] = m.SerializedInput
 	}
+	if m.Version != "" {
+		obj["version"] = m.Version
+	}
+	if m.ParentInstanceID != "" {
+		obj["parentInstanceId"] = m.ParentInstanceID
+	}
 	if m.SerializedOutput != "" {
 		obj["serializedOutput"] = m.SerializedOutput
 	}
@@ -321,6 +329,12 @@ func (m *OrchestrationMetadata) UnmarshalJSON(data []byte) (err error) {
 	}
 	if input, ok := obj["serializedInput"]; ok {
 		m.SerializedInput = input.(string)
+	}
+	if version, ok := obj["version"]; ok {
+		m.Version = version.(string)
+	}
+	if parentInstanceID, ok := obj["parentInstanceId"]; ok {
+		m.ParentInstanceID = InstanceID(parentInstanceID.(string))
 	}
 	if output, ok := obj["serializedOutput"]; ok {
 		m.SerializedOutput = output.(string)

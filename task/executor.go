@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
@@ -13,8 +14,12 @@ import (
 )
 
 type taskExecutor struct {
-	Registry   *TaskRegistry
-	versioning *VersioningOptions
+	Registry             *TaskRegistry
+	versioning           *VersioningOptions
+	orchestrationOptions OrchestrationOptions
+	logger               *slog.Logger
+	metrics              backend.MetricsHooks
+	contextFields        api.ContextFields
 }
 
 // TaskExecutorOption configures the in-memory task executor.
@@ -27,10 +32,44 @@ func WithVersioning(options VersioningOptions) TaskExecutorOption {
 	}
 }
 
+// WithOrchestrationOptions configures deterministic orchestration engine policies.
+func WithOrchestrationOptions(options OrchestrationOptions) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.orchestrationOptions = options
+	}
+}
+
+// WithLogger configures the slog logger exposed to orchestration and activity code.
+func WithLogger(logger *slog.Logger) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		if logger != nil {
+			executor.logger = logger
+		}
+	}
+}
+
+// WithMetricsHooks configures optional backend-neutral metric callbacks.
+func WithMetricsHooks(hooks backend.MetricsHooks) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.metrics = hooks
+	}
+}
+
+// WithContextFields configures immutable fields propagated into task contexts.
+func WithContextFields(fields api.ContextFields) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.contextFields = make(api.ContextFields, len(fields))
+		for key, value := range fields {
+			executor.contextFields[key] = value
+		}
+	}
+}
+
 // NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
 func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
 	executor := &taskExecutor{
 		Registry: registry,
+		logger:   slog.Default(),
 	}
 	for _, configure := range opts {
 		configure(executor)
@@ -51,6 +90,19 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		}
 		return helpers.NewTaskFailedEvent(e.EventId, versionFailureDetails(versionErr)), nil
 	}
+	ctx = api.WithContextFields(ctx, te.contextFields)
+	orchestrationInfo, _ := api.OrchestrationContextInfoFromContext(ctx)
+	if orchestrationInfo.InstanceID == "" {
+		orchestrationInfo.InstanceID = id
+		ctx = api.WithOrchestrationContextInfo(ctx, orchestrationInfo)
+	}
+	ctx = api.WithActivityContextInfo(ctx, api.ActivityContextInfo{
+		InstanceID: id,
+		Name:       ts.Name,
+		Version:    ts.GetVersion().GetValue(),
+		TaskID:     e.EventId,
+	})
+	ctx = withActivityLogger(ctx, te.logger)
 	invoker, ok := te.Registry.activities[ts.Name]
 	if !ok {
 		// try the wildcard match
@@ -119,8 +171,19 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 			},
 		}, nil
 	}
-	orchestrationCtx := NewOrchestrationContext(te.Registry, id, oldEvents, newEvents)
+	orchestrationCtx := newOrchestrationContext(
+		ctx,
+		te.Registry,
+		id,
+		oldEvents,
+		newEvents,
+		te.orchestrationOptions,
+		te.logger,
+		te.metrics,
+		te.contextFields,
+	)
 	actions := orchestrationCtx.start()
+	te.reportHistoryMetric(orchestrationCtx)
 
 	results := &backend.ExecutionResults{
 		Response: &protos.OrchestratorResponse{
@@ -130,6 +193,26 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		},
 	}
 	return results, nil
+}
+
+func (te *taskExecutor) reportHistoryMetric(ctx *OrchestrationContext) {
+	if te.metrics.History == nil {
+		return
+	}
+	metric := backend.HistoryMetric{
+		InstanceID:           ctx.ID,
+		OrchestrationName:    ctx.Name,
+		OrchestrationVersion: ctx.Version,
+		HistoryLength:        ctx.HistoryLength(),
+		ProcessedEvents:      ctx.processedEventsThisTurn,
+		HistoryLimitExceeded: ctx.HistoryLimitExceeded(),
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ctx.Logger().Error("history metrics callback panicked", "error", recovered)
+		}
+	}()
+	te.metrics.History(metric)
 }
 
 func orchestrationVersion(eventLists ...[]*protos.HistoryEvent) string {

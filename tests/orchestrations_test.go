@@ -292,6 +292,7 @@ func Test_ActivityRetries(t *testing.T) {
 		})).Await(nil); err != nil {
 			return nil, err
 		}
+
 		return nil, nil
 	}))
 	require.NoError(t, r.AddActivityN("FailActivity", func(ctx task.ActivityContext) (any, error) {
@@ -330,6 +331,66 @@ func Test_ActivityRetries(t *testing.T) {
 		assertActivity("FailActivity", id, 4),
 		assertOrchestratorExecuted("ActivityRetries", id, "FAILED"),
 	)
+}
+
+func Test_ActivityContextIncludesParentOrchestrationIdentityAndFields(t *testing.T) {
+	type propagatedContext struct {
+		InstanceID           api.InstanceID
+		OrchestrationName    string
+		OrchestrationVersion string
+		ActivityName         string
+		ActivityVersion      string
+		Field                string
+	}
+
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("ContextParent", func(ctx *task.OrchestrationContext) (any, error) {
+		var result propagatedContext
+		err := ctx.CallActivity(
+			"InspectContext",
+			task.WithActivityVersion("activity-v1"),
+		).Await(&result)
+		return result, err
+	}))
+	require.NoError(t, registry.AddActivityN("InspectContext", func(ctx task.ActivityContext) (any, error) {
+		orchestration, _ := api.OrchestrationContextInfoFromContext(ctx.Context())
+		activity, _ := api.ActivityContextInfoFromContext(ctx.Context())
+		fields := api.ContextFieldsFromContext(ctx.Context())
+		return propagatedContext{
+			InstanceID:           orchestration.InstanceID,
+			OrchestrationName:    orchestration.Name,
+			OrchestrationVersion: orchestration.Version,
+			ActivityName:         activity.Name,
+			ActivityVersion:      activity.Version,
+			Field:                fields["tenant"],
+		}, nil
+	}))
+
+	ctx := context.Background()
+	client, worker := initTaskHubWorkerWithExecutorOptions(
+		ctx,
+		registry,
+		[]task.TaskExecutorOption{
+			task.WithContextFields(api.ContextFields{"tenant": "alpha"}),
+		},
+	)
+	defer func() {
+		require.NoError(t, worker.Shutdown(ctx))
+	}()
+
+	instanceID, err := client.ScheduleNewOrchestration(ctx, "ContextParent", api.WithVersion("orchestration-v2"))
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	require.JSONEq(t, fmt.Sprintf(`{
+		"InstanceID": %q,
+		"OrchestrationName": "ContextParent",
+		"OrchestrationVersion": "orchestration-v2",
+		"ActivityName": "InspectContext",
+		"ActivityVersion": "activity-v1",
+		"Field": "alpha"
+	}`, instanceID), metadata.SerializedOutput)
 }
 
 func Test_ActivityFanOut(t *testing.T) {
@@ -1477,12 +1538,21 @@ func Test_SingleActivity_ReuseInstanceIDError(t *testing.T) {
 }
 
 func initTaskHubWorker(ctx context.Context, r *task.TaskRegistry, opts ...backend.NewTaskWorkerOptions) (backend.TaskHubClient, backend.TaskHubWorker) {
+	return initTaskHubWorkerWithExecutorOptions(ctx, r, nil, opts...)
+}
+
+func initTaskHubWorkerWithExecutorOptions(
+	ctx context.Context,
+	r *task.TaskRegistry,
+	executorOpts []task.TaskExecutorOption,
+	workerOpts ...backend.NewTaskWorkerOptions,
+) (backend.TaskHubClient, backend.TaskHubWorker) {
 	// TODO: Switch to options pattern
 	logger := backend.DefaultLogger()
 	be := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), logger)
-	executor := task.NewTaskExecutor(r)
-	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger, opts...)
-	activityWorker := backend.NewActivityTaskWorker(be, executor, logger, opts...)
+	executor := task.NewTaskExecutor(r, executorOpts...)
+	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger, workerOpts...)
+	activityWorker := backend.NewActivityTaskWorker(be, executor, logger, workerOpts...)
 	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger)
 	if err := taskHubWorker.Start(ctx); err != nil {
 		panic(err)

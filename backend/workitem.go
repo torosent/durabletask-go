@@ -20,6 +20,7 @@ type OrchestrationWorkItem struct {
 	NewEvents  []*HistoryEvent
 	LockedBy   string
 	RetryCount int32
+	EnqueuedAt time.Time
 	State      *OrchestrationRuntimeState
 	Properties map[string]any
 }
@@ -51,6 +52,8 @@ type ActivityWorkItem struct {
 	NewEvent       *HistoryEvent
 	Result         *HistoryEvent
 	LockedBy       string
+	RetryCount     int32
+	EnqueuedAt     time.Time
 	Properties     map[string]any
 }
 

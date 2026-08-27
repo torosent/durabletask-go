@@ -368,10 +368,10 @@ func Test_SendEvent(t *testing.T) {
 		}
 		if assert.Len(t, s.PendingMessages(), 1) {
 			msg := s.PendingMessages()[0]
-			if sendEvent := msg.HistoryEvent.GetEventSent(); assert.NotNil(t, sendEvent) {
-				assert.Equal(t, expectedEventName, sendEvent.Name)
-				assert.Equal(t, expectedInput, sendEvent.Input.GetValue())
-				assert.Equal(t, expectedInstanceID, sendEvent.InstanceId)
+			assert.Equal(t, expectedInstanceID, msg.TargetInstanceID)
+			if raisedEvent := msg.HistoryEvent.GetEventRaised(); assert.NotNil(t, raisedEvent) {
+				assert.Equal(t, expectedEventName, raisedEvent.Name)
+				assert.Equal(t, expectedInput, raisedEvent.Input.GetValue())
 			}
 		}
 	}

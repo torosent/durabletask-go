@@ -16,6 +16,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -285,6 +286,112 @@ func Test_ScheduleTimerTasks(t *testing.T) {
 				assert.WithinDuration(t, expectedFireAt, tf.FireAt.AsTime(), 0)
 			}
 		}
+	}
+}
+
+func Test_OrchestrationMetadataIncludesVersionAndParent(t *testing.T) {
+	for i, be := range backends {
+		initTest(t, be, i, true)
+
+		parent := helpers.NewParentInfo(7, "parent", "parent-instance")
+		startEvent := helpers.NewExecutionStartedEvent(
+			"child",
+			"child-instance",
+			nil,
+			parent,
+			nil,
+			nil,
+			wrapperspb.String("v2"),
+		)
+		require.NoError(t, be.CreateOrchestrationInstance(ctx, startEvent))
+
+		metadata, err := be.GetOrchestrationMetadata(ctx, "child-instance")
+		require.NoError(t, err)
+		assert.Equal(t, "v2", metadata.Version)
+		assert.Equal(t, api.InstanceID("parent-instance"), metadata.ParentInstanceID)
+	}
+}
+
+func Test_BacklogSnapshots(t *testing.T) {
+	for i, be := range backends {
+		initTest(t, be, i, true)
+		provider, ok := be.(backend.BacklogSnapshotProvider)
+		if !assert.True(t, ok, "backend does not expose backlog snapshots") {
+			continue
+		}
+
+		require.True(t, createOrchestrationInstance(t, be, "backlog-instance"))
+		orchestrationBacklog, err := provider.GetOrchestrationBacklog(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), orchestrationBacklog.Depth)
+		assert.GreaterOrEqual(t, orchestrationBacklog.OldestAge, time.Duration(0))
+
+		wi, ok := getOrchestrationWorkItem(t, be, "backlog-instance")
+		require.True(t, ok)
+		state, ok := getOrchestrationRuntimeState(t, be, wi)
+		require.True(t, ok)
+		for _, event := range wi.NewEvents {
+			require.NoError(t, state.AddEvent(event))
+		}
+		_, err = state.ApplyActions([]*protos.OrchestratorAction{
+			helpers.NewScheduleTaskAction(0, "queued-activity", nil),
+		}, nil)
+		require.NoError(t, err)
+		wi.State = state
+		require.NoError(t, be.CompleteOrchestrationWorkItem(ctx, wi))
+
+		orchestrationBacklog, err = provider.GetOrchestrationBacklog(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, orchestrationBacklog.Depth)
+		activityBacklog, err := provider.GetActivityBacklog(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), activityBacklog.Depth)
+		assert.GreaterOrEqual(t, activityBacklog.OldestAge, time.Duration(0))
+	}
+}
+
+func Test_SendEventOutboxCommitsTargetEventTransactionally(t *testing.T) {
+	for i, be := range backends {
+		initTest(t, be, i, true)
+
+		require.True(t, createOrchestrationInstance(t, be, "target"))
+		targetWorkItem, ok := getOrchestrationWorkItem(t, be, "target")
+		require.True(t, ok)
+		targetState, ok := getOrchestrationRuntimeState(t, be, targetWorkItem)
+		require.True(t, ok)
+		for _, event := range targetWorkItem.NewEvents {
+			require.NoError(t, targetState.AddEvent(event))
+		}
+		targetWorkItem.State = targetState
+		require.NoError(t, be.CompleteOrchestrationWorkItem(ctx, targetWorkItem))
+
+		require.True(t, createOrchestrationInstance(t, be, "source"))
+		sourceWorkItem, ok := getOrchestrationWorkItem(t, be, "source")
+		require.True(t, ok)
+		sourceState, ok := getOrchestrationRuntimeState(t, be, sourceWorkItem)
+		require.True(t, ok)
+		for _, event := range sourceWorkItem.NewEvents {
+			require.NoError(t, sourceState.AddEvent(event))
+		}
+		_, err := sourceState.ApplyActions([]*protos.OrchestratorAction{
+			helpers.NewSendEventAction("target", "ping", wrapperspb.String(`{"value":1}`)),
+		}, nil)
+		require.NoError(t, err)
+		sourceWorkItem.State = sourceState
+		require.NoError(t, be.CompleteOrchestrationWorkItem(ctx, sourceWorkItem))
+
+		persistedSource, err := be.GetOrchestrationRuntimeState(ctx, &backend.OrchestrationWorkItem{InstanceID: "source"})
+		require.NoError(t, err)
+		require.NotEmpty(t, persistedSource.OldEvents())
+		assert.NotNil(t, persistedSource.OldEvents()[len(persistedSource.OldEvents())-1].GetEventSent())
+
+		delivered, ok := getOrchestrationWorkItem(t, be, "target")
+		require.True(t, ok)
+		require.Len(t, delivered.NewEvents, 1)
+		raised := delivered.NewEvents[0].GetEventRaised()
+		require.NotNil(t, raised)
+		assert.Equal(t, "ping", raised.Name)
+		assert.Equal(t, `{"value":1}`, raised.Input.GetValue())
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -199,5 +200,8 @@ func getSubOrchestrationInstances(oldEvents []*HistoryEvent, newEvents []*Histor
 	for orch := range subOrchestrationInstancesMap {
 		subOrchestrationInstances = append(subOrchestrationInstances, orch)
 	}
+	sort.Slice(subOrchestrationInstances, func(i, j int) bool {
+		return subOrchestrationInstances[i] < subOrchestrationInstances[j]
+	})
 	return subOrchestrationInstances
 }

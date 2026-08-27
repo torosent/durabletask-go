@@ -49,6 +49,15 @@ func (p *orchestratorProcessor) FetchWorkItem(ctx context.Context) (WorkItem, er
 	return p.be.GetOrchestrationWorkItem(ctx)
 }
 
+func (p *orchestratorProcessor) GetBacklogMetric(ctx context.Context) (BacklogMetric, bool, error) {
+	provider, ok := p.be.(BacklogSnapshotProvider)
+	if !ok {
+		return BacklogMetric{}, false, nil
+	}
+	metric, err := provider.GetOrchestrationBacklog(ctx)
+	return metric, true, err
+}
+
 // ProcessWorkItem implements TaskProcessor
 func (w *orchestratorProcessor) ProcessWorkItem(ctx context.Context, cwi WorkItem) error {
 	wi := cwi.(*OrchestrationWorkItem)

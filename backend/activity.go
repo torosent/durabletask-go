@@ -15,6 +15,7 @@ import (
 type activityProcessor struct {
 	be       Backend
 	executor ActivityExecutor
+	logger   Logger
 }
 
 type ActivityExecutor interface {
@@ -22,14 +23,15 @@ type ActivityExecutor interface {
 }
 
 func NewActivityTaskWorker(be Backend, executor ActivityExecutor, logger Logger, opts ...NewTaskWorkerOptions) TaskWorker {
-	processor := newActivityProcessor(be, executor)
+	processor := newActivityProcessor(be, executor, logger)
 	return NewTaskWorker(processor, logger, opts...)
 }
 
-func newActivityProcessor(be Backend, executor ActivityExecutor) TaskProcessor {
+func newActivityProcessor(be Backend, executor ActivityExecutor, logger Logger) TaskProcessor {
 	return &activityProcessor{
 		be:       be,
 		executor: executor,
+		logger:   logger,
 	}
 }
 
@@ -43,6 +45,15 @@ func (ap *activityProcessor) FetchWorkItem(ctx context.Context) (WorkItem, error
 	return ap.be.GetActivityWorkItem(ctx)
 }
 
+func (ap *activityProcessor) GetBacklogMetric(ctx context.Context) (BacklogMetric, bool, error) {
+	provider, ok := ap.be.(BacklogSnapshotProvider)
+	if !ok {
+		return BacklogMetric{}, false, nil
+	}
+	metric, err := provider.GetActivityBacklog(ctx)
+	return metric, true, err
+}
+
 // ProcessWorkItem implements TaskDispatcher
 func (p *activityProcessor) ProcessWorkItem(ctx context.Context, wi WorkItem) error {
 	awi := wi.(*ActivityWorkItem)
@@ -50,6 +61,19 @@ func (p *activityProcessor) ProcessWorkItem(ctx context.Context, wi WorkItem) er
 	ts := awi.NewEvent.GetTaskScheduled()
 	if ts == nil {
 		return fmt.Errorf("%v: invalid TaskScheduled event", awi.InstanceID)
+	}
+
+	if orchestration, ok := api.OrchestrationContextInfoFromContext(ctx); !ok || orchestration.Name == "" {
+		metadata, err := p.be.GetOrchestrationMetadata(ctx, awi.InstanceID)
+		if err != nil {
+			return fmt.Errorf("%v: failed to load orchestration context metadata: %w", awi.InstanceID, err)
+		}
+		ctx = api.WithOrchestrationContextInfo(ctx, api.OrchestrationContextInfo{
+			InstanceID:       awi.InstanceID,
+			Name:             metadata.Name,
+			Version:          metadata.Version,
+			ParentInstanceID: metadata.ParentInstanceID,
+		})
 	}
 
 	// Create span as child of spanContext found in TaskScheduledEvent
