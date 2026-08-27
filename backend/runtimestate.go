@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -129,17 +130,17 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				}
 
 				// Duplicate the start event info, updating just the input
-				if err := newState.AddEvent(
-					helpers.NewExecutionStartedEvent(
-						s.startEvent.Name,
-						string(s.instanceID),
-						completedAction.Result,
-						s.startEvent.ParentInstance,
-						s.startEvent.ParentTraceContext,
-						nil,
-						s.startEvent.Version,
-					),
-				); err != nil {
+				startEvent := helpers.NewExecutionStartedEvent(
+					s.startEvent.Name,
+					string(s.instanceID),
+					completedAction.Result,
+					s.startEvent.ParentInstance,
+					s.startEvent.ParentTraceContext,
+					nil,
+					s.startEvent.Version,
+				)
+				startEvent.GetExecutionStarted().Tags = contextprop.Clone(s.startEvent.Tags)
+				if err := newState.AddEvent(startEvent); err != nil {
 					return false, fmt.Errorf("failed to add execution started event: %w", err)
 				}
 
@@ -196,6 +197,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				scheduleTask.Input,
 				currentTraceContext,
 			)
+			scheduledEvent.GetTaskScheduled().Tags = contextprop.Clone(scheduleTask.Tags)
 			if err := s.AddEvent(scheduledEvent); err != nil {
 				return false, fmt.Errorf("failed to add task scheduled event: %w", err)
 			}
@@ -224,6 +226,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				nil,
 				createSO.Version,
 			)
+			startEvent.GetExecutionStarted().Tags = contextprop.Clone(createSO.Tags)
 			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: startEvent, TargetInstanceID: createSO.InstanceId})
 		} else if sendEvent := action.GetSendEvent(); sendEvent != nil {
 			sentEvent := helpers.NewSendEventEvent(action.Id, sendEvent.Instance.InstanceId, sendEvent.Name, sendEvent.Data)

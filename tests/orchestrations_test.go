@@ -367,18 +367,17 @@ func Test_ActivityContextIncludesParentOrchestrationIdentityAndFields(t *testing
 	}))
 
 	ctx := context.Background()
-	client, worker := initTaskHubWorkerWithExecutorOptions(
-		ctx,
-		registry,
-		[]task.TaskExecutorOption{
-			task.WithContextFields(api.ContextFields{"tenant": "alpha"}),
-		},
-	)
+	client, worker := initTaskHubWorker(ctx, registry)
 	defer func() {
 		require.NoError(t, worker.Shutdown(ctx))
 	}()
 
-	instanceID, err := client.ScheduleNewOrchestration(ctx, "ContextParent", api.WithVersion("orchestration-v2"))
+	instanceID, err := client.ScheduleNewOrchestration(
+		ctx,
+		"ContextParent",
+		api.WithVersion("orchestration-v2"),
+		api.WithContextFields(api.ContextFields{"tenant": "alpha"}),
+	)
 	require.NoError(t, err)
 	metadata, err := client.WaitForOrchestrationCompletion(ctx, instanceID)
 	require.NoError(t, err)

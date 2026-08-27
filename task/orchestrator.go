@@ -16,6 +16,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -516,6 +517,12 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 		helpers.GetTaskFunctionName(activity),
 		options.rawInput,
 		options.version)
+	scheduleTaskAction.GetScheduleTask().Tags = contextprop.Encode(api.OrchestrationContextInfo{
+		InstanceID:       ctx.ID,
+		Name:             ctx.Name,
+		Version:          ctx.Version,
+		ParentInstanceID: ctx.parentInstanceID,
+	}, ctx.contextFields)
 
 	ctx.pendingActions[scheduleTaskAction.Id] = scheduleTaskAction
 
@@ -564,6 +571,15 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 		options.instanceID,
 		options.rawInput,
 		options.version,
+	)
+	createSubOrchestrationAction.GetCreateSubOrchestration().Tags = contextprop.Encode(
+		api.OrchestrationContextInfo{
+			InstanceID:       ctx.ID,
+			Name:             ctx.Name,
+			Version:          ctx.Version,
+			ParentInstanceID: ctx.parentInstanceID,
+		},
+		ctx.contextFields,
 	)
 	if createSubOrchestrationAction.GetCreateSubOrchestration().GetInstanceId() == "" {
 		createSubOrchestrationAction.GetCreateSubOrchestration().InstanceId = fmt.Sprintf(
@@ -776,6 +792,8 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 	}
 	ctx.Name = es.Name
 	ctx.Version = es.GetVersion().GetValue()
+	_, fields := contextprop.Decode(es.GetTags())
+	ctx.contextFields = mergeContextFields(ctx.contextFields, fields)
 	if parent := es.GetParentInstance(); parent != nil {
 		ctx.parentInstanceID = api.InstanceID(parent.GetOrchestrationInstance().GetInstanceId())
 	}

@@ -156,6 +156,18 @@ func WithVersion(version string) NewOrchestrationOptions {
 	}
 }
 
+// WithContextFields configures immutable fields propagated into orchestration
+// and activity contexts. The fields are persisted with orchestration history.
+func WithContextFields(fields ContextFields) NewOrchestrationOptions {
+	return func(req *protos.CreateInstanceRequest) error {
+		req.Tags = make(map[string]string, len(fields))
+		for key, value := range fields {
+			req.Tags[key] = value
+		}
+		return nil
+	}
+}
+
 // WithFetchPayloads configures whether to load orchestration inputs, outputs, and custom status values, which could be large.
 func WithFetchPayloads(fetchPayloads bool) FetchOrchestrationMetadataOptions {
 	return func(req *protos.GetInstanceRequest) {

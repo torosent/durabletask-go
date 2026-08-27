@@ -8,6 +8,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -90,12 +91,26 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		}
 		return helpers.NewTaskFailedEvent(e.EventId, versionFailureDetails(versionErr)), nil
 	}
-	ctx = api.WithContextFields(ctx, te.contextFields)
+	ctx = api.ContextWithFields(ctx, te.contextFields)
+	tagInfo, tagFields := contextprop.Decode(ts.GetTags())
+	ctx = api.ContextWithFields(ctx, tagFields)
 	orchestrationInfo, _ := api.OrchestrationContextInfoFromContext(ctx)
-	if orchestrationInfo.InstanceID == "" {
-		orchestrationInfo.InstanceID = id
-		ctx = api.WithOrchestrationContextInfo(ctx, orchestrationInfo)
+	if orchestrationInfo.Name == "" {
+		orchestrationInfo.Name = tagInfo.Name
 	}
+	if orchestrationInfo.Version == "" {
+		orchestrationInfo.Version = tagInfo.Version
+	}
+	if orchestrationInfo.ParentInstanceID == "" {
+		orchestrationInfo.ParentInstanceID = tagInfo.ParentInstanceID
+	}
+	if orchestrationInfo.InstanceID == "" {
+		orchestrationInfo.InstanceID = tagInfo.InstanceID
+		if orchestrationInfo.InstanceID == "" {
+			orchestrationInfo.InstanceID = id
+		}
+	}
+	ctx = api.WithOrchestrationContextInfo(ctx, orchestrationInfo)
 	ctx = api.WithActivityContextInfo(ctx, api.ActivityContextInfo{
 		InstanceID: id,
 		Name:       ts.Name,

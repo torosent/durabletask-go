@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
@@ -256,6 +257,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 		request.Input,
 		request.ParentTraceContext,
 	)
+	event.GetTaskScheduled().Tags = contextprop.Clone(request.Tags)
 	result, err := w.executor.ExecuteActivity(ctx, api.InstanceID(request.OrchestrationInstance.InstanceId), event)
 	var versionMismatch *task.VersionMismatchError
 	if errors.As(err, &versionMismatch) {
