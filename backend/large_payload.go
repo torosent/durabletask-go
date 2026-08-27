@@ -165,11 +165,11 @@ func (be *largePayloadBackend) GetEntityWorkItem(ctx context.Context) (*EntityWo
 	if err != nil || workItem == nil {
 		return workItem, err
 	}
-	state, err := largepayload.Hydrate(ctx, be.options, StringValue(workItem.State))
-	if err != nil {
-		return nil, fmt.Errorf("failed to hydrate entity state: %w", err)
-	}
 	if workItem.State != nil {
+		state, err := largepayload.Hydrate(ctx, be.options, wrapperspb.String(*workItem.State))
+		if err != nil {
+			return nil, fmt.Errorf("failed to hydrate entity state: %w", err)
+		}
 		value := state.GetValue()
 		workItem.State = &value
 	}

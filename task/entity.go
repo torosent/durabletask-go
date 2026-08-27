@@ -30,7 +30,6 @@ type EntityContext struct {
 	rawInput    []byte
 	state       entityState
 	stateDirty  bool
-	stateRead   bool
 	actions     []*protos.OperationAction
 	actionIDSeq int32
 	currentTime time.Time
@@ -55,7 +54,6 @@ func (ctx *EntityContext) HasState() bool {
 
 // GetState unmarshals the entity state and saves the result into [v].
 func (ctx *EntityContext) GetState(v any) error {
-	ctx.stateRead = true
 	if !ctx.state.hasValue {
 		return fmt.Errorf("entity has no state")
 	}

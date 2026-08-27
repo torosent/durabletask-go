@@ -19,10 +19,3 @@ type EntityRequestMessage struct {
 	Operation        string `json:"operation"`
 	Input            string `json:"input,omitempty"`
 }
-
-// EntityResponseMessage is the payload sent back from an entity to a calling orchestration.
-// This matches the .NET DTFx ResponseMessage format for wire compatibility.
-type EntityResponseMessage struct {
-	Result       string `json:"result,omitempty"`
-	ErrorMessage string `json:"errorMessage,omitempty"`
-}
