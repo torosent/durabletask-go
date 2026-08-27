@@ -23,12 +23,14 @@ var (
 	EmptyInstanceID = InstanceID("")
 )
 
-type CreateOrchestrationAction = protos.CreateOrchestrationAction
+// CreateOrchestrationAction controls how a local task hub handles an existing
+// orchestration whose runtime status matches an ID reuse policy.
+type CreateOrchestrationAction int32
 
 const (
-	REUSE_ID_ACTION_ERROR     CreateOrchestrationAction = protos.CreateOrchestrationAction_ERROR
-	REUSE_ID_ACTION_IGNORE    CreateOrchestrationAction = protos.CreateOrchestrationAction_IGNORE
-	REUSE_ID_ACTION_TERMINATE CreateOrchestrationAction = protos.CreateOrchestrationAction_TERMINATE
+	REUSE_ID_ACTION_ERROR CreateOrchestrationAction = iota
+	REUSE_ID_ACTION_IGNORE
+	REUSE_ID_ACTION_TERMINATE
 )
 
 type OrchestrationStatus = protos.OrchestrationStatus
@@ -44,7 +46,12 @@ const (
 	RUNTIME_STATUS_SUSPENDED        OrchestrationStatus = protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED
 )
 
-type OrchestrationIdReusePolicy = protos.OrchestrationIdReusePolicy
+// OrchestrationIdReusePolicy controls instance ID reuse without exposing the
+// transport-specific protobuf representation.
+type OrchestrationIdReusePolicy struct {
+	Action          CreateOrchestrationAction
+	OperationStatus []OrchestrationStatus
+}
 
 // InstanceID is a unique identifier for an orchestration instance.
 type InstanceID string
@@ -86,13 +93,25 @@ func WithInstanceID(id InstanceID) NewOrchestrationOptions {
 }
 
 // WithOrchestrationIdReusePolicy configures Orchestration ID reuse policy.
-func WithOrchestrationIdReusePolicy(policy *protos.OrchestrationIdReusePolicy) NewOrchestrationOptions {
+func WithOrchestrationIdReusePolicy(policy *OrchestrationIdReusePolicy) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
-		// initialize CreateInstanceOption
-		req.OrchestrationIdReusePolicy = &protos.OrchestrationIdReusePolicy{
-			Action:          policy.Action,
-			OperationStatus: policy.OperationStatus,
+		if policy == nil {
+			req.OrchestrationIdReusePolicy = nil
+			return nil
 		}
+		switch policy.Action {
+		case REUSE_ID_ACTION_ERROR, REUSE_ID_ACTION_IGNORE, REUSE_ID_ACTION_TERMINATE:
+		default:
+			return fmt.Errorf("invalid orchestration ID reuse action: %d", policy.Action)
+		}
+
+		wirePolicy := &protos.OrchestrationIdReusePolicy{
+			ReplaceableStatus: append([]protos.OrchestrationStatus(nil), policy.OperationStatus...),
+		}
+		if err := protos.SetLegacyOrchestrationIDReuseAction(wirePolicy, int32(policy.Action)); err != nil {
+			return fmt.Errorf("failed to encode orchestration ID reuse action: %w", err)
+		}
+		req.OrchestrationIdReusePolicy = wirePolicy
 		return nil
 	}
 }
