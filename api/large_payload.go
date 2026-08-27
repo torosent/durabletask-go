@@ -31,10 +31,10 @@ type LargePayloadResolver interface {
 
 // LargePayloadOptions configures payload externalization and hydration.
 type LargePayloadOptions struct {
-	Store           LargePayloadStore
-	Resolver        LargePayloadResolver
+	Store    LargePayloadStore
+	Resolver LargePayloadResolver
 	// ThresholdBytes uses DefaultLargePayloadThresholdBytes when zero.
-	ThresholdBytes  int
+	ThresholdBytes int
 	// MaxPayloadBytes uses DefaultLargePayloadMaxBytes when zero.
 	MaxPayloadBytes int
 }
