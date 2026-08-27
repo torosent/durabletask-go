@@ -10,15 +10,13 @@ type WaitGroup interface {
 
 type orchestrationWaitGroup struct {
 	scheduler *coroutineScheduler
-	scope     *cancellationScope
 	count     int
 	waiters   map[*coroutine]struct{}
 }
 
-func newOrchestrationWaitGroup(scheduler *coroutineScheduler, scope *cancellationScope) *orchestrationWaitGroup {
+func newOrchestrationWaitGroup(scheduler *coroutineScheduler) *orchestrationWaitGroup {
 	return &orchestrationWaitGroup{
 		scheduler: scheduler,
-		scope:     scope,
 		waiters:   make(map[*coroutine]struct{}),
 	}
 }
