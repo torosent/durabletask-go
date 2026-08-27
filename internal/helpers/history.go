@@ -20,12 +20,13 @@ func NewExecutionStartedEvent(
 	parent *protos.ParentInstanceInfo,
 	parentTraceContext *protos.TraceContext,
 	scheduledStartTimeStamp *timestamppb.Timestamp,
+	version ...*wrapperspb.StringValue,
 ) *protos.HistoryEvent {
 	u, err := uuid.NewV7()
 	if err != nil {
 		u = uuid.New()
 	}
-	return &protos.HistoryEvent{
+	event := &protos.HistoryEvent{
 		EventId:   -1,
 		Timestamp: timestamppb.New(time.Now()),
 		EventType: &protos.HistoryEvent_ExecutionStarted{
@@ -42,6 +43,10 @@ func NewExecutionStartedEvent(
 			},
 		},
 	}
+	if len(version) > 0 {
+		event.GetExecutionStarted().Version = version[0]
+	}
+	return event
 }
 
 func NewExecutionCompletedEvent(eventID int32, status protos.OrchestrationStatus, result *wrapperspb.StringValue, failureDetails *protos.TaskFailureDetails) *protos.HistoryEvent {
@@ -242,13 +247,22 @@ func NewParentInfo(taskID int32, name string, iid string) *protos.ParentInstance
 	}
 }
 
-func NewScheduleTaskAction(taskID int32, name string, input *wrapperspb.StringValue) *protos.OrchestratorAction {
-	return &protos.OrchestratorAction{
+func NewScheduleTaskAction(
+	taskID int32,
+	name string,
+	input *wrapperspb.StringValue,
+	version ...*wrapperspb.StringValue,
+) *protos.OrchestratorAction {
+	action := &protos.OrchestratorAction{
 		Id: taskID,
 		OrchestratorActionType: &protos.OrchestratorAction_ScheduleTask{
 			ScheduleTask: &protos.ScheduleTaskAction{Name: name, Input: input},
 		},
 	}
+	if len(version) > 0 {
+		action.GetScheduleTask().Version = version[0]
+	}
+	return action
 }
 
 func NewCreateTimerAction(taskID int32, fireAt time.Time) *protos.OrchestratorAction {
@@ -278,8 +292,9 @@ func NewCreateSubOrchestrationAction(
 	name string,
 	iid string,
 	input *wrapperspb.StringValue,
+	version ...*wrapperspb.StringValue,
 ) *protos.OrchestratorAction {
-	return &protos.OrchestratorAction{
+	action := &protos.OrchestratorAction{
 		Id: taskID,
 		OrchestratorActionType: &protos.OrchestratorAction_CreateSubOrchestration{
 			CreateSubOrchestration: &protos.CreateSubOrchestrationAction{
@@ -289,6 +304,10 @@ func NewCreateSubOrchestrationAction(
 			},
 		},
 	}
+	if len(version) > 0 {
+		action.GetCreateSubOrchestration().Version = version[0]
+	}
+	return action
 }
 
 func NewCompleteOrchestrationAction(
