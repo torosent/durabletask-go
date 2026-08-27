@@ -1380,7 +1380,7 @@ func loadPostgresEntityMessages(rows pgx.Rows, capacity int) ([]postgresEntityMe
 		message.descriptor = descriptor
 		messages = append(messages, message)
 	}
-	return messages, nil
+	return messages, rows.Err()
 }
 
 // isEntityControlMessage reports whether an entity message kind transfers ownership
@@ -1743,6 +1743,10 @@ func (be *postgresBackend) CleanEntityStorage(ctx context.Context, request api.C
 			return nil, err
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 	result := &api.CleanEntityStorageResult{}

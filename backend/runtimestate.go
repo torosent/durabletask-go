@@ -158,10 +158,21 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 						return false, fmt.Errorf("failed to add carryover event: %w", err)
 					}
 				}
-				newState.pendingTasks = append(newState.pendingTasks, s.pendingTasks...)
-				newState.pendingTimers = append(newState.pendingTimers, s.pendingTimers...)
-				newState.pendingMessages = append(newState.pendingMessages, s.pendingMessages...)
-				newState.pendingEntityMessages = append(newState.pendingEntityMessages, s.pendingEntityMessages...)
+				// ContinueAsNew discards correlated work from the old execution.
+				// Only fire-and-forget orchestration events and entity signals can
+				// safely cross the execution boundary.
+				for _, message := range s.pendingMessages {
+					if message.HistoryEvent.GetEventRaised() != nil ||
+						message.HistoryEvent.GetExecutionTerminated() != nil {
+						newState.pendingMessages = append(newState.pendingMessages, message)
+					}
+				}
+				for _, message := range s.pendingEntityMessages {
+					if message.HistoryEvent.GetEntityOperationSignaled() != nil ||
+						message.HistoryEvent.GetEntityUnlockSent() != nil {
+						newState.pendingEntityMessages = append(newState.pendingEntityMessages, message)
+					}
+				}
 
 				// Overwrite the current state object with a new one
 				*s = *newState

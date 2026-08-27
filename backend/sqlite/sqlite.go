@@ -1232,7 +1232,9 @@ func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.En
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to load entity messages: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	messages := make([]sqliteEntityMessage, 0, be.options.MaxEntityOperationBatchSize+1)
 	for rows.Next() {
@@ -1250,6 +1252,9 @@ func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.En
 			return nil, false, err
 		}
 		messages = append(messages, raw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
 	}
 
 	selected := make([]sqliteEntityMessage, 0, be.options.MaxEntityOperationBatchSize)
@@ -1618,7 +1623,9 @@ func (be *sqliteBackend) QueryEntities(ctx context.Context, query api.EntityQuer
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 	result := &api.EntityQueryResults{Entities: make([]*api.EntityMetadata, 0, pageSize)}
 	for rows.Next() {
 		var instanceID string
@@ -1672,12 +1679,16 @@ func (be *sqliteBackend) CleanEntityStorage(ctx context.Context, request api.Cle
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
+			return nil, errors.Join(err, rows.Close())
 		}
 		ids = append(ids, id)
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	result := &api.CleanEntityStorageResult{}
 	if len(ids) > 1000 {
 		result.ContinuationToken = ids[999]
