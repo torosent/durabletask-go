@@ -10,6 +10,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/marusama/semaphore/v2"
+	"github.com/microsoft/durabletask-go/api"
 )
 
 type TaskWorker interface {
@@ -293,7 +294,7 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 		return
 	}
 
-	if err := w.processor.CompleteWorkItem(ctx, wi); err != nil {
+	if err := w.processor.CompleteWorkItem(w.releaseContext(ctx), wi); err != nil {
 		if errors.Is(err, ctx.Err()) {
 			w.logger.Warnf("%v: failed to complete work item due to cancellation", w.Name())
 		} else {
@@ -361,6 +362,17 @@ func asActivityWorkItem(wi WorkItem) *ActivityWorkItem {
 	}
 }
 
+func asEntityWorkItem(wi WorkItem) *EntityWorkItem {
+	switch workItem := wi.(type) {
+	case *EntityWorkItem:
+		return workItem
+	case EntityWorkItem:
+		return &workItem
+	default:
+		return nil
+	}
+}
+
 type backlogMetricSource interface {
 	GetBacklogMetric(context.Context) (BacklogMetric, bool, error)
 }
@@ -420,6 +432,10 @@ func (w *worker) reportWorkerActivity(wi WorkItem, state WorkerActivityState, st
 		if activity.NewEvent != nil {
 			metric.ActivityName = activity.NewEvent.GetTaskScheduled().GetName()
 		}
+	} else if entity := asEntityWorkItem(wi); entity != nil {
+		metric.Kind = WorkItemKindEntity
+		metric.InstanceID = api.InstanceID(entity.InstanceID.String())
+		metric.RetryCount = entity.RetryCount
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -448,6 +464,8 @@ func workItemQueueLatency(wi WorkItem, now time.Time) time.Duration {
 		enqueuedAt = orchestration.EnqueuedAt
 	} else if activity := asActivityWorkItem(wi); activity != nil {
 		enqueuedAt = activity.EnqueuedAt
+	} else if entity := asEntityWorkItem(wi); entity != nil {
+		enqueuedAt = entity.EnqueuedAt
 	}
 	if enqueuedAt.IsZero() || !enqueuedAt.Before(now) {
 		return 0

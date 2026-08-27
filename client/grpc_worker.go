@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ type TaskHubGrpcWorkerOption func(*taskHubGrpcWorkerOptions) error
 type taskHubGrpcWorkerOptions struct {
 	maxConcurrentOrchestrations int
 	maxConcurrentActivities     int
+	maxConcurrentEntities       int
 	helloTimeout                time.Duration
 	silentDisconnectTimeout     time.Duration
 	rpcTimeout                  time.Duration
@@ -49,6 +51,7 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
 	taskExecutorOptions         []task.TaskExecutorOption
+	workItemFilters             *protos.WorkItemFilters
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -56,6 +59,7 @@ func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
 	return taskHubGrpcWorkerOptions{
 		maxConcurrentOrchestrations: defaultConcurrency,
 		maxConcurrentActivities:     defaultConcurrency,
+		maxConcurrentEntities:       defaultConcurrency,
 		helloTimeout:                30 * time.Second,
 		silentDisconnectTimeout:     2 * time.Minute,
 		rpcTimeout:                  30 * time.Second,
@@ -83,6 +87,79 @@ func WithMaxConcurrentActivityWorkItems(n int) TaskHubGrpcWorkerOption {
 			return fmt.Errorf("maximum concurrent activity work items must be greater than zero")
 		}
 		options.maxConcurrentActivities = n
+		return nil
+	}
+}
+
+// WithMaxConcurrentEntityWorkItems limits concurrent entity batch execution.
+func WithMaxConcurrentEntityWorkItems(n int) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if n <= 0 {
+			return fmt.Errorf("maximum concurrent entity work items must be greater than zero")
+		}
+		options.maxConcurrentEntities = n
+		return nil
+	}
+}
+
+type OrchestrationWorkItemFilter struct {
+	Name     string
+	Versions []string
+}
+
+type ActivityWorkItemFilter struct {
+	Name     string
+	Versions []string
+}
+
+type WorkItemFilters struct {
+	Orchestrations []OrchestrationWorkItemFilter
+	Activities     []ActivityWorkItemFilter
+	Entities       []string
+}
+
+// WithWorkItemFilters configures server-side work routing filters.
+func WithWorkItemFilters(filters WorkItemFilters) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		wire := &protos.WorkItemFilters{}
+		for _, filter := range filters.Orchestrations {
+			if strings.TrimSpace(filter.Name) == "" {
+				return fmt.Errorf("orchestration work-item filter name must not be empty")
+			}
+			versions := append([]string(nil), filter.Versions...)
+			slices.Sort(versions)
+			wire.Orchestrations = append(wire.Orchestrations, &protos.OrchestrationFilter{
+				Name:     filter.Name,
+				Versions: versions,
+			})
+		}
+		for _, filter := range filters.Activities {
+			if strings.TrimSpace(filter.Name) == "" {
+				return fmt.Errorf("activity work-item filter name must not be empty")
+			}
+			versions := append([]string(nil), filter.Versions...)
+			slices.Sort(versions)
+			wire.Activities = append(wire.Activities, &protos.ActivityFilter{
+				Name:     filter.Name,
+				Versions: versions,
+			})
+		}
+		for _, name := range filters.Entities {
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("entity work-item filter name must not be empty")
+			}
+			wire.Entities = append(wire.Entities, &protos.EntityFilter{Name: name})
+		}
+		slices.SortFunc(wire.Orchestrations, func(left, right *protos.OrchestrationFilter) int {
+			return strings.Compare(left.Name, right.Name)
+		})
+		slices.SortFunc(wire.Activities, func(left, right *protos.ActivityFilter) int {
+			return strings.Compare(left.Name, right.Name)
+		})
+		slices.SortFunc(wire.Entities, func(left, right *protos.EntityFilter) int {
+			return strings.Compare(left.Name, right.Name)
+		})
+		options.workItemFilters = wire
 		return nil
 	}
 }
@@ -174,6 +251,7 @@ type grpcWorkerRun struct {
 
 	orchestrationSlots chan struct{}
 	activitySlots      chan struct{}
+	entitySlots        chan struct{}
 	pending            sync.WaitGroup
 	retired            sync.WaitGroup
 	err                error
@@ -364,6 +442,7 @@ func (w *TaskHubGrpcWorker) begin(ctx context.Context) (*grpcWorkerRun, *grpcWor
 			w.options.maxConcurrentOrchestrations,
 		),
 		activitySlots: make(chan struct{}, w.options.maxConcurrentActivities),
+		entitySlots:   make(chan struct{}, w.options.maxConcurrentEntities),
 	}
 	w.run = run
 	w.lastErr = nil
@@ -473,10 +552,11 @@ func (w *TaskHubGrpcWorker) connect(ctx context.Context) (*grpcWorkerConnection,
 	stream, err := client.GetWorkItems(streamCtx, &protos.GetWorkItemsRequest{
 		MaxConcurrentOrchestrationWorkItems: int32(w.options.maxConcurrentOrchestrations),
 		MaxConcurrentActivityWorkItems:      int32(w.options.maxConcurrentActivities),
-		MaxConcurrentEntityWorkItems:        0,
+		MaxConcurrentEntityWorkItems:        int32(w.options.maxConcurrentEntities),
 		Capabilities: []protos.WorkerCapability{
 			protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING,
 		},
+		WorkItemFilters: w.options.workItemFilters,
 	})
 	if err != nil {
 		cancelStream()

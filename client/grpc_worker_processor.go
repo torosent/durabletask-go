@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -38,9 +39,18 @@ func (w *TaskHubGrpcWorker) consumeConnection(run *grpcWorkerRun, connection *gr
 			if err := w.dispatchActivity(run, connection, workItem.GetCompletionToken(), request.ActivityRequest); err != nil {
 				return observedMessage, err
 			}
-		case *protos.WorkItem_EntityRequest, *protos.WorkItem_EntityRequestV2:
-			w.logger.Warn("received unsupported entity work item; abandoning it")
-			w.abandonEntity(run.processingCtx, connection.client, workItem.GetCompletionToken())
+		case *protos.WorkItem_EntityRequest:
+			if err := w.dispatchEntity(run, connection, workItem.GetCompletionToken(), func(ctx context.Context) {
+				w.processEntityBatch(ctx, connection.client, workItem.GetCompletionToken(), request.EntityRequest, nil)
+			}); err != nil {
+				return observedMessage, err
+			}
+		case *protos.WorkItem_EntityRequestV2:
+			if err := w.dispatchEntity(run, connection, workItem.GetCompletionToken(), func(ctx context.Context) {
+				w.processEntityV2(ctx, connection.client, workItem.GetCompletionToken(), request.EntityRequestV2)
+			}); err != nil {
+				return observedMessage, err
+			}
 		default:
 			w.logger.Warnf("received unknown work item type with completion token present=%t", workItem.GetCompletionToken() != "")
 		}
@@ -97,6 +107,21 @@ func (w *TaskHubGrpcWorker) dispatchActivity(
 	return w.dispatch(run, connection, run.activitySlots,
 		func(ctx context.Context) { w.abandonActivity(ctx, connection.client, completionToken) },
 		func(ctx context.Context) { w.processActivity(ctx, connection.client, completionToken, request) },
+	)
+}
+
+func (w *TaskHubGrpcWorker) dispatchEntity(
+	run *grpcWorkerRun,
+	connection *grpcWorkerConnection,
+	completionToken string,
+	process func(context.Context),
+) error {
+	return w.dispatch(
+		run,
+		connection,
+		run.entitySlots,
+		func(ctx context.Context) { w.abandonEntity(ctx, connection.client, completionToken) },
+		process,
 	)
 }
 
@@ -306,6 +331,62 @@ func (w *TaskHubGrpcWorker) processActivity(
 	if err != nil {
 		w.logger.Errorf("%s/%s#%d: failed to complete activity work item: %v", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId, err)
 		w.abandonActivity(ctx, client, completionToken)
+	}
+}
+
+func (w *TaskHubGrpcWorker) processEntityV2(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+	request *protos.EntityRequest,
+) {
+	batch, operationInfos, err := backend.EntityBatchFromRequestV2(request)
+	if err != nil {
+		w.logger.Errorf("invalid V2 entity work item: %v", err)
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
+	w.processEntityBatch(ctx, client, completionToken, batch, operationInfos)
+}
+
+func (w *TaskHubGrpcWorker) processEntityBatch(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+	request *protos.EntityBatchRequest,
+	operationInfos []*protos.OperationInfo,
+) {
+	executor, ok := w.executor.(backend.EntityExecutor)
+	if !ok {
+		w.logger.Error("task executor does not support entity work items")
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
+	result, err := executor.ExecuteEntity(ctx, request)
+	if err != nil {
+		w.logger.Errorf("%s: entity execution failed; abandoning work item: %v", request.GetInstanceId(), err)
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
+	if result == nil {
+		w.logger.Errorf("%s: entity executor returned no result; abandoning work item", request.GetInstanceId())
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
+	result = proto.Clone(result).(*protos.EntityBatchResult)
+	result.CompletionToken = completionToken
+	if len(operationInfos) > len(result.Results) {
+		operationInfos = operationInfos[:len(result.Results)]
+	}
+	result.OperationInfos = append([]*protos.OperationInfo(nil), operationInfos...)
+
+	err = w.executeRPCWithRetry(ctx, "complete entity task", func(callCtx context.Context) error {
+		_, callErr := client.CompleteEntityTask(callCtx, result)
+		return callErr
+	})
+	if err != nil {
+		w.logger.Errorf("%s: failed to complete entity work item: %v", request.GetInstanceId(), err)
+		w.abandonEntity(ctx, client, completionToken)
 	}
 }
 

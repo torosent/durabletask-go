@@ -287,6 +287,106 @@ func NewSendEventAction(iid string, name string, data *wrapperspb.StringValue) *
 	}
 }
 
+func NewEntityOperationSignaledAction(
+	id int32,
+	requestID string,
+	entityID string,
+	operation string,
+	input *wrapperspb.StringValue,
+	scheduledTime *timestamppb.Timestamp,
+) *protos.OrchestratorAction {
+	return &protos.OrchestratorAction{
+		Id: id,
+		OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+			SendEntityMessage: &protos.SendEntityMessageAction{
+				EntityMessageType: &protos.SendEntityMessageAction_EntityOperationSignaled{
+					EntityOperationSignaled: &protos.EntityOperationSignaledEvent{
+						RequestId:        requestID,
+						Operation:        operation,
+						ScheduledTime:    scheduledTime,
+						Input:            input,
+						TargetInstanceId: wrapperspb.String(entityID),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewEntityOperationCalledAction(
+	id int32,
+	requestID string,
+	entityID string,
+	parentInstanceID string,
+	parentExecutionID string,
+	operation string,
+	input *wrapperspb.StringValue,
+	scheduledTime *timestamppb.Timestamp,
+) *protos.OrchestratorAction {
+	return &protos.OrchestratorAction{
+		Id: id,
+		OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+			SendEntityMessage: &protos.SendEntityMessageAction{
+				EntityMessageType: &protos.SendEntityMessageAction_EntityOperationCalled{
+					EntityOperationCalled: &protos.EntityOperationCalledEvent{
+						RequestId:         requestID,
+						Operation:         operation,
+						ScheduledTime:     scheduledTime,
+						Input:             input,
+						ParentInstanceId:  wrapperspb.String(parentInstanceID),
+						ParentExecutionId: wrapperspb.String(parentExecutionID),
+						TargetInstanceId:  wrapperspb.String(entityID),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewEntityLockRequestedAction(
+	id int32,
+	criticalSectionID string,
+	parentInstanceID string,
+	lockSet []string,
+) *protos.OrchestratorAction {
+	return &protos.OrchestratorAction{
+		Id: id,
+		OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+			SendEntityMessage: &protos.SendEntityMessageAction{
+				EntityMessageType: &protos.SendEntityMessageAction_EntityLockRequested{
+					EntityLockRequested: &protos.EntityLockRequestedEvent{
+						CriticalSectionId: criticalSectionID,
+						LockSet:           append([]string(nil), lockSet...),
+						ParentInstanceId:  wrapperspb.String(parentInstanceID),
+					},
+				},
+			},
+		},
+	}
+}
+
+func NewEntityUnlockSentAction(
+	id int32,
+	criticalSectionID string,
+	parentInstanceID string,
+	entityID string,
+) *protos.OrchestratorAction {
+	return &protos.OrchestratorAction{
+		Id: id,
+		OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+			SendEntityMessage: &protos.SendEntityMessageAction{
+				EntityMessageType: &protos.SendEntityMessageAction_EntityUnlockSent{
+					EntityUnlockSent: &protos.EntityUnlockSentEvent{
+						CriticalSectionId: criticalSectionID,
+						ParentInstanceId:  wrapperspb.String(parentInstanceID),
+						TargetInstanceId:  wrapperspb.String(entityID),
+					},
+				},
+			},
+		},
+	}
+}
+
 func NewCreateSubOrchestrationAction(
 	taskID int32,
 	name string,

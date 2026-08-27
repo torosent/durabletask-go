@@ -53,3 +53,35 @@ CREATE TABLE IF NOT EXISTS NewTasks (
     [LockExpiration] DATETIME NULL,
     [EventPayload] BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS Entities (
+    [InstanceID] TEXT PRIMARY KEY NOT NULL,
+    [ExecutionID] TEXT NOT NULL,
+    [State] TEXT NULL,
+    [CreatedTime] DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    [LastModifiedTime] DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    [LockedBy] TEXT NULL,
+    [WorkItemLockedBy] TEXT NULL,
+    [WorkItemLockExpiration] DATETIME NULL
+);
+
+CREATE TABLE IF NOT EXISTS EntityMessages (
+    [SequenceNumber] INTEGER PRIMARY KEY,
+    [InstanceID] TEXT NOT NULL,
+    [RequestID] TEXT NOT NULL,
+    [MessageKind] TEXT NOT NULL,
+    [ParentInstanceID] TEXT NULL,
+    [Timestamp] DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    [VisibleTime] DATETIME NULL,
+    [DequeueCount] INTEGER NOT NULL DEFAULT 0,
+    [LockedBy] TEXT NULL,
+    [EventPayload] BLOB NOT NULL,
+
+    CONSTRAINT UX_EntityMessages_Request UNIQUE (InstanceID, MessageKind, RequestID)
+);
+
+CREATE INDEX IF NOT EXISTS IX_EntityMessages_InstanceSequence
+    ON EntityMessages(InstanceID, SequenceNumber);
+
+CREATE INDEX IF NOT EXISTS IX_EntityMessages_Visibility
+    ON EntityMessages(VisibleTime, InstanceID);

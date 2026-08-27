@@ -26,9 +26,11 @@ var schema string
 var emptyString string = ""
 
 type SqliteOptions struct {
-	OrchestrationLockTimeout time.Duration
-	ActivityLockTimeout      time.Duration
-	FilePath                 string
+	OrchestrationLockTimeout    time.Duration
+	ActivityLockTimeout         time.Duration
+	EntityLockTimeout           time.Duration
+	MaxEntityOperationBatchSize int
+	FilePath                    string
 }
 
 type sqliteBackend struct {
@@ -45,9 +47,11 @@ type sqliteBackend struct {
 func NewSqliteOptions(filePath string) *SqliteOptions {
 	// Default values are provided for required options
 	return &SqliteOptions{
-		FilePath:                 filePath,
-		OrchestrationLockTimeout: 2 * time.Minute,
-		ActivityLockTimeout:      2 * time.Minute,
+		FilePath:                    filePath,
+		OrchestrationLockTimeout:    2 * time.Minute,
+		ActivityLockTimeout:         2 * time.Minute,
+		EntityLockTimeout:           2 * time.Minute,
+		MaxEntityOperationBatchSize: 100,
 	}
 }
 
@@ -61,6 +65,9 @@ func NewSqliteBackend(opts *SqliteOptions, logger backend.Logger) backend.Backen
 	pid := os.Getpid()
 	uuidStr := uuid.NewString()
 
+	if opts == nil {
+		opts = NewSqliteOptions("")
+	}
 	be := &sqliteBackend{
 		db:         nil,
 		workerName: fmt.Sprintf("%s,%d,%s", hostname, pid, uuidStr),
@@ -68,12 +75,9 @@ func NewSqliteBackend(opts *SqliteOptions, logger backend.Logger) backend.Backen
 		logger:     logger,
 	}
 
-	if opts == nil {
-		opts = NewSqliteOptions("")
-	}
 	switch {
 	case opts.FilePath == "":
-		be.dsn = "file::memory:"
+		be.dsn = fmt.Sprintf("file:durabletask-%s?mode=memory&cache=shared", uuidStr)
 	case !strings.HasPrefix(opts.FilePath, "file:"):
 		be.dsn = "file:" + opts.FilePath
 	default:
@@ -359,6 +363,12 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 		_, err = tx.ExecContext(ctx, insertSql, sqlInsertArgs...)
 		if err != nil {
 			return fmt.Errorf("failed to insert into the NewEvents table: %w", err)
+		}
+	}
+
+	for _, message := range wi.State.PendingEntityMessages() {
+		if err := be.addEntityMessageTx(ctx, tx, message.TargetInstanceID, message.HistoryEvent); err != nil {
+			return fmt.Errorf("failed to enqueue entity message: %w", err)
 		}
 	}
 
@@ -1034,6 +1044,717 @@ func (be *sqliteBackend) AbandonActivityWorkItem(ctx context.Context, wi *backen
 	return nil
 }
 
+func (be *sqliteBackend) SignalEntity(ctx context.Context, request *protos.SignalEntityRequest) error {
+	if err := be.ensureDB(); err != nil {
+		return err
+	}
+	event, err := backend.NewEntitySignalEvent(request)
+	if err != nil {
+		return err
+	}
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := be.addEntityMessageTx(ctx, tx, request.InstanceId, event); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (be *sqliteBackend) GetEntityWorkItem(ctx context.Context) (*backend.EntityWorkItem, error) {
+	if err := be.ensureDB(); err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		workItem, progressed, err := be.getEntityWorkItemOnce(ctx)
+		if err != nil || workItem != nil {
+			return workItem, err
+		}
+		if !progressed {
+			return nil, backend.ErrNoWorkItems
+		}
+	}
+	return nil, backend.ErrNoWorkItems
+}
+
+type sqliteEntityMessage struct {
+	sequenceNumber int64
+	event          *protos.HistoryEvent
+	descriptor     backend.EntityMessageDescriptor
+	dequeueCount   int32
+	enqueuedAt     time.Time
+}
+
+func (be *sqliteBackend) getEntityWorkItemOnce(ctx context.Context) (*backend.EntityWorkItem, bool, error) {
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC()
+	lockExpiration := now.Add(be.options.EntityLockTimeout)
+	row := tx.QueryRowContext(
+		ctx,
+		`UPDATE Entities SET [WorkItemLockedBy] = ?, [WorkItemLockExpiration] = ?
+		WHERE [rowid] = (
+			SELECT E.[rowid] FROM Entities E
+			WHERE (E.[WorkItemLockExpiration] IS NULL OR E.[WorkItemLockExpiration] < ?)
+			AND EXISTS (
+				SELECT 1 FROM EntityMessages M
+				WHERE M.[InstanceID] = E.[InstanceID]
+				AND (M.[VisibleTime] IS NULL OR M.[VisibleTime] <= ?)
+				AND (
+					E.[LockedBy] IS NULL
+					OR (M.[MessageKind] = 'call' AND M.[ParentInstanceID] = E.[LockedBy])
+					OR (M.[MessageKind] = 'unlock' AND M.[ParentInstanceID] = E.[LockedBy])
+				)
+			)
+			ORDER BY (
+				SELECT MIN(M2.[SequenceNumber]) FROM EntityMessages M2
+				WHERE M2.[InstanceID] = E.[InstanceID]
+				AND (M2.[VisibleTime] IS NULL OR M2.[VisibleTime] <= ?)
+				AND (
+					E.[LockedBy] IS NULL
+					OR (M2.[MessageKind] = 'call' AND M2.[ParentInstanceID] = E.[LockedBy])
+					OR (M2.[MessageKind] = 'unlock' AND M2.[ParentInstanceID] = E.[LockedBy])
+				)
+			)
+			LIMIT 1
+		)
+		RETURNING [InstanceID], [ExecutionID], [State], [LockedBy]`,
+		be.workerName,
+		lockExpiration,
+		now,
+		now,
+		now,
+	)
+
+	var instanceID string
+	var executionID string
+	var state sql.NullString
+	var criticalSectionOwner sql.NullString
+	if err := row.Scan(&instanceID, &executionID, &state, &criticalSectionOwner); errors.Is(err, sql.ErrNoRows) {
+		return nil, false, backend.ErrNoWorkItems
+	} else if err != nil {
+		return nil, false, fmt.Errorf("failed to lock entity work item: %w", err)
+	}
+
+	query := `SELECT [SequenceNumber], [EventPayload], [DequeueCount], [Timestamp]
+		FROM EntityMessages
+		WHERE [InstanceID] = ? AND ([VisibleTime] IS NULL OR [VisibleTime] <= ?)`
+	args := []any{instanceID, now}
+	if criticalSectionOwner.Valid {
+		query += ` AND (([MessageKind] = 'call' AND [ParentInstanceID] = ?)
+			OR ([MessageKind] = 'unlock' AND [ParentInstanceID] = ?))`
+		args = append(args, criticalSectionOwner.String, criticalSectionOwner.String)
+	}
+	query += " ORDER BY [SequenceNumber] ASC LIMIT ?"
+	args = append(args, max(be.options.MaxEntityOperationBatchSize+1, 2))
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to load entity messages: %w", err)
+	}
+	defer rows.Close()
+
+	messages := make([]sqliteEntityMessage, 0, be.options.MaxEntityOperationBatchSize+1)
+	for rows.Next() {
+		var raw sqliteEntityMessage
+		var payload []byte
+		if err := rows.Scan(&raw.sequenceNumber, &payload, &raw.dequeueCount, &raw.enqueuedAt); err != nil {
+			return nil, false, err
+		}
+		raw.event, err = backend.UnmarshalHistoryEvent(payload)
+		if err != nil {
+			return nil, false, err
+		}
+		raw.descriptor, err = backend.DescribeEntityMessage(raw.event)
+		if err != nil {
+			return nil, false, err
+		}
+		messages = append(messages, raw)
+	}
+
+	selected := make([]sqliteEntityMessage, 0, be.options.MaxEntityOperationBatchSize)
+	for _, message := range messages {
+		switch message.descriptor.Kind {
+		case "signal", "call":
+			selected = append(selected, message)
+			if len(selected) == be.options.MaxEntityOperationBatchSize {
+				break
+			}
+		case "lock":
+			if len(selected) > 0 {
+				break
+			}
+			if err := be.processEntityLockTx(ctx, tx, instanceID, message); err != nil {
+				return nil, false, err
+			}
+			if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
+				return nil, false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, false, err
+			}
+			return nil, true, nil
+		case "unlock":
+			if len(selected) > 0 {
+				break
+			}
+			if _, err := tx.ExecContext(ctx, "DELETE FROM EntityMessages WHERE [SequenceNumber] = ?", message.sequenceNumber); err != nil {
+				return nil, false, err
+			}
+			if criticalSectionOwner.Valid && criticalSectionOwner.String == message.descriptor.ParentInstanceID {
+				if _, err := tx.ExecContext(ctx, "UPDATE Entities SET [LockedBy] = NULL WHERE [InstanceID] = ?", instanceID); err != nil {
+					return nil, false, err
+				}
+			}
+			if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
+				return nil, false, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, false, err
+			}
+			return nil, true, nil
+		}
+		if len(selected) == be.options.MaxEntityOperationBatchSize ||
+			(message.descriptor.Kind == "lock" || message.descriptor.Kind == "unlock") {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		if err := be.releaseEntityWorkLockTx(ctx, tx, instanceID); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, backend.ErrNoWorkItems
+	}
+
+	workItem := &backend.EntityWorkItem{
+		ExecutionID: executionID,
+		LockedBy:    be.workerName,
+		Operations:  make([]*protos.HistoryEvent, 0, len(selected)),
+		MessageIDs:  make([]int64, 0, len(selected)),
+	}
+	entityID, err := api.EntityIDFromString(instanceID)
+	if err != nil {
+		return nil, false, err
+	}
+	workItem.InstanceID = entityID
+	if state.Valid {
+		workItem.State = &state.String
+	}
+	for _, message := range selected {
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE EntityMessages SET [LockedBy] = ?, [DequeueCount] = [DequeueCount] + 1
+			WHERE [SequenceNumber] = ?`,
+			be.workerName,
+			message.sequenceNumber,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return nil, false, backend.ErrWorkItemLockLost
+		}
+		workItem.Operations = append(workItem.Operations, message.event)
+		workItem.MessageIDs = append(workItem.MessageIDs, message.sequenceNumber)
+		if message.dequeueCount > workItem.RetryCount {
+			workItem.RetryCount = message.dequeueCount
+		}
+		if workItem.EnqueuedAt.IsZero() || message.enqueuedAt.Before(workItem.EnqueuedAt) {
+			workItem.EnqueuedAt = message.enqueuedAt
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return workItem, false, nil
+}
+
+func (be *sqliteBackend) processEntityLockTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	instanceID string,
+	message sqliteEntityMessage,
+) error {
+	lockRequest := message.event.GetEntityLockRequested()
+	if lockRequest == nil || message.descriptor.ParentInstanceID == "" {
+		return fmt.Errorf("invalid entity lock request")
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		"UPDATE Entities SET [LockedBy] = ? WHERE [InstanceID] = ?",
+		message.descriptor.ParentInstanceID,
+		instanceID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM EntityMessages WHERE [SequenceNumber] = ?", message.sequenceNumber); err != nil {
+		return err
+	}
+	next := proto.Clone(message.event).(*protos.HistoryEvent)
+	nextRequest := next.GetEntityLockRequested()
+	nextRequest.Position++
+	if int(nextRequest.Position) < len(nextRequest.LockSet) {
+		return be.addEntityMessageTx(ctx, tx, nextRequest.LockSet[nextRequest.Position], next)
+	}
+	return be.insertOrchestrationEventTx(
+		ctx,
+		tx,
+		message.descriptor.ParentInstanceID,
+		backend.NewEntityLockGrantedEvent(nextRequest.CriticalSectionId),
+		nil,
+	)
+}
+
+func (be *sqliteBackend) CompleteEntityWorkItem(ctx context.Context, wi *backend.EntityWorkItem) error {
+	if err := be.ensureDB(); err != nil {
+		return err
+	}
+	if wi == nil || wi.Result == nil {
+		return fmt.Errorf("entity work item result is required")
+	}
+	if wi.Result.FailureDetails != nil {
+		return fmt.Errorf("entity batch failure cannot be committed: %s", wi.Result.FailureDetails.ErrorMessage)
+	}
+	if len(wi.Result.Results) > len(wi.MessageIDs) {
+		return fmt.Errorf("entity result count exceeds operation count")
+	}
+
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var state any
+	if wi.Result.EntityState != nil {
+		state = wi.Result.EntityState.Value
+	}
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE Entities SET [State] = ?, [LastModifiedTime] = ?, [ExecutionID] = ?,
+			[WorkItemLockedBy] = NULL, [WorkItemLockExpiration] = NULL
+		WHERE [InstanceID] = ? AND [WorkItemLockedBy] = ?`,
+		state,
+		time.Now().UTC(),
+		uuid.NewString(),
+		wi.InstanceID.String(),
+		wi.LockedBy,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return backend.ErrWorkItemLockLost
+	}
+
+	for index, messageID := range wi.MessageIDs {
+		if index < len(wi.Result.Results) {
+			result, err := tx.ExecContext(
+				ctx,
+				"DELETE FROM EntityMessages WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+				messageID,
+				wi.LockedBy,
+			)
+			if err != nil {
+				return err
+			}
+			if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+				return backend.ErrWorkItemLockLost
+			}
+		} else if _, err := tx.ExecContext(
+			ctx,
+			"UPDATE EntityMessages SET [LockedBy] = NULL WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+			messageID,
+			wi.LockedBy,
+		); err != nil {
+			return err
+		}
+	}
+
+	responseCount := min(len(wi.Result.Results), len(wi.Result.OperationInfos))
+	for index := 0; index < responseCount; index++ {
+		event, target, err := backend.NewEntityOperationResponseEvent(
+			wi.Result.OperationInfos[index],
+			wi.Result.Results[index],
+		)
+		if err != nil {
+			return err
+		}
+		if event != nil {
+			if err := be.insertOrchestrationEventTx(ctx, tx, target, event, nil); err != nil {
+				return err
+			}
+		}
+	}
+
+	for index, action := range wi.Result.Actions {
+		switch {
+		case action.GetSendSignal() != nil:
+			signal := action.GetSendSignal()
+			event := backend.NewEntitySignalMessage(wi.InstanceID.String(), wi.ExecutionID, index, signal)
+			if err := be.addEntityMessageTx(ctx, tx, signal.InstanceId, event); err != nil {
+				return err
+			}
+		case action.GetStartNewOrchestration() != nil:
+			start := action.GetStartNewOrchestration()
+			event := helpers.NewExecutionStartedEvent(
+				start.Name,
+				start.InstanceId,
+				start.Input,
+				nil,
+				start.ParentTraceContext,
+				start.ScheduledTime,
+				start.Version,
+			)
+			instanceID, err := be.createOrchestrationInstanceInternal(ctx, event, tx)
+			if err != nil && !errors.Is(err, api.ErrDuplicateInstance) {
+				return err
+			}
+			if err == nil {
+				if err := be.insertOrchestrationEventTx(ctx, tx, instanceID, event, nil); err != nil {
+					return err
+				}
+			}
+		default:
+			return fmt.Errorf("unknown entity operation action")
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (be *sqliteBackend) AbandonEntityWorkItem(ctx context.Context, wi *backend.EntityWorkItem) error {
+	if err := be.ensureDB(); err != nil {
+		return err
+	}
+	if wi == nil {
+		return fmt.Errorf("entity work item is required")
+	}
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	for _, messageID := range wi.MessageIDs {
+		if _, err := tx.ExecContext(
+			ctx,
+			"UPDATE EntityMessages SET [LockedBy] = NULL WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+			messageID,
+			wi.LockedBy,
+		); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE Entities SET [WorkItemLockedBy] = NULL, [WorkItemLockExpiration] = NULL
+		WHERE [InstanceID] = ? AND [WorkItemLockedBy] = ?`,
+		wi.InstanceID.String(),
+		wi.LockedBy,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return backend.ErrWorkItemLockLost
+	}
+	return tx.Commit()
+}
+
+func (be *sqliteBackend) GetEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
+	if err := be.ensureDB(); err != nil {
+		return nil, err
+	}
+	stateColumn := "NULL"
+	if includeState {
+		stateColumn = "E.[State]"
+	}
+	row := be.db.QueryRowContext(
+		ctx,
+		`SELECT E.[LastModifiedTime], E.[LockedBy], `+stateColumn+`,
+			(SELECT COUNT(*) FROM EntityMessages M WHERE M.[InstanceID] = E.[InstanceID])
+		FROM Entities E WHERE E.[InstanceID] = ?`,
+		entityID.String(),
+	)
+	var lastModified time.Time
+	var lockedBy sql.NullString
+	var state sql.NullString
+	var backlog int32
+	if err := row.Scan(&lastModified, &lockedBy, &state, &backlog); errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return &api.EntityMetadata{
+		InstanceID:       entityID,
+		LastModifiedTime: lastModified,
+		BacklogQueueSize: backlog,
+		LockedBy:         lockedBy.String,
+		SerializedState:  state.String,
+	}, nil
+}
+
+func (be *sqliteBackend) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
+	if err := be.ensureDB(); err != nil {
+		return nil, err
+	}
+	pageSize := query.PageSize
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	pageSize = min(pageSize, 1000)
+	sqlQuery := `SELECT E.[InstanceID], E.[LastModifiedTime], E.[LockedBy], E.[State],
+		(SELECT COUNT(*) FROM EntityMessages M WHERE M.[InstanceID] = E.[InstanceID])
+		FROM Entities E WHERE E.[InstanceID] > ?`
+	args := []any{query.ContinuationToken}
+	if query.InstanceIDStartsWith != "" {
+		sqlQuery += " AND E.[InstanceID] LIKE ?"
+		args = append(args, query.InstanceIDStartsWith+"%")
+	}
+	if !query.LastModifiedFrom.IsZero() {
+		sqlQuery += " AND E.[LastModifiedTime] >= ?"
+		args = append(args, query.LastModifiedFrom)
+	}
+	if !query.LastModifiedTo.IsZero() {
+		sqlQuery += " AND E.[LastModifiedTime] < ?"
+		args = append(args, query.LastModifiedTo)
+	}
+	if !query.IncludeTransient {
+		sqlQuery += " AND E.[State] IS NOT NULL"
+	}
+	sqlQuery += " ORDER BY E.[InstanceID] ASC LIMIT ?"
+	args = append(args, pageSize+1)
+	rows, err := be.db.QueryContext(ctx, sqlQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := &api.EntityQueryResults{Entities: make([]*api.EntityMetadata, 0, pageSize)}
+	for rows.Next() {
+		var instanceID string
+		var lastModified time.Time
+		var lockedBy sql.NullString
+		var state sql.NullString
+		var backlog int32
+		if err := rows.Scan(&instanceID, &lastModified, &lockedBy, &state, &backlog); err != nil {
+			return nil, err
+		}
+		if int32(len(result.Entities)) == pageSize {
+			result.ContinuationToken = result.Entities[len(result.Entities)-1].InstanceID.String()
+			break
+		}
+		entityID, err := api.EntityIDFromString(instanceID)
+		if err != nil {
+			return nil, err
+		}
+		metadata := &api.EntityMetadata{
+			InstanceID:       entityID,
+			LastModifiedTime: lastModified,
+			BacklogQueueSize: backlog,
+			LockedBy:         lockedBy.String,
+		}
+		if query.IncludeState {
+			metadata.SerializedState = state.String
+		}
+		result.Entities = append(result.Entities, metadata)
+	}
+	return result, rows.Err()
+}
+
+func (be *sqliteBackend) CleanEntityStorage(ctx context.Context, request api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
+	if err := be.ensureDB(); err != nil {
+		return nil, err
+	}
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.QueryContext(
+		ctx,
+		"SELECT [InstanceID] FROM Entities WHERE [InstanceID] > ? ORDER BY [InstanceID] LIMIT 1001",
+		request.ContinuationToken,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	result := &api.CleanEntityStorageResult{}
+	if len(ids) > 1000 {
+		result.ContinuationToken = ids[999]
+		ids = ids[:1000]
+	}
+	for _, id := range ids {
+		if request.ReleaseOrphanedLocks {
+			dbResult, err := tx.ExecContext(
+				ctx,
+				`UPDATE Entities SET [LockedBy] = NULL
+				WHERE [InstanceID] = ? AND [LockedBy] IS NOT NULL
+				AND NOT EXISTS (
+					SELECT 1 FROM Instances I WHERE I.[InstanceID] = Entities.[LockedBy]
+					AND I.[RuntimeStatus] IN ('PENDING', 'RUNNING', 'SUSPENDED')
+				)`,
+				id,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if count, err := dbResult.RowsAffected(); err == nil {
+				result.OrphanedLocksReleased += int32(count)
+			}
+		}
+		if request.RemoveEmptyEntities {
+			dbResult, err := tx.ExecContext(
+				ctx,
+				`DELETE FROM Entities WHERE [InstanceID] = ? AND [State] IS NULL
+				AND [LockedBy] IS NULL AND [WorkItemLockedBy] IS NULL
+				AND NOT EXISTS (SELECT 1 FROM EntityMessages M WHERE M.[InstanceID] = Entities.[InstanceID])`,
+				id,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if count, err := dbResult.RowsAffected(); err == nil {
+				result.EmptyEntitiesRemoved += int32(count)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (be *sqliteBackend) GetEntityBacklog(ctx context.Context) (backend.BacklogMetric, error) {
+	if err := be.ensureDB(); err != nil {
+		return backend.BacklogMetric{}, err
+	}
+	row := be.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(DISTINCT [InstanceID]),
+			COALESCE((julianday('now') - julianday(MIN([Timestamp]))) * 86400.0, 0)
+		FROM EntityMessages WHERE [VisibleTime] IS NULL OR [VisibleTime] <= ?`,
+		time.Now().UTC(),
+	)
+	return scanSqliteBacklog(row, backend.WorkItemKindEntity)
+}
+
+func (be *sqliteBackend) addEntityMessageTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	targetInstanceID string,
+	event *protos.HistoryEvent,
+) error {
+	entityID, err := api.EntityIDFromString(targetInstanceID)
+	if err != nil {
+		return err
+	}
+	descriptor, err := backend.DescribeEntityMessage(event)
+	if err != nil {
+		return err
+	}
+	payload, err := backend.MarshalHistoryEvent(event)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT OR IGNORE INTO Entities ([InstanceID], [ExecutionID], [CreatedTime], [LastModifiedTime])
+		VALUES (?, ?, ?, ?)`,
+		entityID.String(),
+		uuid.NewString(),
+		now,
+		now,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT OR IGNORE INTO EntityMessages
+			([InstanceID], [RequestID], [MessageKind], [ParentInstanceID], [Timestamp], [VisibleTime], [EventPayload])
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		entityID.String(),
+		descriptor.RequestID,
+		descriptor.Kind,
+		nullString(descriptor.ParentInstanceID),
+		event.Timestamp.AsTime(),
+		descriptor.VisibleTime,
+		payload,
+	); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(
+		ctx,
+		"UPDATE Entities SET [LastModifiedTime] = ? WHERE [InstanceID] = ?",
+		now,
+		entityID.String(),
+	)
+	return err
+}
+
+func (be *sqliteBackend) insertOrchestrationEventTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	instanceID string,
+	event *protos.HistoryEvent,
+	visibleTime *time.Time,
+) error {
+	payload, err := backend.MarshalHistoryEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(
+		ctx,
+		"INSERT INTO NewEvents ([InstanceID], [EventPayload], [VisibleTime]) VALUES (?, ?, ?)",
+		instanceID,
+		payload,
+		visibleTime,
+	)
+	return err
+}
+
+func (be *sqliteBackend) releaseEntityWorkLockTx(ctx context.Context, tx *sql.Tx, instanceID string) error {
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE Entities SET [WorkItemLockedBy] = NULL, [WorkItemLockExpiration] = NULL
+		WHERE [InstanceID] = ? AND [WorkItemLockedBy] = ?`,
+		instanceID,
+		be.workerName,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return backend.ErrWorkItemLockLost
+	}
+	return nil
+}
+
+func nullString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 func (be *sqliteBackend) PurgeOrchestrationState(ctx context.Context, id api.InstanceID) error {
 	if err := be.ensureDB(); err != nil {
 		return err
@@ -1078,7 +1799,9 @@ func (be *sqliteBackend) Start(context.Context) error {
 // Stop implements backend.Backend
 func (be *sqliteBackend) Stop(context.Context) error {
 	if be.db != nil {
+		db := be.db
 		be.db = nil
+		return db.Close()
 	}
 
 	return nil

@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"time"
@@ -14,6 +16,8 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type TaskHubClient interface {
@@ -26,6 +30,15 @@ type TaskHubClient interface {
 	SuspendOrchestration(ctx context.Context, id api.InstanceID, reason string) error
 	ResumeOrchestration(ctx context.Context, id api.InstanceID, reason string) error
 	PurgeOrchestrationState(ctx context.Context, id api.InstanceID, opts ...api.PurgeOptions) error
+}
+
+// EntityTaskHubClient extends TaskHubClient with durable entity operations.
+type EntityTaskHubClient interface {
+	TaskHubClient
+	SignalEntity(ctx context.Context, entityID api.EntityID, operationName string, opts ...api.SignalEntityOptions) error
+	FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error)
+	QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error)
+	CleanEntityStorage(ctx context.Context, req api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error)
 }
 
 type backendClient struct {
@@ -210,4 +223,103 @@ func (c *backendClient) PurgeOrchestrationState(ctx context.Context, id api.Inst
 		return fmt.Errorf("failed to purge orchestration state: %w", err)
 	}
 	return nil
+}
+
+// SignalEntity sends a fire-and-forget operation to an entity.
+func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID, operationName string, opts ...api.SignalEntityOptions) error {
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return err
+	}
+	if operationName == "" {
+		return fmt.Errorf("entity operation name must not be empty")
+	}
+	req := &protos.SignalEntityRequest{
+		InstanceId:  entityID.String(),
+		Name:        operationName,
+		RequestId:   uuid.NewString(),
+		RequestTime: timestamppb.Now(),
+	}
+	for _, configure := range opts {
+		if err := configure(req); err != nil {
+			return fmt.Errorf("failed to configure signal entity request: %w", err)
+		}
+	}
+	if entityBackend, ok := c.be.(EntitySignalBackend); ok {
+		if err := entityBackend.SignalEntity(ctx, req); err != nil {
+			return fmt.Errorf("failed to signal entity: %w", err)
+		}
+		return nil
+	}
+
+	request := helpers.EntityRequestMessage{
+		ID:        req.RequestId,
+		IsSignal:  true,
+		Operation: req.Name,
+	}
+	if req.Input != nil {
+		request.Input = req.Input.Value
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("failed to marshal entity signal: %w", err)
+	}
+	startEvent := helpers.NewExecutionStartedEvent(entityID.Name, req.InstanceId, nil, nil, nil, nil, nil)
+	createErr := c.be.CreateOrchestrationInstance(ctx, startEvent, WithOrchestrationIdReusePolicy(&api.OrchestrationIdReusePolicy{
+		Action:          api.REUSE_ID_ACTION_IGNORE,
+		OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_RUNNING, api.RUNTIME_STATUS_PENDING},
+	}))
+	if createErr != nil && !errors.Is(createErr, api.ErrDuplicateInstance) && !errors.Is(createErr, api.ErrIgnoreInstance) {
+		return fmt.Errorf("failed to create compatibility entity instance: %w", createErr)
+	}
+	event := helpers.NewEventRaisedEvent(helpers.EntityRequestEventName, wrapperspb.String(string(payload)))
+	if req.ScheduledTime != nil {
+		event.Timestamp = req.ScheduledTime
+	}
+	if err := c.be.AddNewOrchestrationEvent(ctx, api.InstanceID(req.InstanceId), event); err != nil {
+		return fmt.Errorf("failed to enqueue compatibility entity signal: %w", err)
+	}
+	return nil
+}
+
+// FetchEntityMetadata retrieves metadata for an entity instance.
+func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return nil, err
+	}
+	if entityBackend, ok := c.be.(EntityQueryBackend); ok {
+		return entityBackend.GetEntityMetadata(ctx, entityID, includeState)
+	}
+	metadata, err := c.be.GetOrchestrationMetadata(ctx, api.InstanceID(entityID.String()))
+	if errors.Is(err, api.ErrInstanceNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get compatibility entity metadata: %w", err)
+	}
+	result := &api.EntityMetadata{
+		InstanceID:       entityID,
+		LastModifiedTime: metadata.LastUpdatedAt,
+	}
+	if includeState {
+		result.SerializedState = metadata.SerializedCustomStatus
+	}
+	return result, nil
+}
+
+// QueryEntities queries native entity storage.
+func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
+	entityBackend, ok := c.be.(EntityQueryBackend)
+	if !ok {
+		return nil, fmt.Errorf("QueryEntities requires an EntityBackend with native entity support")
+	}
+	return entityBackend.QueryEntities(ctx, query)
+}
+
+// CleanEntityStorage removes empty entities and releases orphaned locks.
+func (c *backendClient) CleanEntityStorage(ctx context.Context, req api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
+	entityBackend, ok := c.be.(EntityQueryBackend)
+	if !ok {
+		return nil, fmt.Errorf("CleanEntityStorage requires an EntityBackend with native entity support")
+	}
+	return entityBackend.CleanEntityStorage(ctx, req)
 }
