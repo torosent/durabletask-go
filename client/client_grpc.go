@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"sync"
 
 	"github.com/cenkalti/backoff/v4"
@@ -19,6 +18,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 )
 
 // REVIEW: Can this be merged with backend/client.go somehow?
@@ -497,7 +497,7 @@ func orchestrationMetadataFromState(state *protos.OrchestrationState) (*api.Orch
 		SerializedCustomStatus: state.CustomStatus.GetValue(),
 		SerializedOutput:       state.Output.GetValue(),
 		FailureDetails:         state.FailureDetails,
-		Tags:                   maps.Clone(state.Tags),
+		Tags:                   tagcodec.DecodeUserTagsOrPlain(state.Tags),
 	}
 	if state.ScheduledStartTimestamp != nil {
 		metadata.ScheduledStartAt = state.ScheduledStartTimestamp.AsTime()

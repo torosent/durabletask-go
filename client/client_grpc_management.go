@@ -30,6 +30,7 @@ func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.Orches
 		Orchestrations: make([]*api.OrchestrationMetadata, 0, pageSize),
 	}
 	continuationToken := query.ContinuationToken
+	scannedPages := 0
 	for len(result.Orchestrations) < pageSize {
 		remaining := pageSize - len(result.Orchestrations)
 		wireQuery := &protos.InstanceQuery{
@@ -56,6 +57,7 @@ func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.Orches
 		if err != nil {
 			return nil, managementClientError(ctx, "failed to query orchestration instances", err)
 		}
+		scannedPages++
 
 		for _, state := range resp.GetOrchestrationState() {
 			if err := largepayload.TransformOrchestrationState(ctx, c.largePayloads, state); err != nil {
@@ -78,6 +80,10 @@ func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.Orches
 			return nil, errors.New("query service returned a non-advancing continuation token")
 		}
 		continuationToken = nextToken
+		if len(query.Tags) > 0 && scannedPages >= api.MaxRemoteTagFilterScanPages {
+			result.ContinuationToken = continuationToken
+			return result, nil
+		}
 	}
 	result.ContinuationToken = continuationToken
 	return result, nil
@@ -145,10 +151,13 @@ func (c *TaskHubGrpcClient) RewindInstance(ctx context.Context, id api.InstanceI
 }
 
 func (c *TaskHubGrpcClient) PurgeInstances(ctx context.Context, request api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
-	hasInstanceIDs := len(request.InstanceIDs) > 0
-	hasFilter := request.Filter != nil
-	if hasInstanceIDs == hasFilter {
-		return nil, errors.New("purge request must specify exactly one of instance IDs or a filter")
+	if err := request.Validate(); err != nil {
+		return nil, err
+	}
+	if request.Filter != nil && request.Filter.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, request.Filter.Timeout)
+		defer cancel()
 	}
 	pollInterval := request.PollInterval
 	if pollInterval <= 0 {
@@ -181,11 +190,13 @@ func (c *TaskHubGrpcClient) PurgeInstances(ctx context.Context, request api.Purg
 			IsOrchestration: true,
 		}
 		batchResult, err := c.pollPurgeInstances(ctx, req, pollInterval)
-		if err != nil {
-			return nil, err
+		if batchResult != nil {
+			result.DeletedInstanceCount += batchResult.DeletedInstanceCount
+			result.IsComplete = result.IsComplete && batchResult.IsComplete
 		}
-		result.DeletedInstanceCount += batchResult.DeletedInstanceCount
-		result.IsComplete = result.IsComplete && batchResult.IsComplete
+		if err != nil {
+			return result, err
+		}
 	}
 	return result, nil
 }
@@ -195,7 +206,7 @@ func (c *TaskHubGrpcClient) pollPurgeInstances(ctx context.Context, req *protos.
 	for {
 		resp, err := c.client.PurgeInstances(ctx, req)
 		if err != nil {
-			return nil, managementClientError(ctx, "failed to purge orchestration instances", err)
+			return result, managementClientError(ctx, "failed to purge orchestration instances", err)
 		}
 		result.DeletedInstanceCount += int(resp.GetDeletedInstanceCount())
 		if resp.GetIsComplete() == nil || resp.GetIsComplete().GetValue() {
@@ -208,7 +219,7 @@ func (c *TaskHubGrpcClient) pollPurgeInstances(ctx context.Context, req *protos.
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return nil, ctx.Err()
+			return result, ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -264,12 +275,6 @@ func (c *TaskHubGrpcClient) DeleteTaskHub(ctx context.Context) error {
 
 func makePurgeFilterRequest(request api.PurgeInstancesRequest) (*protos.PurgeInstancesRequest, error) {
 	filter := request.Filter
-	if err := api.ValidateTimeRange(filter.CreatedTimeFrom, filter.CreatedTimeTo); err != nil {
-		return nil, fmt.Errorf("invalid purge filter: %w", err)
-	}
-	if filter.Timeout < 0 {
-		return nil, errors.New("purge timeout cannot be negative")
-	}
 	wireFilter := &protos.PurgeInstanceFilter{
 		RuntimeStatus: slices.Clone(filter.RuntimeStatus),
 	}

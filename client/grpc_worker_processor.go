@@ -184,8 +184,9 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	}
 	if w.options.workItemFilters != nil {
 		name, version, ok := orchestrationWorkItemIdentity(pastEvents, request.NewEvents)
-		if !ok || !matchesWorkItemFilters(w.options.workItemFilters, true, name, version) {
+		if ok && !matchesWorkItemFilters(w.options.workItemFilters, true, name, version) {
 			w.logger.Warnf("%s: orchestration work item does not match configured filters; abandoning it", request.InstanceId)
+			_ = waitForRetry(ctx, w.options.reconnectBaseDelay)
 			w.abandonOrchestration(ctx, client, completionToken)
 			return
 		}
@@ -317,6 +318,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 			request.Name,
 			request.TaskId,
 		)
+		_ = waitForRetry(ctx, w.options.reconnectBaseDelay)
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
@@ -500,6 +502,9 @@ func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, 
 		return false
 	}
 	if candidates == nil {
+		return true
+	}
+	if len(candidates) == 0 {
 		return true
 	}
 	for _, filter := range candidates {

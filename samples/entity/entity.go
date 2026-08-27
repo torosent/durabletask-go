@@ -128,8 +128,12 @@ func Init(ctx context.Context, r *task.TaskRegistry) (backend.EntityTaskHubClien
 	executor := task.NewTaskExecutor(r)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger)
 	activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+	if !ok {
+		return nil, nil, fmt.Errorf("backend does not support durable entities")
+	}
 	entityWorker := backend.NewEntityWorker(
-		be.(backend.EntityBackend),
+		entityBackend,
 		executor.(backend.EntityExecutor),
 		logger,
 	)

@@ -22,7 +22,9 @@ type LargePayloadStore interface {
 	Store(context.Context, []byte) (string, error)
 }
 
-// LargePayloadResolver resolves payload bytes from an opaque location.
+// LargePayloadResolver resolves payload bytes from an opaque, untrusted location.
+// Implementations must validate schemes, accounts, paths, and other allow-list
+// constraints before reading data.
 type LargePayloadResolver interface {
 	Resolve(context.Context, string) ([]byte, error)
 }
@@ -31,7 +33,9 @@ type LargePayloadResolver interface {
 type LargePayloadOptions struct {
 	Store           LargePayloadStore
 	Resolver        LargePayloadResolver
+	// ThresholdBytes uses DefaultLargePayloadThresholdBytes when zero.
 	ThresholdBytes  int
+	// MaxPayloadBytes uses DefaultLargePayloadMaxBytes when zero.
 	MaxPayloadBytes int
 }
 

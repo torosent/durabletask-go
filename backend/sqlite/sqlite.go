@@ -15,7 +15,9 @@ import (
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	_ "modernc.org/sqlite"
 )
@@ -103,13 +105,16 @@ func (be *sqliteBackend) CreateTaskHub(ctx context.Context) error {
 	if _, err := be.db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to initialize the database: %w", err)
 	}
+	if err := be.ensureScheduledStartColumn(ctx); err != nil {
+		return err
+	}
 
 	return nil
 }
 
 func (be *sqliteBackend) DeleteTaskHub(ctx context.Context) error {
 	if be.db != nil {
-		if err := be.Stop(ctx); err != nil {
+		if err := be.closeDB(); err != nil {
 			return fmt.Errorf("failed to stop the backend: %w", err)
 		}
 	}
@@ -492,15 +497,17 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx *sql.Tx, e *bac
 		`INSERT OR IGNORE INTO [Instances] (
 			[Name],
 			[Version],
+			[ScheduledStartTime],
 			[InstanceID],
 			[ExecutionID],
 			[Input],
 			[RuntimeStatus],
 			[CreatedTime],
 			[ParentInstanceID]
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		startEvent.Name,
 		startEvent.Version.GetValue(),
+		timestampValue(startEvent.ScheduledStartTimestamp),
 		startEvent.OrchestrationInstance.InstanceId,
 		startEvent.OrchestrationInstance.ExecutionId.GetValue(),
 		startEvent.Input.GetValue(),
@@ -525,7 +532,7 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx *sql.Tx, e *bac
 }
 
 func insertInstanceTags(ctx context.Context, tx *sql.Tx, instanceID string, tags map[string]string) error {
-	for key, value := range tags {
+	for key, value := range tagcodec.DecodeUserTagsOrPlain(tags) {
 		if _, err := tx.ExecContext(
 			ctx,
 			"INSERT INTO InstanceTags ([InstanceID], [TagKey], [TagValue]) VALUES (?, ?, ?)",
@@ -686,7 +693,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 
 	row := be.db.QueryRowContext(
 		ctx,
-		`SELECT [InstanceID], [ExecutionID], [Name], [Version], [ParentInstanceID], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [CompletedTime], [Input], [Output], [CustomStatus], [FailureDetails]
+		`SELECT [InstanceID], [ExecutionID], [Name], [Version], [ScheduledStartTime], [ParentInstanceID], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [CompletedTime], [Input], [Output], [CustomStatus], [FailureDetails]
 		FROM Instances WHERE [InstanceID] = ?`,
 		string(iid),
 	)
@@ -702,6 +709,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	var executionID *string
 	var name *string
 	var version *string
+	var scheduledStartAt *time.Time
 	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
@@ -713,7 +721,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err = row.Scan(&instanceID, &executionID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err = row.Scan(&instanceID, &executionID, &name, &version, &scheduledStartAt, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -755,6 +763,9 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	}
 	if executionID != nil {
 		metadata.ExecutionID = *executionID
+	}
+	if scheduledStartAt != nil {
+		metadata.ScheduledStartAt = *scheduledStartAt
 	}
 	if parentInstanceID != nil {
 		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
@@ -1831,7 +1842,7 @@ func (be *sqliteBackend) PurgeOrchestrationState(ctx context.Context, id api.Ins
 }
 
 // Start implements backend.Backend
-func (be *sqliteBackend) Start(context.Context) error {
+func (be *sqliteBackend) Start(ctx context.Context) error {
 	if be.db == nil {
 		db, err := sql.Open("sqlite", be.dsn)
 		if err != nil {
@@ -1847,20 +1858,71 @@ func (be *sqliteBackend) Start(context.Context) error {
 		be.db = db
 	}
 
-	return nil
+	return be.ensureScheduledStartColumn(ctx)
 }
 
 // Stop implements backend.Backend
 func (be *sqliteBackend) Stop(context.Context) error {
-	if be.db != nil {
-		db := be.db
-		be.db = nil
-		if err := db.Close(); err != nil {
-			return fmt.Errorf("failed to close the database: %w", err)
+	if be.options.FilePath != "" {
+		return be.closeDB()
+	}
+	// Keep in-memory task hubs alive across worker stop/start cycles.
+	return nil
+}
+
+func (be *sqliteBackend) closeDB() error {
+	db := be.db
+	be.db = nil
+	if db == nil {
+		return nil
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("failed to close the database: %w", err)
+	}
+	return nil
+}
+
+func (be *sqliteBackend) ensureScheduledStartColumn(ctx context.Context) error {
+	rows, err := be.db.QueryContext(ctx, "PRAGMA table_info(Instances)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect Instances schema: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck // read-only schema inspection
+	foundTable := false
+	for rows.Next() {
+		foundTable = true
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("failed to inspect Instances column: %w", err)
+		}
+		if name == "ScheduledStartTime" {
+			return nil
 		}
 	}
-
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed while inspecting Instances schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close Instances schema query: %w", err)
+	}
+	if !foundTable {
+		return nil
+	}
+	if _, err := be.db.ExecContext(ctx, "ALTER TABLE Instances ADD COLUMN [ScheduledStartTime] DATETIME NULL"); err != nil {
+		return fmt.Errorf("failed to add ScheduledStartTime column: %w", err)
+	}
 	return nil
+}
+
+func timestampValue(timestamp *timestamppb.Timestamp) any {
+	if timestamp == nil {
+		return nil
+	}
+	return timestamp.AsTime()
 }
 
 func (be *sqliteBackend) ensureDB() error {

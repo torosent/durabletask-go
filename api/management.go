@@ -12,6 +12,7 @@ import (
 const (
 	DefaultInstanceQueryPageSize = 100
 	MaxInstanceQueryPageSize     = 1000
+	MaxRemoteTagFilterScanPages  = 100
 	MaxInstanceBatchSize         = 500
 	DefaultPurgePollInterval     = 100 * time.Millisecond
 )
@@ -29,7 +30,11 @@ type OrchestrationQuery struct {
 	ContinuationToken     string
 	InstanceIDPrefix      string
 	FetchInputsAndOutputs bool
-	Tags                  map[string]string
+	// Tags are exact-match filters. Embedded backends evaluate them in storage.
+	// The current gRPC wire contract lacks tag filters, so remote clients scan a
+	// bounded number of pages locally and can return a partial page with a
+	// continuation token.
+	Tags map[string]string
 }
 
 type OrchestrationQueryResult struct {
@@ -88,6 +93,28 @@ type PurgeInstancesRequest struct {
 type PurgeInstancesResult struct {
 	DeletedInstanceCount int
 	IsComplete           bool
+}
+
+func (request PurgeInstancesRequest) Validate() error {
+	hasInstanceIDs := len(request.InstanceIDs) > 0
+	hasFilter := request.Filter != nil
+	if hasInstanceIDs == hasFilter {
+		return errors.New("purge request must specify exactly one of instance IDs or a filter")
+	}
+	for _, id := range request.InstanceIDs {
+		if id == EmptyInstanceID {
+			return errors.New("purge instance ID cannot be empty")
+		}
+	}
+	if request.Filter != nil {
+		if err := ValidateTimeRange(request.Filter.CreatedTimeFrom, request.Filter.CreatedTimeTo); err != nil {
+			return fmt.Errorf("invalid purge filter: %w", err)
+		}
+		if request.Filter.Timeout < 0 {
+			return errors.New("purge timeout cannot be negative")
+		}
+	}
+	return nil
 }
 
 type CreateTaskHubOptions func(*protos.CreateTaskHubRequest) error

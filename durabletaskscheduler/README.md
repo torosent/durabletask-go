@@ -50,11 +50,16 @@ instance, filtered purge can complete without deleting matches, and
 `ListInstanceIds` can omit matching IDs. The emulator integration tests record
 these limitations explicitly.
 
+Embedded gRPC hosts must opt in to destructive task-hub create/delete RPCs with
+`backend.WithTaskHubLifecycleManagement()`. They remain disabled by default.
+
 ### Worker routing and capabilities
 
 Use `client.WithWorkItemFilters` to advertise and locally enforce accepted
 orchestration/activity names and versions. Local enforcement is a fallback for
-services that ignore the filter request. Capability advertisement is explicit:
+services that ignore the filter request; the embedded sidecar routes work using
+the same filters. An empty orchestration or activity filter list means no
+restriction for that kind. Capability advertisement is explicit:
 history streaming is enabled by default, while scheduled tasks use
 `client.WithScheduledTaskCapability(true)`.
 
@@ -77,7 +82,8 @@ options.LargePayloads = &api.LargePayloadOptions{
 `payload.NewFileStore` provides a bounded local-file implementation. Workers
 advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured. The same
 abstraction can be used with embedded backends through
-`backend.NewLargePayloadBackend`.
+`backend.NewLargePayloadBackend`. Resolver implementations must treat reference
+locations as untrusted and enforce their own scheme/account/path allow lists.
 
 ## Worker lifecycle
 
@@ -90,11 +96,11 @@ cancels them only if the shutdown context expires.
 | Feature | Status |
 | --- | --- |
 | Schedule, bounded query/list, and wait for orchestrations | Supported |
-| Tags on schedule, metadata, query, sub-orchestration, continue-as-new, restart, and rewind | Supported |
+| Tags on schedule, metadata, query, sub-orchestration, continue-as-new, restart, and rewind | Supported; distinct from immutable context fields |
 | Restart and batch/filter purge | Supported; see emulator limitations above |
 | Rewind | Supported by embedded sqlite/Postgres; current emulator does not transition instances |
 | Skip-graceful termination | Supported by embedded sqlite/Postgres; current emulator returns `Unimplemented` |
-| Task-hub create/delete | Supported by embedded sidecars; remote-service behavior is provider-specific |
+| Task-hub create/delete | Embedded sidecars require `backend.WithTaskHubLifecycleManagement`; remote-service behavior is provider-specific |
 | Raise events, suspend/resume, terminate, and single-instance purge | Supported |
 | Orchestration and activity execution | Supported |
 | Bounded orchestration/activity/entity concurrency | Supported |

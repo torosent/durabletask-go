@@ -61,6 +61,10 @@ func TestLargePayloadBackendRoundTripAcrossOrchestrationSurfaces(t *testing.T) {
 	rawBackend := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), backend.DefaultLogger())
 	wrappedBackend, err := backend.NewLargePayloadBackend(rawBackend, payloadOptions)
 	require.NoError(t, err)
+	_, directCapability := wrappedBackend.(backend.OrchestrationQueryBackend)
+	require.False(t, directCapability)
+	_, discoveredCapability := backend.GetBackendCapability[backend.OrchestrationQueryBackend](wrappedBackend)
+	require.True(t, discoveredCapability)
 	executor := task.NewTaskExecutor(registry)
 	worker := backend.NewTaskHubWorker(
 		wrappedBackend,
@@ -84,6 +88,7 @@ func TestLargePayloadBackendRoundTripAcrossOrchestrationSurfaces(t *testing.T) {
 		"LargePayloadParent",
 		api.WithInstanceID("large-payload-parent"),
 		api.WithInput(input),
+		api.WithContextFields(api.ContextFields{"context-only": "value"}),
 		api.WithTags(map[string]string{"team": "durable"}),
 	)
 	require.NoError(t, err)
@@ -91,6 +96,7 @@ func TestLargePayloadBackendRoundTripAcrossOrchestrationSurfaces(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, `"`+input+`-activity-child"`, metadata.SerializedOutput)
 	require.Equal(t, "durable", metadata.Tags["team"])
+	require.NotContains(t, metadata.Tags, "context-only")
 
 	rawMetadata, err := rawBackend.GetOrchestrationMetadata(ctx, id)
 	require.NoError(t, err)
@@ -107,6 +113,7 @@ func TestLargePayloadBackendRoundTripAcrossOrchestrationSurfaces(t *testing.T) {
 	require.Len(t, query.Orchestrations, 2)
 	for _, item := range query.Orchestrations {
 		require.Equal(t, "durable", item.Tags["team"])
+		require.NotContains(t, item.Tags, "context-only")
 		require.NotContains(t, item.SerializedInput, "durabletask-payload:v1:")
 	}
 }
@@ -150,7 +157,8 @@ func TestLargePayloadBackendRoundTripAcrossEntitySurfaces(t *testing.T) {
 	rawBackend := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), backend.DefaultLogger())
 	wrappedBackend, err := backend.NewLargePayloadBackend(rawBackend, payloadOptions)
 	require.NoError(t, err)
-	entityBackend := wrappedBackend.(backend.EntityBackend)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](wrappedBackend)
+	require.True(t, ok)
 	executor := task.NewTaskExecutor(registry)
 	worker := backend.NewTaskHubWorker(
 		wrappedBackend,

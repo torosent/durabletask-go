@@ -58,7 +58,7 @@ const (
 
 func Test_EntityBackend_PersistenceOrderingAbandonAndCleanup(t *testing.T) {
 	for index, be := range backends {
-		entityBackend, ok := be.(backend.EntityBackend)
+		entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
 		if !ok {
 			t.Fatalf("backend %T does not implement EntityBackend", be)
 		}
@@ -156,7 +156,7 @@ func Test_EntityBackend_PersistenceOrderingAbandonAndCleanup(t *testing.T) {
 
 func Test_EntityBackend_CriticalSectionChain(t *testing.T) {
 	for index, be := range backends {
-		entityBackend, ok := be.(backend.EntityBackend)
+		entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
 		if !ok {
 			t.Fatalf("backend %T does not implement EntityBackend", be)
 		}
@@ -199,7 +199,8 @@ func Test_EntityBackend_CriticalSectionChain(t *testing.T) {
 
 func Test_EntityBackend_AbandonBackoffDefersPoisonedBatch(t *testing.T) {
 	for index, be := range backends {
-		entityBackend := be.(backend.EntityBackend)
+		entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+		require.True(t, ok)
 		initTest(t, be, index, true)
 		entityID := api.NewEntityID("counter", fmt.Sprintf("backoff-%d", index))
 		require.NoError(t, entityBackend.SignalEntity(ctx, &protos.SignalEntityRequest{

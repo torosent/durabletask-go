@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -16,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -58,7 +61,8 @@ type Executor interface {
 
 type grpcExecutor struct {
 	protos.UnimplementedTaskHubSidecarServiceServer
-	workItemQueue              chan *protos.WorkItem
+	workItemSubscribers        *sync.Map // map[uint64]*workItemSubscriber
+	nextSubscriberID           atomic.Uint64
 	pendingOrchestrators       *sync.Map // map[api.InstanceID]*ExecutionResults
 	pendingActivities          *sync.Map // map[string]*activityExecutionResult
 	pendingEntities            *sync.Map // map[completionToken]*entityExecutionResult
@@ -68,9 +72,17 @@ type grpcExecutor struct {
 	onWorkItemConnection       func(context.Context) error
 	streamShutdownChan         <-chan any
 	allowReplaceableStatusWire bool
+	allowTaskHubLifecycle      bool
+	shutdownChan               chan struct{}
+	shutdownOnce               sync.Once
 }
 
 type grpcExecutorOptions func(g *grpcExecutor)
+
+type workItemSubscriber struct {
+	filters *protos.WorkItemFilters
+	queue   chan *protos.WorkItem
+}
 
 // IsDurableTaskGrpcRequest returns true if the specified gRPC method name represents an operation
 // that is compatible with the gRPC executor.
@@ -102,16 +114,25 @@ func WithCurrentOrchestrationIDReusePolicyWire() grpcExecutorOptions {
 	}
 }
 
+// WithTaskHubLifecycleManagement enables destructive task-hub lifecycle RPCs.
+// These RPCs are disabled by default because DeleteTaskHub can remove all state.
+func WithTaskHubLifecycleManagement() grpcExecutorOptions {
+	return func(g *grpcExecutor) {
+		g.allowTaskHubLifecycle = true
+	}
+}
+
 // NewGrpcExecutor returns the Executor object and a method to invoke to register the gRPC server in the executor.
 func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (executor Executor, registerServerFn func(grpcServer grpc.ServiceRegistrar)) {
 	grpcExecutor := &grpcExecutor{
-		workItemQueue:          make(chan *protos.WorkItem),
+		workItemSubscribers:    &sync.Map{},
 		backend:                be,
 		logger:                 logger,
 		pendingOrchestrators:   &sync.Map{},
 		pendingActivities:      &sync.Map{},
 		pendingEntities:        &sync.Map{},
 		pendingEntityInstances: &sync.Map{},
+		shutdownChan:           make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -120,6 +141,46 @@ func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (ex
 
 	return grpcExecutor, func(grpcServer grpc.ServiceRegistrar) {
 		protos.RegisterTaskHubSidecarServiceServer(grpcServer, grpcExecutor)
+	}
+}
+
+func (g *grpcExecutor) dispatchWorkItem(ctx context.Context, workItem *protos.WorkItem) error {
+	for {
+		delivered := false
+		g.workItemSubscribers.Range(func(_, value any) bool {
+			subscriber := value.(*workItemSubscriber)
+			if !workItemMatchesFilters(subscriber.filters, workItem) {
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case <-g.shutdownChan:
+				return false
+			case subscriber.queue <- workItem:
+				delivered = true
+				return false
+			default:
+				return true
+			}
+		})
+		if delivered {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-g.shutdownChan:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrOperationAborted
+		case <-timer.C:
+		}
 	}
 }
 
@@ -148,13 +209,20 @@ func (executor *grpcExecutor) ExecuteOrchestrator(ctx context.Context, iid api.I
 	case <-ctx.Done():
 		executor.logger.Warnf("%s: context canceled before dispatching orchestrator work item", iid)
 		return nil, ctx.Err()
-	case executor.workItemQueue <- workItem:
+	case <-executor.shutdownChan:
+		return nil, ErrOperationAborted
+	default:
+	}
+	if err := executor.dispatchWorkItem(ctx, workItem); err != nil {
+		executor.pendingOrchestrators.Delete(iid)
+		return nil, err
 	}
 
 	// Wait for the connected worker to signal that it's done executing the work-item
 	select {
 	case <-ctx.Done():
 		executor.logger.Warnf("%s: context canceled before receiving orchestrator result", iid)
+		executor.pendingOrchestrators.Delete(iid)
 		return nil, ctx.Err()
 	case <-result.complete:
 		executor.logger.Debugf("%s: orchestrator got result", iid)
@@ -192,13 +260,20 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 	case <-ctx.Done():
 		executor.logger.Warnf("%s/%s#%d: context canceled before dispatching activity work item", iid, task.Name, e.EventId)
 		return nil, ctx.Err()
-	case executor.workItemQueue <- workItem:
+	case <-executor.shutdownChan:
+		return nil, ErrOperationAborted
+	default:
+	}
+	if err := executor.dispatchWorkItem(ctx, workItem); err != nil {
+		executor.pendingActivities.Delete(key)
+		return nil, err
 	}
 
 	// Wait for the connected worker to signal that it's done executing the work-item
 	select {
 	case <-ctx.Done():
 		executor.logger.Warnf("%s/%s#%d: context canceled before receiving activity result", iid, task.Name, e.EventId)
+		executor.pendingActivities.Delete(key)
 		return nil, ctx.Err()
 	case <-result.complete:
 		executor.logger.Debugf("%s: activity got result", key)
@@ -244,7 +319,14 @@ func (executor *grpcExecutor) ExecuteEntity(ctx context.Context, req *protos.Ent
 	case <-ctx.Done():
 		cleanup()
 		return nil, ctx.Err()
-	case executor.workItemQueue <- workItem:
+	case <-executor.shutdownChan:
+		cleanup()
+		return nil, ErrOperationAborted
+	default:
+	}
+	if err := executor.dispatchWorkItem(ctx, workItem); err != nil {
+		cleanup()
+		return nil, err
 	}
 
 	select {
@@ -261,36 +343,49 @@ func (executor *grpcExecutor) ExecuteEntity(ctx context.Context, req *protos.Ent
 
 // Shutdown implements Executor
 func (g *grpcExecutor) Shutdown(ctx context.Context) error {
-	// closing the work item queue is a signal for shutdown
-	close(g.workItemQueue)
+	g.shutdownOnce.Do(func() {
+		close(g.shutdownChan)
+	})
 
 	// Iterate through all pending items and close them to unblock the goroutines waiting on this
-	g.pendingActivities.Range(func(_, value any) bool {
-		p, ok := value.(*activityExecutionResult)
+	g.pendingActivities.Range(func(key, value any) bool {
+		_, ok := value.(*activityExecutionResult)
 		if ok {
-			close(p.complete)
+			if pending, loaded := g.pendingActivities.LoadAndDelete(key); loaded {
+				close(pending.(*activityExecutionResult).complete)
+			}
 		}
 		return true
 	})
-	g.pendingOrchestrators.Range(func(_, value any) bool {
-		p, ok := value.(*ExecutionResults)
+	g.pendingOrchestrators.Range(func(key, value any) bool {
+		_, ok := value.(*ExecutionResults)
 		if ok {
-			close(p.complete)
+			if pending, loaded := g.pendingOrchestrators.LoadAndDelete(key); loaded {
+				close(pending.(*ExecutionResults).complete)
+			}
 		}
 		return true
 	})
-	g.pendingEntities.Range(func(_, value any) bool {
-		if pending, ok := value.(*entityExecutionResult); ok {
-			close(pending.complete)
-		}
-		return true
-	})
+	if g.pendingEntities != nil {
+		g.pendingEntities.Range(func(key, value any) bool {
+			if _, ok := value.(*entityExecutionResult); ok {
+				if pending, loaded := g.pendingEntities.LoadAndDelete(key); loaded {
+					entity := pending.(*entityExecutionResult)
+					if g.pendingEntityInstances != nil {
+						g.pendingEntityInstances.CompareAndDelete(entity.instanceID, key)
+					}
+					close(entity.complete)
+				}
+			}
+			return true
+		})
+	}
 
 	return nil
 }
 
 // Hello implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) Hello(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
+func (*grpcExecutor) Hello(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
 	return empty, nil
 }
 
@@ -319,7 +414,14 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 	pendingOrchestratorCh := make(chan string, 1)
 	pendingEntities := make(map[string]struct{})
 	pendingEntityCh := make(chan string, 1)
+	subscriberID := g.nextSubscriberID.Add(1)
+	subscriber := &workItemSubscriber{queue: make(chan *protos.WorkItem)}
+	if req.GetWorkItemFilters() != nil {
+		subscriber.filters = proto.Clone(req.GetWorkItemFilters()).(*protos.WorkItemFilters)
+	}
+	g.workItemSubscribers.Store(subscriberID, subscriber)
 	defer func() {
+		g.workItemSubscribers.Delete(subscriberID)
 		// If there's any pending activity left, remove them
 		for key := range pendingActivities {
 			g.logger.Debugf("cleaning up pending activity: %s", key)
@@ -352,10 +454,9 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 		case <-stream.Context().Done():
 			g.logger.Info("work item stream closed")
 			return nil
-		case wi, ok := <-g.workItemQueue:
-			if !ok {
-				continue
-			}
+		case <-g.shutdownChan:
+			return errShuttingDown
+		case wi := <-subscriber.queue:
 			switch x := wi.Request.(type) {
 			case *protos.WorkItem_OrchestratorRequest:
 				key := x.OrchestratorRequest.GetInstanceId()
@@ -393,6 +494,92 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 			return errShuttingDown
 		}
 	}
+}
+
+func workItemMatchesFilters(filters *protos.WorkItemFilters, workItem *protos.WorkItem) bool {
+	if filters == nil || workItem == nil {
+		return true
+	}
+	switch request := workItem.Request.(type) {
+	case *protos.WorkItem_OrchestratorRequest:
+		if len(filters.GetOrchestrations()) == 0 {
+			return true
+		}
+		name, version, ok := orchestrationRequestIdentity(request.OrchestratorRequest)
+		return !ok || matchesOrchestrationFilters(filters.GetOrchestrations(), name, version)
+	case *protos.WorkItem_ActivityRequest:
+		if len(filters.GetActivities()) == 0 {
+			return true
+		}
+		for _, filter := range filters.GetActivities() {
+			if filter.GetName() == request.ActivityRequest.GetName() &&
+				(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), request.ActivityRequest.GetVersion().GetValue())) {
+				return true
+			}
+		}
+		return false
+	case *protos.WorkItem_EntityRequest:
+		if len(filters.GetEntities()) == 0 {
+			return true
+		}
+		entityID, err := api.EntityIDFromString(request.EntityRequest.GetInstanceId())
+		if err != nil {
+			return false
+		}
+		for _, filter := range filters.GetEntities() {
+			if strings.EqualFold(filter.GetName(), entityID.Name) {
+				return true
+			}
+		}
+		return false
+	case *protos.WorkItem_EntityRequestV2:
+		if len(filters.GetEntities()) == 0 {
+			return true
+		}
+		entityID, err := api.EntityIDFromString(request.EntityRequestV2.GetInstanceId())
+		if err != nil {
+			return false
+		}
+		for _, filter := range filters.GetEntities() {
+			if strings.EqualFold(filter.GetName(), entityID.Name) {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func orchestrationRequestIdentity(request *protos.OrchestratorRequest) (string, string, bool) {
+	if request == nil {
+		return "", "", false
+	}
+	for _, events := range [][]*protos.HistoryEvent{request.GetNewEvents(), request.GetPastEvents()} {
+		for index := len(events) - 1; index >= 0; index-- {
+			event := events[index]
+			if event == nil {
+				continue
+			}
+			if rewound := event.GetExecutionRewound(); rewound != nil && rewound.GetName().GetValue() != "" {
+				return rewound.GetName().GetValue(), rewound.GetVersion().GetValue(), true
+			}
+			if started := event.GetExecutionStarted(); started != nil {
+				return started.GetName(), started.GetVersion().GetValue(), true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func matchesOrchestrationFilters(filters []*protos.OrchestrationFilter, name, version string) bool {
+	for _, filter := range filters {
+		if filter.GetName() == name &&
+			(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), version)) {
+			return true
+		}
+	}
+	return false
 }
 
 // CompleteOrchestratorTask implements protos.TaskHubSidecarServiceServer
@@ -505,6 +692,9 @@ func (g *grpcExecutor) resolveEntityTask(completionToken string, response *proto
 
 // CreateTaskHub implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) CreateTaskHub(ctx context.Context, req *protos.CreateTaskHubRequest) (*protos.CreateTaskHubResponse, error) {
+	if !g.allowTaskHubLifecycle {
+		return nil, status.Error(codes.Unimplemented, "task hub lifecycle management is not enabled")
+	}
 	if req.GetRecreateIfExists() {
 		if err := g.backend.DeleteTaskHub(ctx); err != nil && !errors.Is(err, ErrTaskHubNotFound) {
 			return nil, fmt.Errorf("failed to recreate task hub: %w", err)
@@ -518,6 +708,9 @@ func (g *grpcExecutor) CreateTaskHub(ctx context.Context, req *protos.CreateTask
 
 // DeleteTaskHub implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) DeleteTaskHub(ctx context.Context, _ *protos.DeleteTaskHubRequest) (*protos.DeleteTaskHubResponse, error) {
+	if !g.allowTaskHubLifecycle {
+		return nil, status.Error(codes.Unimplemented, "task hub lifecycle management is not enabled")
+	}
 	if err := g.backend.DeleteTaskHub(ctx); err != nil {
 		return nil, fmt.Errorf("failed to delete task hub: %w", err)
 	}
@@ -550,12 +743,12 @@ func (g *grpcExecutor) PurgeInstances(ctx context.Context, req *protos.PurgeInst
 			IsComplete:           wrapperspb.Bool(true),
 		}
 		if err != nil {
-			return resp, fmt.Errorf("failed to purge orchestration state: %w", err)
+			return nil, managementRPCError(err, "failed to purge orchestration state")
 		}
 		return resp, nil
 	}
 
-	capability, ok := g.backend.(PurgeInstancesBackend)
+	capability, ok := GetBackendCapability[PurgeInstancesBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "multi-instance purge is not supported by this backend")
 	}
@@ -595,8 +788,7 @@ func (g *grpcExecutor) PurgeInstances(ctx context.Context, req *protos.PurgeInst
 
 // QueryInstances implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) QueryInstances(ctx context.Context, req *protos.QueryInstancesRequest) (*protos.QueryInstancesResponse, error) {
-	capability, ok := g.backend.(OrchestrationQueryBackend)
-	if !ok {
+	if _, ok := GetBackendCapability[OrchestrationQueryBackend](g.backend); !ok {
 		return nil, status.Error(codes.Unimplemented, "instance queries are not supported by this backend")
 	}
 	wireQuery := req.GetQuery()
@@ -619,9 +811,9 @@ func (g *grpcExecutor) QueryInstances(ctx context.Context, req *protos.QueryInst
 	for _, taskHubName := range wireQuery.GetTaskHubNames() {
 		query.TaskHubNames = append(query.TaskHubNames, taskHubName.GetValue())
 	}
-	result, err := capability.QueryOrchestrations(ctx, query)
+	result, err := queryOrchestrations(ctx, g.backend, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query orchestration instances: %w", err)
+		return nil, managementRPCError(err, "failed to query orchestration instances")
 	}
 	resp := &protos.QueryInstancesResponse{
 		OrchestrationState: make([]*protos.OrchestrationState, 0, len(result.Orchestrations)),
@@ -637,7 +829,7 @@ func (g *grpcExecutor) QueryInstances(ctx context.Context, req *protos.QueryInst
 
 // ListInstanceIds implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) ListInstanceIds(ctx context.Context, req *protos.ListInstanceIdsRequest) (*protos.ListInstanceIdsResponse, error) {
-	capability, ok := g.backend.(InstanceIDQueryBackend)
+	capability, ok := GetBackendCapability[InstanceIDQueryBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "instance ID queries are not supported by this backend")
 	}
@@ -654,7 +846,7 @@ func (g *grpcExecutor) ListInstanceIds(ctx context.Context, req *protos.ListInst
 	}
 	result, err := capability.ListInstanceIDs(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list orchestration instance IDs: %w", err)
+		return nil, managementRPCError(err, "failed to list orchestration instance IDs")
 	}
 	resp := &protos.ListInstanceIdsResponse{
 		InstanceIds: make([]string, len(result.InstanceIDs)),
@@ -670,7 +862,7 @@ func (g *grpcExecutor) ListInstanceIds(ctx context.Context, req *protos.ListInst
 
 // RestartInstance implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) RestartInstance(ctx context.Context, req *protos.RestartInstanceRequest) (*protos.RestartInstanceResponse, error) {
-	capability, ok := g.backend.(RestartInstanceBackend)
+	capability, ok := GetBackendCapability[RestartInstanceBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "instance restart is not supported by this backend")
 	}
@@ -683,7 +875,7 @@ func (g *grpcExecutor) RestartInstance(ctx context.Context, req *protos.RestartI
 
 // RewindInstance implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) RewindInstance(ctx context.Context, req *protos.RewindInstanceRequest) (*protos.RewindInstanceResponse, error) {
-	capability, ok := g.backend.(RewindInstanceBackend)
+	capability, ok := GetBackendCapability[RewindInstanceBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "instance rewind is not supported by this backend")
 	}
@@ -698,7 +890,7 @@ func (g *grpcExecutor) SkipGracefulOrchestrationTerminations(
 	ctx context.Context,
 	req *protos.SkipGracefulOrchestrationTerminationsRequest,
 ) (*protos.SkipGracefulOrchestrationTerminationsResponse, error) {
-	capability, ok := g.backend.(SkipGracefulTerminationsBackend)
+	capability, ok := GetBackendCapability[SkipGracefulTerminationsBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "immediate orchestration termination is not supported by this backend")
 	}
@@ -715,7 +907,7 @@ func (g *grpcExecutor) SkipGracefulOrchestrationTerminations(
 	}
 	unterminated, err := capability.SkipGracefulOrchestrationTerminations(ctx, ids, req.GetReason().GetValue())
 	if err != nil {
-		return nil, fmt.Errorf("failed to skip graceful orchestration terminations: %w", err)
+		return nil, managementRPCError(err, "failed to skip graceful orchestration terminations")
 	}
 	resp := &protos.SkipGracefulOrchestrationTerminationsResponse{
 		UnterminatedInstanceIds: make([]string, len(unterminated)),
@@ -728,7 +920,7 @@ func (g *grpcExecutor) SkipGracefulOrchestrationTerminations(
 
 // RaiseEvent implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) RaiseEvent(ctx context.Context, req *protos.RaiseEventRequest) (*protos.RaiseEventResponse, error) {
-	if entityBackend, ok := g.backend.(EntitySignalBackend); ok && helpers.IsEntityInstanceID(req.InstanceId) &&
+	if entityBackend, ok := GetBackendCapability[EntitySignalBackend](g.backend); ok && helpers.IsEntityInstanceID(req.InstanceId) &&
 		strings.EqualFold(req.Name, helpers.EntityRequestEventName) {
 		var message helpers.EntityRequestMessage
 		if err := json.Unmarshal([]byte(req.Input.GetValue()), &message); err != nil {
@@ -786,7 +978,7 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 
 // SignalEntity implements protos.TaskHubSidecarServiceServer.
 func (g *grpcExecutor) SignalEntity(ctx context.Context, req *protos.SignalEntityRequest) (*protos.SignalEntityResponse, error) {
-	entityBackend, ok := g.backend.(EntitySignalBackend)
+	entityBackend, ok := GetBackendCapability[EntitySignalBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
 	}
@@ -895,7 +1087,7 @@ func (g *grpcExecutor) CleanEntityStorage(ctx context.Context, req *protos.Clean
 // entityQueryBackend returns the configured backend's entity query support, or a
 // gRPC status error when the backend does not implement durable entities.
 func (g *grpcExecutor) entityQueryBackend() (EntityQueryBackend, error) {
-	entityBackend, ok := g.backend.(EntityQueryBackend)
+	entityBackend, ok := GetBackendCapability[EntityQueryBackend](g.backend)
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
 	}
@@ -1002,7 +1194,7 @@ loop:
 }
 
 // mustEmbedUnimplementedTaskHubSidecarServiceServer implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) mustEmbedUnimplementedTaskHubSidecarServiceServer() { //nolint:unused
+func (*grpcExecutor) mustEmbedUnimplementedTaskHubSidecarServiceServer() { //nolint:unused
 }
 
 func createGetInstanceResponse(req *protos.GetInstanceRequest, metadata *api.OrchestrationMetadata) *protos.GetInstanceResponse {

@@ -45,6 +45,26 @@ func TestLargePayloadIntegrityFailure(t *testing.T) {
 	require.ErrorIs(t, err, api.ErrLargePayloadIntegrity)
 }
 
+func TestLargePayloadReferenceRequiresConfiguration(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	externalized, err := Externalize(context.Background(), options, wrapperspb.String("payload"))
+	require.NoError(t, err)
+	_, err = Hydrate(context.Background(), nil, externalized)
+	require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+	_, err = Externalize(context.Background(), nil, externalized)
+	require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+	err = TransformActivityRequest(context.Background(), nil, &protos.ActivityRequest{Input: externalized})
+	require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+	err = TransformOrchestrationState(context.Background(), nil, &protos.OrchestrationState{Output: externalized})
+	require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+}
+
 func TestLargePayloadLimitAndMalformedReference(t *testing.T) {
 	store := payload.NewMemoryStore()
 	options := &api.LargePayloadOptions{
