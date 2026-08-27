@@ -2,7 +2,6 @@ package task
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -80,14 +79,4 @@ func (r *TaskRegistry) AddEntityN(name string, e Entity) error {
 	}
 	r.entities[name] = e
 	return nil
-}
-
-// EntityNames returns registered entity names in deterministic order.
-func (r *TaskRegistry) EntityNames() []string {
-	names := make([]string, 0, len(r.entities))
-	for name := range r.entities {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }

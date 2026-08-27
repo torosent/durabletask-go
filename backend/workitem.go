@@ -43,13 +43,17 @@ func (wi OrchestrationWorkItem) IsWorkItem() bool {
 }
 
 func (wi *OrchestrationWorkItem) GetAbandonDelay() time.Duration {
+	return abandonDelayForRetry(wi.RetryCount)
+}
+
+func abandonDelayForRetry(retryCount int32) time.Duration {
 	switch {
-	case wi.RetryCount == 0:
+	case retryCount == 0:
 		return time.Duration(0) // no delay
-	case wi.RetryCount > 100:
+	case retryCount > 100:
 		return 5 * time.Minute // max delay
 	default:
-		return time.Duration(wi.RetryCount) * time.Second // linear backoff
+		return time.Duration(retryCount) * time.Second // linear backoff
 	}
 }
 
