@@ -8,6 +8,7 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -105,4 +106,69 @@ func TestContinueAsNewDropsCorrelatedPendingWork(t *testing.T) {
 	if state.instanceID != api.InstanceID("parent") {
 		t.Fatalf("instance ID changed: %s", state.instanceID)
 	}
+}
+
+func TestContinueAsNewAppliesNewVersion(t *testing.T) {
+	state := NewOrchestrationRuntimeState("instance", []*HistoryEvent{
+		helpers.NewExecutionStartedEvent(
+			"orchestration",
+			"instance",
+			nil,
+			nil,
+			nil,
+			nil,
+			wrapperspb.String("v1"),
+		),
+	})
+	action := helpers.NewCompleteOrchestrationAction(
+		0,
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW,
+		nil,
+		nil,
+		nil,
+	)
+	action.GetCompleteOrchestration().NewVersion = wrapperspb.String("v2")
+
+	continued, err := state.ApplyActions([]*protos.OrchestratorAction{action}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !continued {
+		t.Fatal("expected ContinueAsNew")
+	}
+	if got := state.startEvent.GetVersion().GetValue(); got != "v2" {
+		t.Fatalf("continued version = %q, want v2", got)
+	}
+	if !state.ContinueAsNewVersionChanged() {
+		t.Fatal("expected version-changing ContinueAsNew boundary")
+	}
+}
+
+func TestContinueAsNewCanMigrateToUnversioned(t *testing.T) {
+	state := NewOrchestrationRuntimeState("instance", []*HistoryEvent{
+		helpers.NewExecutionStartedEvent(
+			"orchestration",
+			"instance",
+			nil,
+			nil,
+			nil,
+			nil,
+			wrapperspb.String("v1"),
+		),
+	})
+	action := helpers.NewCompleteOrchestrationAction(
+		0,
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW,
+		nil,
+		nil,
+		nil,
+	)
+	action.GetCompleteOrchestration().NewVersion = wrapperspb.String("")
+
+	continued, err := state.ApplyActions([]*protos.OrchestratorAction{action}, nil)
+	require.NoError(t, err)
+	require.True(t, continued)
+	require.True(t, state.ContinueAsNewVersionChanged())
+	require.NotNil(t, state.startEvent.Version)
+	require.Empty(t, state.startEvent.Version.GetValue())
 }

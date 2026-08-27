@@ -31,6 +31,7 @@ type completableTask struct {
 	failureDetails     *protos.TaskFailureDetails
 	localErr           error
 	taskName           string
+	taskVersion        string
 	taskID             int32
 	entityID           api.EntityID
 	entityOperation    string
@@ -83,12 +84,13 @@ func (t *completableTask) Await(v any) error {
 				}
 				return &TaskFailedError{
 					TaskName:       t.taskName,
+					TaskVersion:    t.taskVersion,
 					TaskID:         t.taskID,
 					FailureDetails: details,
 				}
 			}
 			if v != nil && len(t.rawResult) > 0 {
-				if err := unmarshalData(t.rawResult, v); err != nil {
+				if err := unmarshalData(t.orchestrationCtx.converter, t.rawResult, v); err != nil {
 					return fmt.Errorf("failed to decode task result: %w", err)
 				}
 			}

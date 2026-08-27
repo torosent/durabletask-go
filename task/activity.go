@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-type callActivityOption func(*callActivityOptions) error
+type callActivityOption func(*callActivityOptions, api.DataConverter) error
 
 type callActivityOptions struct {
 	rawInput    *wrapperspb.StringValue
@@ -19,9 +19,20 @@ type callActivityOptions struct {
 	retryPolicy *RetryPolicy
 }
 
+func (options *callActivityOptions) versionOrInherited(inheritedVersion string) *wrapperspb.StringValue {
+	if options.version != nil {
+		return options.version
+	}
+	// Preserve nil for implicit unversioned calls; an explicit empty version remains non-nil.
+	if inheritedVersion == "" {
+		return nil
+	}
+	return wrapperspb.String(inheritedVersion)
+}
+
 // WithActivityVersion configures the activity version.
 func WithActivityVersion(version string) callActivityOption {
-	return func(opt *callActivityOptions) error {
+	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		opt.version = wrapperspb.String(version)
 		return nil
 	}
@@ -77,10 +88,10 @@ func (policy *RetryPolicy) Validate() error {
 }
 
 // WithActivityInput configures an input for an activity invocation.
-// The specified input must be JSON serializable.
+// The configured data converter must be able to serialize the input.
 func WithActivityInput(input any) callActivityOption {
-	return func(opt *callActivityOptions) error {
-		data, err := marshalData(input)
+	return func(opt *callActivityOptions, converter api.DataConverter) error {
+		data, err := marshalData(converter, input)
 		if err != nil {
 			return err
 		}
@@ -91,14 +102,14 @@ func WithActivityInput(input any) callActivityOption {
 
 // WithRawActivityInput configures a raw input for an activity invocation.
 func WithRawActivityInput(input string) callActivityOption {
-	return func(opt *callActivityOptions) error {
+	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		opt.rawInput = wrapperspb.String(input)
 		return nil
 	}
 }
 
 func WithActivityRetryPolicy(policy *RetryPolicy) callActivityOption {
-	return func(opt *callActivityOptions) error {
+	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		if policy == nil {
 			return nil
 		}
@@ -121,25 +132,32 @@ type activityContext struct {
 	TaskID int32
 	Name   string
 
-	rawInput []byte
-	ctx      context.Context
+	rawInput  []byte
+	ctx       context.Context
+	converter api.DataConverter
 }
 
 // Activity is the functional interface for activity implementations.
 type Activity func(ctx ActivityContext) (any, error)
 
-func newTaskActivityContext(ctx context.Context, taskID int32, ts *protos.TaskScheduledEvent) *activityContext {
+func newTaskActivityContext(
+	ctx context.Context,
+	taskID int32,
+	ts *protos.TaskScheduledEvent,
+	converter api.DataConverter,
+) *activityContext {
 	return &activityContext{
-		TaskID:   taskID,
-		Name:     ts.Name,
-		rawInput: []byte(ts.Input.GetValue()),
-		ctx:      ctx,
+		TaskID:    taskID,
+		Name:      ts.Name,
+		rawInput:  []byte(ts.Input.GetValue()),
+		ctx:       ctx,
+		converter: converter,
 	}
 }
 
 // GetInput unmarshals the serialized activity input and saves the result into [v].
 func (actx *activityContext) GetInput(v any) error {
-	return unmarshalData(actx.rawInput, v)
+	return unmarshalData(actx.converter, actx.rawInput, v)
 }
 
 func (actx *activityContext) Context() context.Context {

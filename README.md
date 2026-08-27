@@ -35,6 +35,53 @@ environment-gated emulator tests.
 See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
 and the [environment-driven sample](./samples/durabletaskscheduler).
 
+## Task versions
+
+Orchestrators and activities can register multiple implementations under the
+same logical name. Registry identity is case-insensitive and includes both name
+and version:
+
+```go
+registry.AddOrchestratorNVersion("orders", "v1", ordersV1)
+registry.AddOrchestratorNVersion("orders", "v2", ordersV2)
+registry.AddActivityNVersion("charge", "v2", chargeV2)
+```
+
+Dispatch prefers an exact `(name, version)` match. A versioned request falls
+back to an unversioned registration only when that logical name has no versioned
+registrations. Activities inherit the parent orchestration version unless
+`task.WithActivityVersion` is supplied; passing `""` explicitly requests the
+unversioned activity. Sub-orchestrations use `VersioningOptions.DefaultVersion`
+unless explicitly overridden. `task.WithContinueAsNewVersion` moves the next
+execution across a deterministic ContinueAsNew boundary; passing
+`task.UnversionedTaskVersion` migrates back to an unversioned registration.
+
+Top-level clients can configure a default with `backend.WithDefaultVersion` or
+`client.WithDefaultVersion`. Workers use `client.WithTaskVersioning`; the DTS
+`Options.Versioning` value configures both sides. Reject/fail mismatch strategies
+remain available for rolling deployments.
+
+## Data converters
+
+`api.DataConverter` owns application payload serialization. The default
+`api.JSONDataConverter` preserves the existing `encoding/json` wire format.
+Configure the same converter on every producer and consumer:
+
+```go
+converter := myDataConverter{}
+client := backend.NewTaskHubClient(be, backend.WithDataConverter(converter))
+executor := task.NewTaskExecutor(registry, task.WithDataConverter(converter))
+```
+
+For DTS, set `Options.DataConverter` once; it is propagated to both the client
+and worker. Generic gRPC callers use `client.WithDataConverter` and
+`client.WithWorkerDataConverter`. Typed orchestration, activity, entity, event,
+status, management, metadata, and ContinueAsNew payloads use the converter.
+`WithRaw*`, serialized metadata fields, failure metadata, and large-payload
+reference descriptors remain raw protocol values and bypass conversion.
+Converter identity is not persisted, so a replacement converter must continue
+to decode payloads written by earlier deployments.
+
 ## Durable entities
 
 Durable entities are addressable stateful objects that execute operations one at

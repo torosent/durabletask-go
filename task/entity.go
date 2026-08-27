@@ -3,7 +3,6 @@ package task
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -35,6 +34,7 @@ type EntityContext struct {
 	currentTime time.Time
 	ctx         context.Context
 	logger      *slog.Logger
+	converter   api.DataConverter
 }
 
 type entityState struct {
@@ -44,7 +44,7 @@ type entityState struct {
 
 // GetInput unmarshals the serialized entity operation input and saves the result into [v].
 func (ctx *EntityContext) GetInput(v any) error {
-	return unmarshalData(ctx.rawInput, v)
+	return unmarshalData(ctx.converter, ctx.rawInput, v)
 }
 
 // HasState returns true if the entity has state set.
@@ -57,21 +57,21 @@ func (ctx *EntityContext) GetState(v any) error {
 	if !ctx.state.hasValue {
 		return fmt.Errorf("entity has no state")
 	}
-	return unmarshalData(ctx.state.value, v)
+	return unmarshalData(ctx.converter, ctx.state.value, v)
 }
 
-// SetState sets the entity state. The state must be JSON-serializable.
+// SetState serializes and stores entity state with the configured converter.
 // Passing nil deletes the entity state.
 func (ctx *EntityContext) SetState(state any) error {
 	if state == nil {
 		ctx.DeleteState()
 		return nil
 	}
-	bytes, err := json.Marshal(state)
+	payload, err := marshalData(ctx.converter, state)
 	if err != nil {
-		return fmt.Errorf("failed to marshal entity state: %w", err)
+		return fmt.Errorf("failed to serialize entity state: %w", err)
 	}
-	ctx.state.value = bytes
+	ctx.state.value = payload
 	ctx.state.hasValue = true
 	ctx.stateDirty = true
 	return nil
@@ -128,9 +128,9 @@ func (ctx *EntityContext) signalEntity(entityID api.EntityID, operationName stri
 
 	var rawInput *wrapperspb.StringValue
 	if input != nil {
-		bytes, err := json.Marshal(input)
+		bytes, err := marshalData(ctx.converter, input)
 		if err != nil {
-			return fmt.Errorf("failed to marshal signal input: %w", err)
+			return fmt.Errorf("failed to serialize signal input: %w", err)
 		}
 		rawInput = wrapperspb.String(string(bytes))
 	}
@@ -158,7 +158,7 @@ func (ctx *EntityContext) StartNewOrchestration(name string, opts ...entityStart
 	}
 	options := &entityStartOrchestrationOptions{}
 	for _, configure := range opts {
-		if err := configure(options); err != nil {
+		if err := configure(options, ctx.converter); err != nil {
 			return err
 		}
 	}
@@ -202,14 +202,14 @@ type entityStartOrchestrationOptions struct {
 }
 
 // entityStartOrchestrationOption is a functional option for StartNewOrchestration.
-type entityStartOrchestrationOption func(*entityStartOrchestrationOptions) error
+type entityStartOrchestrationOption func(*entityStartOrchestrationOptions, api.DataConverter) error
 
 // WithEntityStartOrchestrationInput sets the input for the new orchestration.
 func WithEntityStartOrchestrationInput(input any) entityStartOrchestrationOption {
-	return func(opts *entityStartOrchestrationOptions) error {
-		bytes, err := json.Marshal(input)
+	return func(opts *entityStartOrchestrationOptions, converter api.DataConverter) error {
+		bytes, err := marshalData(converter, input)
 		if err != nil {
-			return fmt.Errorf("failed to marshal orchestration input: %w", err)
+			return fmt.Errorf("failed to serialize orchestration input: %w", err)
 		}
 		opts.rawInput = wrapperspb.String(string(bytes))
 		return nil
@@ -218,7 +218,7 @@ func WithEntityStartOrchestrationInput(input any) entityStartOrchestrationOption
 
 // WithEntityStartOrchestrationInstanceID sets the instance ID for the new orchestration.
 func WithEntityStartOrchestrationInstanceID(instanceID string) entityStartOrchestrationOption {
-	return func(opts *entityStartOrchestrationOptions) error {
+	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		opts.instanceID = instanceID
 		return nil
 	}
@@ -226,7 +226,7 @@ func WithEntityStartOrchestrationInstanceID(instanceID string) entityStartOrches
 
 // WithEntityStartOrchestrationVersion sets the version for the new orchestration.
 func WithEntityStartOrchestrationVersion(version string) entityStartOrchestrationOption {
-	return func(opts *entityStartOrchestrationOptions) error {
+	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		opts.version = wrapperspb.String(version)
 		return nil
 	}
@@ -234,7 +234,7 @@ func WithEntityStartOrchestrationVersion(version string) entityStartOrchestratio
 
 // WithEntityStartOrchestrationScheduledTime schedules the new orchestration.
 func WithEntityStartOrchestrationScheduledTime(scheduledTime time.Time) entityStartOrchestrationOption {
-	return func(opts *entityStartOrchestrationOptions) error {
+	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		if scheduledTime.IsZero() {
 			return fmt.Errorf("scheduled orchestration time must not be zero")
 		}
@@ -244,7 +244,7 @@ func WithEntityStartOrchestrationScheduledTime(scheduledTime time.Time) entitySt
 }
 
 // callEntityOption is a functional option type for the CallEntity orchestrator method.
-type callEntityOption func(*callEntityOptions) error
+type callEntityOption func(*callEntityOptions, api.DataConverter) error
 
 type callEntityOptions struct {
 	rawInput *wrapperspb.StringValue
@@ -252,8 +252,8 @@ type callEntityOptions struct {
 
 // WithEntityInput configures an input for an entity operation invocation.
 func WithEntityInput(input any) callEntityOption {
-	return func(opt *callEntityOptions) error {
-		data, err := marshalData(input)
+	return func(opt *callEntityOptions, converter api.DataConverter) error {
+		data, err := marshalData(converter, input)
 		if err != nil {
 			return err
 		}
@@ -264,14 +264,14 @@ func WithEntityInput(input any) callEntityOption {
 
 // WithRawEntityInput configures a raw input for an entity operation invocation.
 func WithRawEntityInput(input string) callEntityOption {
-	return func(opt *callEntityOptions) error {
+	return func(opt *callEntityOptions, _ api.DataConverter) error {
 		opt.rawInput = wrapperspb.String(input)
 		return nil
 	}
 }
 
 // signalEntityOption is a functional option type for the SignalEntity orchestrator method.
-type signalEntityOption func(*signalEntityOptions) error
+type signalEntityOption func(*signalEntityOptions, api.DataConverter) error
 
 type signalEntityOptions struct {
 	rawInput      *wrapperspb.StringValue
@@ -280,8 +280,8 @@ type signalEntityOptions struct {
 
 // WithSignalEntityInput configures an input for a signal entity invocation.
 func WithSignalEntityInput(input any) signalEntityOption {
-	return func(opt *signalEntityOptions) error {
-		data, err := marshalData(input)
+	return func(opt *signalEntityOptions, converter api.DataConverter) error {
+		data, err := marshalData(converter, input)
 		if err != nil {
 			return err
 		}
@@ -292,7 +292,7 @@ func WithSignalEntityInput(input any) signalEntityOption {
 
 // WithRawSignalEntityInput configures a raw input for a signal entity invocation.
 func WithRawSignalEntityInput(input string) signalEntityOption {
-	return func(opt *signalEntityOptions) error {
+	return func(opt *signalEntityOptions, _ api.DataConverter) error {
 		opt.rawInput = wrapperspb.String(input)
 		return nil
 	}
@@ -300,7 +300,7 @@ func WithRawSignalEntityInput(input string) signalEntityOption {
 
 // WithSignalEntityScheduledTime configures a scheduled time for an entity signal.
 func WithSignalEntityScheduledTime(scheduledTime time.Time) signalEntityOption {
-	return func(opt *signalEntityOptions) error {
+	return func(opt *signalEntityOptions, _ api.DataConverter) error {
 		if scheduledTime.IsZero() {
 			return fmt.Errorf("scheduled entity signal time must not be zero")
 		}

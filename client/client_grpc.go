@@ -30,6 +30,8 @@ type TaskHubGrpcClient struct {
 	logger                       backend.Logger
 	allowLegacyIDReusePolicyWire bool
 	largePayloads                *api.LargePayloadOptions
+	defaultVersion               string
+	converter                    api.DataConverter
 
 	listenerMu sync.Mutex
 	listener   *TaskHubGrpcWorker
@@ -60,6 +62,21 @@ func WithLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcClientOption
 	}
 }
 
+// WithDefaultVersion configures the version used when a top-level orchestration
+// is scheduled without an explicit [api.WithVersion] option.
+func WithDefaultVersion(version string) TaskHubGrpcClientOption {
+	return func(c *TaskHubGrpcClient) {
+		c.defaultVersion = version
+	}
+}
+
+// WithDataConverter configures application payload serialization.
+func WithDataConverter(converter api.DataConverter) TaskHubGrpcClientOption {
+	return func(c *TaskHubGrpcClient) {
+		c.converter = api.NormalizeDataConverter(converter)
+	}
+}
+
 // NewTaskHubGrpcClient creates a client that can be used to manage orchestrations over a gRPC connection.
 // The gRPC connection must be to a task hub worker that understands the Durable Task gRPC protocol.
 func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
@@ -67,6 +84,7 @@ func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, op
 		client:     protos.NewTaskHubSidecarServiceClient(cc),
 		connection: cc,
 		logger:     logger,
+		converter:  api.DefaultDataConverter(),
 	}
 	for _, configure := range opts {
 		configure(c)
@@ -78,12 +96,15 @@ func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, op
 func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orchestrator string, opts ...api.NewOrchestrationOptions) (api.InstanceID, error) {
 	req := &protos.CreateInstanceRequest{Name: orchestrator}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return api.EmptyInstanceID, fmt.Errorf(
 				"failed to configure orchestration request: %w",
 				api.WrapInvalidArgument(err),
 			)
 		}
+	}
+	if req.Version == nil && c.defaultVersion != "" {
+		req.Version = wrapperspb.String(c.defaultVersion)
 	}
 	if err := c.prepareOrchestrationIDReusePolicy(req); err != nil {
 		return api.EmptyInstanceID, err
@@ -208,7 +229,7 @@ func (c *TaskHubGrpcClient) WaitForOrchestrationCompletion(ctx context.Context, 
 func (c *TaskHubGrpcClient) TerminateOrchestration(ctx context.Context, id api.InstanceID, opts ...api.TerminateOptions) error {
 	req := &protos.TerminateRequest{InstanceId: string(id), Recursive: true}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure termination request: %w", api.WrapInvalidArgument(err))
 		}
 	}
@@ -229,7 +250,7 @@ func (c *TaskHubGrpcClient) TerminateOrchestration(ctx context.Context, id api.I
 func (c *TaskHubGrpcClient) RaiseEvent(ctx context.Context, id api.InstanceID, eventName string, opts ...api.RaiseEventOptions) error {
 	req := &protos.RaiseEventRequest{InstanceId: string(id), Name: eventName}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure raise event request: %w", api.WrapInvalidArgument(err))
 		}
 	}
@@ -309,7 +330,7 @@ func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.Entit
 		ParentTraceContext: helpers.TraceContextFromSpan(trace.SpanFromContext(ctx)),
 	}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure signal entity request: %w", api.WrapInvalidArgument(err))
 		}
 	}
@@ -340,7 +361,7 @@ func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID ap
 	if !response.Exists || response.Entity == nil {
 		return nil, api.ErrInstanceNotFound
 	}
-	return entityMetadataFromProto(ctx, c.largePayloads, response.Entity)
+	return entityMetadataFromProto(ctx, c.largePayloads, c.converter, response.Entity)
 }
 
 // QueryEntities queries entities matching the supplied filters.
@@ -373,7 +394,7 @@ func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQ
 		ContinuationToken: response.ContinuationToken.GetValue(),
 	}
 	for _, entity := range response.Entities {
-		metadata, err := entityMetadataFromProto(ctx, c.largePayloads, entity)
+		metadata, err := entityMetadataFromProto(ctx, c.largePayloads, c.converter, entity)
 		if err != nil {
 			return nil, err
 		}
@@ -405,6 +426,7 @@ func (c *TaskHubGrpcClient) CleanEntityStorage(ctx context.Context, request api.
 func entityMetadataFromProto(
 	ctx context.Context,
 	options *api.LargePayloadOptions,
+	converter api.DataConverter,
 	entity *protos.EntityMetadata,
 ) (*api.EntityMetadata, error) {
 	if entity == nil {
@@ -419,6 +441,7 @@ func entityMetadataFromProto(
 		BacklogQueueSize: entity.BacklogQueueSize,
 		LockedBy:         entity.LockedBy.GetValue(),
 		SerializedState:  entity.SerializedState.GetValue(),
+		Converter:        converter,
 	}
 	if entity.LastModifiedTime != nil {
 		metadata.LastModifiedTime = entity.LastModifiedTime.AsTime()
@@ -457,10 +480,13 @@ func (c *TaskHubGrpcClient) makeOrchestrationMetadata(
 	if err := largepayload.TransformOrchestrationState(ctx, c.largePayloads, resp.OrchestrationState); err != nil {
 		return nil, fmt.Errorf("failed to hydrate orchestration metadata: %w", err)
 	}
-	return orchestrationMetadataFromState(resp.OrchestrationState)
+	return orchestrationMetadataFromState(resp.OrchestrationState, c.converter)
 }
 
-func orchestrationMetadataFromState(state *protos.OrchestrationState) (*api.OrchestrationMetadata, error) {
+func orchestrationMetadataFromState(
+	state *protos.OrchestrationState,
+	converter api.DataConverter,
+) (*api.OrchestrationMetadata, error) {
 	if state == nil {
 		return nil, errors.New("orchestration state is nil")
 	}
@@ -476,6 +502,7 @@ func orchestrationMetadataFromState(state *protos.OrchestrationState) (*api.Orch
 		SerializedOutput:       state.Output.GetValue(),
 		FailureDetails:         failure.FromProto(state.FailureDetails),
 		Tags:                   tagcodec.DecodeUserTagsOrPlain(state.Tags),
+		Converter:              converter,
 	}
 	if state.ScheduledStartTimestamp != nil {
 		metadata.ScheduledStartAt = state.ScheduledStartTimestamp.AsTime()

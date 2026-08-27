@@ -55,13 +55,46 @@ Embedded gRPC hosts must opt in to destructive task-hub create/delete RPCs with
 
 ### Worker routing and capabilities
 
-Use `client.WithWorkItemFilters` to advertise and locally enforce accepted
-orchestration/activity names and versions. Local enforcement is a fallback for
-services that ignore the filter request; the embedded sidecar routes work using
-the same filters. An empty orchestration or activity filter list means no
-restriction for that kind. Capability advertisement is explicit:
-history streaming is enabled by default, while scheduled tasks use
-`client.WithScheduledTaskCapability(true)`.
+Use `client.WithTaskVersioning` for `None`, `Strict`, or `CurrentOrOlder`
+acceptance and `Reject` or `Fail` mismatch handling. `VersioningOptions.DefaultVersion`
+is applied to sub-orchestrations. When `Options.Versioning` is set, its default
+also applies to top-level starts made by the DTS client.
+
+Registrations use `AddOrchestratorNVersion` and `AddActivityNVersion`. Exact
+name/version matches win. Unversioned fallback is allowed only for a logical
+name with no versioned registrations. Activities inherit their parent
+orchestration version unless explicitly overridden, including an explicit
+unversioned `""` override. ContinueAsNew can migrate with
+`task.WithContinueAsNewVersion`, including to
+`task.UnversionedTaskVersion`.
+
+The current DTS service accepts numeric versions in
+`Major[.Minor[.Patch]]` form. The Go registry and embedded backends also support
+case-insensitive opaque version strings, but DTS applications should use numeric
+versions such as `"1.0"` and `"2.0"`.
+
+Use `client.WithAutoWorkItemFilters()` to derive filters from the registry, or
+`client.WithWorkItemFilters` for an explicit override. Local enforcement is a
+fallback for services that ignore the filter request; the embedded sidecar
+routes work using the same filters. `CurrentOrOlder` ranges cannot be represented
+by the protocol filter and are therefore enforced by the worker. Service-side
+filters can leave a task pending indefinitely when no worker advertises it,
+whereas unfiltered delivery produces a deterministic task-not-found failure.
+Auto-generated filters reject task kinds with no registrations and validate
+that strict worker versions can resolve every advertised logical name.
+Capability advertisement is explicit: history streaming is enabled by default,
+while scheduled tasks use `client.WithScheduledTaskCapability(true)`.
+
+### Data converters
+
+Set `Options.DataConverter` to configure one `api.DataConverter` for the DTS
+client and worker. The default is `api.JSONDataConverter`. Conversion happens
+before large-payload externalization and after hydration. Converter errors are
+returned; the SDK never retries a payload with JSON. Raw input/output APIs and
+serialized metadata fields bypass conversion. Converter identity is not stored
+by the protocol, so deployments must retain backward decoding compatibility.
+The legacy skip-graceful termination `reason` remains a plain protocol string
+for cross-version service compatibility.
 
 ### Large payloads
 
@@ -108,8 +141,10 @@ cancels them only if the shutdown context expires.
 | Completion tokens and abandon RPCs | Supported |
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
 | Streamed orchestration history | Supported and advertised |
-| Version-aware dispatch | Supported with `client.WithTaskExecutorOptions(task.WithVersioning(...))` |
-| Name/version work-item filters | Supported, advertised, and locally enforced |
+| Version-aware registry dispatch and controlled unversioned fallback | Supported |
+| Default versions, activity inheritance, and ContinueAsNew migration | Supported; backend/service must honor `newVersion` |
+| Name/version work-item filters | Supported, auto-generated or explicit, advertised, and locally enforced |
+| Pluggable application data conversion | Supported with shared client/worker configuration; default is JSON |
 | Scheduled-task capability | Supported; opt in with `client.WithScheduledTaskCapability(true)` |
 | Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |

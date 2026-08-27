@@ -219,17 +219,22 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 	sqlUpdateArgs := make([]any, 0, 10)
 	isCreated := false
 	isCompleted := false
+	newEvents := wi.State.NewEvents()
+	versionBoundary := wi.State.ContinueAsNewVersionChanged()
 
-	for _, e := range wi.State.NewEvents() {
+	for _, e := range newEvents {
 		if es := e.GetExecutionStarted(); es != nil {
 			if isCreated {
 				// TODO: Log warning about duplicate start event
 				continue
 			}
 			isCreated = true
-			sqlSB.WriteString("[CreatedTime] = ?, [Input] = ?, ")
+			sqlSB.WriteString("[CreatedTime] = ?, [Input] = ?, [Name] = ?, [Version] = ?, [ExecutionID] = ?, ")
 			sqlUpdateArgs = append(sqlUpdateArgs, e.Timestamp.AsTime())
 			sqlUpdateArgs = append(sqlUpdateArgs, es.Input.GetValue())
+			sqlUpdateArgs = append(sqlUpdateArgs, es.Name)
+			sqlUpdateArgs = append(sqlUpdateArgs, es.Version.GetValue())
+			sqlUpdateArgs = append(sqlUpdateArgs, es.OrchestrationInstance.ExecutionId.GetValue())
 		} else if ec := e.GetExecutionCompleted(); ec != nil {
 			if isCompleted {
 				// TODO: Log warning about duplicate completion event
@@ -258,8 +263,12 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 	}
 
 	// TODO: Support for stickiness, which would extend the LockExpiration
+	runtimeStatus := helpers.ToRuntimeStatusString(wi.State.RuntimeStatus())
+	if versionBoundary {
+		runtimeStatus = "PENDING"
+	}
 	sqlSB.WriteString("[RuntimeStatus] = ?, [LastUpdatedTime] = ?, [LockExpiration] = NULL WHERE [InstanceID] = ? AND [LockedBy] = ?")
-	sqlUpdateArgs = append(sqlUpdateArgs, helpers.ToRuntimeStatusString(wi.State.RuntimeStatus()), now, string(wi.InstanceID), wi.LockedBy)
+	sqlUpdateArgs = append(sqlUpdateArgs, runtimeStatus, now, string(wi.InstanceID), wi.LockedBy)
 
 	result, err := tx.ExecContext(ctx, sqlSB.String(), sqlUpdateArgs...)
 	if err != nil {
@@ -281,14 +290,15 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 	}
 
 	// Save new history events
-	newHistoryCount := len(wi.State.NewEvents())
+	historyEvents := newEvents
+	newHistoryCount := len(historyEvents)
 	if newHistoryCount > 0 {
 		query := "INSERT INTO History ([InstanceID], [SequenceNumber], [EventPayload]) VALUES (?, ?, ?)" +
 			strings.Repeat(", (?, ?, ?)", newHistoryCount-1)
 
 		args := make([]any, 0, newHistoryCount*3)
 		nextSequenceNumber := len(wi.State.OldEvents())
-		for _, e := range wi.State.NewEvents() {
+		for _, e := range historyEvents {
 			eventPayload, err := backend.MarshalHistoryEvent(e)
 			if err != nil {
 				return err
@@ -301,6 +311,21 @@ func (be *sqliteBackend) CompleteOrchestrationWorkItem(ctx context.Context, wi *
 		_, err = tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to insert into the History table: %w", err)
+		}
+	}
+
+	if versionBoundary {
+		wakeUpPayload, err := backend.MarshalHistoryEvent(helpers.NewOrchestratorStartedEvent())
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			"INSERT INTO NewEvents ([InstanceID], [EventPayload]) VALUES (?, ?)",
+			string(wi.InstanceID),
+			wakeUpPayload,
+		); err != nil {
+			return fmt.Errorf("failed to enqueue version-changing continue-as-new wake-up: %w", err)
 		}
 	}
 

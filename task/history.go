@@ -1,7 +1,6 @@
 package task
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -62,6 +61,7 @@ type HistoryLimitInfo struct {
 	MaxEventsPerTurnExceeded bool
 	UnprocessedEventCount    int
 	SerializedInput          string
+	Converter                api.DataConverter
 }
 
 // GetInput unmarshals the current orchestration input.
@@ -69,7 +69,7 @@ func (info HistoryLimitInfo) GetInput(v any) error {
 	if v == nil || info.SerializedInput == "" {
 		return nil
 	}
-	return json.Unmarshal([]byte(info.SerializedInput), v)
+	return api.NormalizeDataConverter(info.Converter).Deserialize(info.SerializedInput, v)
 }
 
 // HistoryLimitHandler supplies safe input for a ContinueAsNew transition.

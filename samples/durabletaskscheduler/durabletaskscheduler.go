@@ -30,12 +30,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("invalid DTS connection string: %w", err)
 	}
+	options.Versioning = &task.VersioningOptions{
+		DefaultVersion: "1.0",
+		MatchStrategy:  task.VersionMatchNone,
+	}
 
 	registry := task.NewTaskRegistry()
-	if err := registry.AddOrchestratorN("ActivitySequence", activitySequence); err != nil {
+	if err := registry.AddOrchestratorNVersion("ActivitySequence", "1.0", activitySequence); err != nil {
 		return err
 	}
-	if err := registry.AddActivityN("SayHello", sayHello); err != nil {
+	if err := registry.AddActivityNVersion("SayHello", "1.0", sayHello); err != nil {
 		return err
 	}
 
@@ -58,10 +62,7 @@ func run() error {
 		registry,
 		logger,
 		durabletaskclient.WithScheduledTaskCapability(true),
-		durabletaskclient.WithWorkItemFilters(&durabletaskclient.WorkItemFilters{
-			Orchestrations: []durabletaskclient.WorkItemFilter{{Name: "ActivitySequence"}},
-			Activities:     []durabletaskclient.WorkItemFilter{{Name: "SayHello"}},
-		}),
+		durabletaskclient.WithAutoWorkItemFilters(),
 	)
 	if err != nil {
 		return err

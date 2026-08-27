@@ -20,6 +20,7 @@ const (
 // TaskFailedError is returned when an activity or sub-orchestration fails.
 type TaskFailedError struct {
 	TaskName       string
+	TaskVersion    string
 	TaskID         int32
 	FailureDetails *api.FailureDetails
 }
