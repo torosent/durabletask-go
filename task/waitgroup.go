@@ -46,12 +46,15 @@ func (wg *orchestrationWaitGroup) Wait(ctx *OrchestrationContext) {
 	}
 	for wg.count > 0 {
 		c := wg.scheduler.mustCurrent()
-		if c.scope.isCanceled() {
+		ctx.scope.addWaiter(c)
+		if c.scope.isCanceled() || ctx.scope.isCanceled() {
+			ctx.scope.removeWaiter(c)
 			panic(ErrTaskCanceled)
 		}
 		wg.waiters[c] = struct{}{}
 		c.state = coroutineWaiting
 		c.yield()
 		delete(wg.waiters, c)
+		ctx.scope.removeWaiter(c)
 	}
 }

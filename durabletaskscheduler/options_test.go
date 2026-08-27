@@ -2,6 +2,7 @@ package durabletaskscheduler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -127,4 +128,25 @@ func TestOptionsValidateEndpoint(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrepareOptionsAppliesDefaultsAndCopiesTenants(t *testing.T) {
+	options := &Options{
+		EndpointAddress:            "scheduler.example.com",
+		TaskHubName:                "hub",
+		Authentication:             AuthenticationDefaultAzure,
+		AdditionallyAllowedTenants: []string{"tenant"},
+	}
+	prepared, err := prepareOptions(options)
+	require.NoError(t, err)
+	require.Equal(t, DefaultResourceID, prepared.ResourceID)
+	require.Equal(t, 30*time.Second, prepared.HelloTimeout)
+	options.AdditionallyAllowedTenants[0] = "changed"
+	require.Equal(t, []string{"tenant"}, prepared.AdditionallyAllowedTenants)
+}
+
+func TestOptionsValidateRejectsInvalidUserAgent(t *testing.T) {
+	options := NewOptions("scheduler.example.com", "hub")
+	options.UserAgent = "agent\r\ninjected"
+	require.ErrorContains(t, options.Validate(), "user agent")
 }

@@ -8,7 +8,7 @@ import (
 )
 
 func TestOrchestrationIDReusePolicyDefaultsToError(t *testing.T) {
-	policy, err := orchestrationIDReusePolicyFromProto(&protos.OrchestrationIdReusePolicy{})
+	policy, err := orchestrationIDReusePolicyFromProto(&protos.OrchestrationIdReusePolicy{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func TestOrchestrationIDReusePolicyRejectsAmbiguousWireShape(t *testing.T) {
 		ReplaceableStatus: []protos.OrchestrationStatus{
 			protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING,
 		},
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("expected ambiguous policy error")
 	}
@@ -37,11 +37,25 @@ func TestOrchestrationIDReusePolicyPreservesExplicitError(t *testing.T) {
 	if err := protos.SetLegacyOrchestrationIDReuseAction(wirePolicy, int32(api.REUSE_ID_ACTION_ERROR)); err != nil {
 		t.Fatal(err)
 	}
-	policy, err := orchestrationIDReusePolicyFromProto(wirePolicy)
+	policy, err := orchestrationIDReusePolicyFromProto(wirePolicy, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if policy.Action != api.REUSE_ID_ACTION_ERROR {
 		t.Fatalf("action = %v, want ERROR", policy.Action)
+	}
+}
+
+func TestOrchestrationIDReusePolicyAcceptsCurrentWireWhenEnabled(t *testing.T) {
+	policy, err := orchestrationIDReusePolicyFromProto(&protos.OrchestrationIdReusePolicy{
+		ReplaceableStatus: []protos.OrchestrationStatus{
+			protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING,
+		},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Action != api.REUSE_ID_ACTION_TERMINATE {
+		t.Fatalf("action = %v, want TERMINATE", policy.Action)
 	}
 }

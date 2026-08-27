@@ -41,7 +41,10 @@ func WithOrchestrationIdReusePolicy(policy *api.OrchestrationIdReusePolicy) Orch
 	}
 }
 
-func orchestrationIDReusePolicyFromProto(policy *protos.OrchestrationIdReusePolicy) (*api.OrchestrationIdReusePolicy, error) {
+func orchestrationIDReusePolicyFromProto(
+	policy *protos.OrchestrationIdReusePolicy,
+	allowReplaceableStatusWire bool,
+) (*api.OrchestrationIdReusePolicy, error) {
 	if policy == nil {
 		return nil, nil
 	}
@@ -51,6 +54,12 @@ func orchestrationIDReusePolicyFromProto(policy *protos.OrchestrationIdReusePoli
 		return nil, fmt.Errorf("invalid orchestration ID reuse policy: %w", err)
 	}
 	if !hasLegacyAction && len(policy.ReplaceableStatus) > 0 {
+		if allowReplaceableStatusWire {
+			return &api.OrchestrationIdReusePolicy{
+				Action:          api.REUSE_ID_ACTION_TERMINATE,
+				OperationStatus: append([]api.OrchestrationStatus(nil), policy.ReplaceableStatus...),
+			}, nil
+		}
 		return nil, fmt.Errorf(
 			"ambiguous orchestration ID reuse policy: replaceable statuses require an explicit legacy action for the local backend",
 		)

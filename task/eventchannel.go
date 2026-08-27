@@ -14,7 +14,8 @@ type bufferedEvent struct {
 }
 
 // EventChannel receives a named external event repeatedly while preserving
-// durable event order.
+// durable event order. Use ReceiveErr or TryReceiveErr when payload errors
+// should be handled by the orchestrator.
 type EventChannel[T any] struct {
 	ctx  *OrchestrationContext
 	name string
@@ -46,31 +47,51 @@ func NewEventChannel[T any](ctx *OrchestrationContext, name string) *EventChanne
 
 // Receive waits for and consumes the next event value.
 func (c *EventChannel[T]) Receive(ctx *OrchestrationContext) T {
-	if ctx.engineContext() != c.ctx {
-		panic("event channel used with a different orchestration context")
-	}
-	if value, ok := c.TryReceive(); ok {
-		return value
-	}
-	var value T
-	if err := ctx.WaitForSingleEvent(c.name, -1).Await(&value); err != nil {
+	value, err := c.ReceiveErr(ctx)
+	if err != nil {
 		panic(err)
 	}
 	return value
 }
 
+// ReceiveErr waits for and consumes the next event value, returning payload
+// decoding and cancellation errors to the orchestrator.
+func (c *EventChannel[T]) ReceiveErr(ctx *OrchestrationContext) (T, error) {
+	if ctx.engineContext() != c.ctx {
+		panic("event channel used with a different orchestration context")
+	}
+	if value, ok, err := c.TryReceiveErr(); ok || err != nil {
+		return value, err
+	}
+	var value T
+	if err := ctx.WaitForSingleEvent(c.name, -1).Await(&value); err != nil {
+		return value, err
+	}
+	return value, nil
+}
+
 // TryReceive consumes a buffered event without blocking.
 func (c *EventChannel[T]) TryReceive() (T, bool) {
+	value, ok, err := c.TryReceiveErr()
+	if err != nil {
+		panic(err)
+	}
+	return value, ok
+}
+
+// TryReceiveErr consumes a buffered event without blocking and returns payload
+// decoding errors.
+func (c *EventChannel[T]) TryReceiveErr() (T, bool, error) {
 	var value T
 	buffered, ok := c.ctx.takeBufferedEvent(c.key)
 	if !ok {
-		return value, false
+		return value, false, nil
 	}
 	raw := []byte(buffered.event.GetEventRaised().GetInput().GetValue())
 	if err := unmarshalData(raw, &value); err != nil {
-		panic(fmt.Errorf("failed to decode event %q as %s: %w", c.name, reflect.TypeOf(value), err))
+		return value, true, fmt.Errorf("failed to decode event %q as %s: %w", c.name, reflect.TypeOf(value), err)
 	}
-	return value, true
+	return value, true, nil
 }
 
 func (c *EventChannel[T]) peek() (*bufferedEvent, bool) {

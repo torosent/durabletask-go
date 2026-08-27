@@ -108,9 +108,7 @@ func (s *coroutineScheduler) runNext() {
 		if c.state == coroutineRunning {
 			c.state = coroutineWaiting
 		}
-	case coroutineFinished:
-		c.state = coroutineCompleted
-	case coroutineCanceled:
+	case coroutineFinished, coroutineCanceled:
 		c.state = coroutineCompleted
 	case coroutinePanicked:
 		c.state = coroutineCompleted

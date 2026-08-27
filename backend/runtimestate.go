@@ -226,7 +226,16 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				nil,
 				createSO.Version,
 			)
-			startEvent.GetExecutionStarted().Tags = contextprop.Clone(createSO.Tags)
+			_, fields := contextprop.Decode(createSO.Tags)
+			startEvent.GetExecutionStarted().Tags = contextprop.Encode(
+				api.OrchestrationContextInfo{
+					InstanceID:       api.InstanceID(createSO.InstanceId),
+					Name:             createSO.Name,
+					Version:          createSO.Version.GetValue(),
+					ParentInstanceID: s.instanceID,
+				},
+				fields,
+			)
 			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: startEvent, TargetInstanceID: createSO.InstanceId})
 		} else if sendEvent := action.GetSendEvent(); sendEvent != nil {
 			sentEvent := helpers.NewSendEventEvent(action.Id, sendEvent.Instance.InstanceId, sendEvent.Name, sendEvent.Data)

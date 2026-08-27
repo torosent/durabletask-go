@@ -1,12 +1,16 @@
 package contextprop
 
-import "github.com/microsoft/durabletask-go/api"
+import (
+	"maps"
+
+	"github.com/microsoft/durabletask-go/api"
+)
 
 const (
-	instanceIDTag       = "__durabletask.context.instance_id"
-	nameTag             = "__durabletask.context.orchestration_name"
-	versionTag          = "__durabletask.context.orchestration_version"
-	parentInstanceIDTag = "__durabletask.context.parent_instance_id"
+	instanceIDTag       = api.ReservedContextFieldPrefix + "instance_id"
+	nameTag             = api.ReservedContextFieldPrefix + "orchestration_name"
+	versionTag          = api.ReservedContextFieldPrefix + "orchestration_version"
+	parentInstanceIDTag = api.ReservedContextFieldPrefix + "parent_instance_id"
 )
 
 // Encode returns a new tag map containing immutable fields and orchestration identity.
@@ -15,18 +19,10 @@ func Encode(info api.OrchestrationContextInfo, fields api.ContextFields) map[str
 	if tags == nil {
 		tags = make(map[string]string, 4)
 	}
-	if info.InstanceID != "" {
-		tags[instanceIDTag] = string(info.InstanceID)
-	}
-	if info.Name != "" {
-		tags[nameTag] = info.Name
-	}
-	if info.Version != "" {
-		tags[versionTag] = info.Version
-	}
-	if info.ParentInstanceID != "" {
-		tags[parentInstanceIDTag] = string(info.ParentInstanceID)
-	}
+	tags[instanceIDTag] = string(info.InstanceID)
+	tags[nameTag] = info.Name
+	tags[versionTag] = info.Version
+	tags[parentInstanceIDTag] = string(info.ParentInstanceID)
 	return tags
 }
 
@@ -53,14 +49,12 @@ func Decode(tags map[string]string) (api.OrchestrationContextInfo, api.ContextFi
 	return info, fields
 }
 
-// Clone returns a defensive copy of tags.
+// Clone returns a defensive copy of tags, or nil when there is nothing to copy.
 func Clone[T ~map[string]string](tags T) map[string]string {
 	if len(tags) == 0 {
 		return nil
 	}
 	copyOfTags := make(map[string]string, len(tags))
-	for key, value := range tags {
-		copyOfTags[key] = value
-	}
+	maps.Copy(copyOfTags, tags)
 	return copyOfTags
 }

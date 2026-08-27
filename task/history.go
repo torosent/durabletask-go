@@ -52,6 +52,7 @@ type HistoryLimitInfo struct {
 	MaxEventsPerTurn         int
 	MaxHistoryEventsExceeded bool
 	MaxEventsPerTurnExceeded bool
+	UnprocessedEventCount    int
 	SerializedInput          string
 }
 

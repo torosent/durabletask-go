@@ -101,12 +101,10 @@ func (be *sqliteBackend) CreateTaskHub(ctx context.Context) error {
 }
 
 func (be *sqliteBackend) DeleteTaskHub(ctx context.Context) error {
-	if be.db == nil {
-		return nil
-	}
-
-	if err := be.Stop(ctx); err != nil {
-		return fmt.Errorf("failed to stop the backend: %w", err)
+	if be.db != nil {
+		if err := be.Stop(ctx); err != nil {
+			return fmt.Errorf("failed to stop the backend: %w", err)
+		}
 	}
 
 	if be.options.FilePath == "" {
@@ -925,10 +923,12 @@ func (be *sqliteBackend) GetOrchestrationBacklog(ctx context.Context) (backend.B
 	now := time.Now().UTC()
 	row := be.db.QueryRowContext(
 		ctx,
-		`SELECT COUNT(DISTINCT [InstanceID]),
-			COALESCE((julianday(?) - julianday(MIN([Timestamp]))) * 86400.0, 0)
-		FROM NewEvents
-		WHERE [LockedBy] IS NULL AND ([VisibleTime] IS NULL OR [VisibleTime] <= ?)`,
+		`SELECT COUNT(DISTINCT E.[InstanceID]),
+			COALESCE((julianday('now') - julianday(MIN(E.[Timestamp]))) * 86400.0, 0)
+		FROM NewEvents E
+		INNER JOIN Instances I ON I.[InstanceID] = E.[InstanceID]
+		WHERE (I.[LockExpiration] IS NULL OR I.[LockExpiration] < ?)
+			AND (E.[VisibleTime] IS NULL OR E.[VisibleTime] <= ?)`,
 		now,
 		now,
 	)
@@ -943,10 +943,9 @@ func (be *sqliteBackend) GetActivityBacklog(ctx context.Context) (backend.Backlo
 	row := be.db.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*),
-			COALESCE((julianday(?) - julianday(MIN([Timestamp]))) * 86400.0, 0)
+			COALESCE((julianday('now') - julianday(MIN([Timestamp]))) * 86400.0, 0)
 		FROM NewTasks
 		WHERE [LockExpiration] IS NULL OR [LockExpiration] < ?`,
-		now,
 		now,
 	)
 	return scanSqliteBacklog(row, backend.WorkItemKindActivity)
@@ -1009,9 +1008,15 @@ func (be *sqliteBackend) AbandonActivityWorkItem(ctx context.Context, wi *backen
 		return err
 	}
 
+	var lockExpiration *time.Time
+	if delay := wi.GetAbandonDelay(); delay > 0 {
+		visibleAt := time.Now().UTC().Add(delay)
+		lockExpiration = &visibleAt
+	}
 	dbResult, err := be.db.ExecContext(
 		ctx,
-		"UPDATE NewTasks SET [LockedBy] = NULL, [LockExpiration] = NULL WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+		"UPDATE NewTasks SET [LockedBy] = NULL, [LockExpiration] = ? WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+		lockExpiration,
 		wi.SequenceNumber,
 		wi.LockedBy,
 	)

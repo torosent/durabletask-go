@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync/atomic"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -49,16 +48,7 @@ func (w *TaskHubGrpcWorker) consumeConnection(run *grpcWorkerRun, connection *gr
 }
 
 func (w *TaskHubGrpcWorker) receiveWorkItem(connection *grpcWorkerConnection) (*protos.WorkItem, error) {
-	var timedOut atomic.Bool
-	timer := time.AfterFunc(w.options.silentDisconnectTimeout, func() {
-		timedOut.Store(true)
-		connection.cancelStream()
-	})
-	workItem, err := connection.stream.Recv()
-	timer.Stop()
-	if timedOut.Load() {
-		return nil, errSilentDisconnect
-	}
+	workItem, err := recvBeforeSilenceTimeout(connection.stream.Recv, connection.cancelStream, w.options.silentDisconnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -68,30 +58,34 @@ func (w *TaskHubGrpcWorker) receiveWorkItem(connection *grpcWorkerConnection) (*
 	return workItem, nil
 }
 
+// recvBeforeSilenceTimeout receives one message from a server stream, canceling
+// the stream and reporting errSilentDisconnect if nothing arrives before the
+// configured silent disconnect timeout.
+func recvBeforeSilenceTimeout[T any](recv func() (T, error), cancelStream context.CancelFunc, timeout time.Duration) (T, error) {
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() {
+		cancelStream()
+		close(timedOut)
+	})
+	message, err := recv()
+	if !timer.Stop() {
+		<-timedOut
+		var zero T
+		return zero, errSilentDisconnect
+	}
+	return message, err
+}
+
 func (w *TaskHubGrpcWorker) dispatchOrchestration(
 	run *grpcWorkerRun,
 	connection *grpcWorkerConnection,
 	completionToken string,
 	request *protos.OrchestratorRequest,
 ) error {
-	select {
-	case run.orchestrationSlots <- struct{}{}:
-	case <-run.intakeCtx.Done():
-		w.abandonOrchestration(run.processingCtx, connection.client, completionToken)
-		return run.intakeCtx.Err()
-	}
-
-	run.pending.Add(1)
-	connection.pending.Add(1)
-	go func() {
-		defer func() {
-			<-run.orchestrationSlots
-			connection.pending.Done()
-			run.pending.Done()
-		}()
-		w.processOrchestration(run.processingCtx, connection.client, completionToken, request)
-	}()
-	return nil
+	return w.dispatch(run, connection, run.orchestrationSlots,
+		func(ctx context.Context) { w.abandonOrchestration(ctx, connection.client, completionToken) },
+		func(ctx context.Context) { w.processOrchestration(ctx, connection.client, completionToken, request) },
+	)
 }
 
 func (w *TaskHubGrpcWorker) dispatchActivity(
@@ -100,10 +94,26 @@ func (w *TaskHubGrpcWorker) dispatchActivity(
 	completionToken string,
 	request *protos.ActivityRequest,
 ) error {
+	return w.dispatch(run, connection, run.activitySlots,
+		func(ctx context.Context) { w.abandonActivity(ctx, connection.client, completionToken) },
+		func(ctx context.Context) { w.processActivity(ctx, connection.client, completionToken, request) },
+	)
+}
+
+// dispatch reserves a concurrency slot and runs process in the background under
+// the processing context, so a graceful drain can still complete in-flight work.
+// If intake is canceled before a slot is free, the work item is abandoned instead.
+func (w *TaskHubGrpcWorker) dispatch(
+	run *grpcWorkerRun,
+	connection *grpcWorkerConnection,
+	slots chan struct{},
+	abandon func(context.Context),
+	process func(context.Context),
+) error {
 	select {
-	case run.activitySlots <- struct{}{}:
+	case slots <- struct{}{}:
 	case <-run.intakeCtx.Done():
-		w.abandonActivity(run.processingCtx, connection.client, completionToken)
+		abandon(run.processingCtx)
 		return run.intakeCtx.Err()
 	}
 
@@ -111,11 +121,11 @@ func (w *TaskHubGrpcWorker) dispatchActivity(
 	connection.pending.Add(1)
 	go func() {
 		defer func() {
-			<-run.activitySlots
+			<-slots
 			connection.pending.Done()
 			run.pending.Done()
 		}()
-		w.processActivity(run.processingCtx, connection.client, completionToken, request)
+		process(run.processingCtx)
 	}()
 	return nil
 }
@@ -215,16 +225,7 @@ func (w *TaskHubGrpcWorker) streamHistory(
 
 	var history []*protos.HistoryEvent
 	for {
-		var timedOut atomic.Bool
-		timer := time.AfterFunc(w.options.silentDisconnectTimeout, func() {
-			timedOut.Store(true)
-			cancelHistory()
-		})
-		chunk, recvErr := stream.Recv()
-		timer.Stop()
-		if timedOut.Load() {
-			return nil, errSilentDisconnect
-		}
+		chunk, recvErr := recvBeforeSilenceTimeout(stream.Recv, cancelHistory, w.options.silentDisconnectTimeout)
 		if errors.Is(recvErr, io.EOF) {
 			return history, nil
 		}

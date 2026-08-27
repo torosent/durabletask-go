@@ -1,6 +1,12 @@
 package api
 
-import "context"
+import (
+	"context"
+	"maps"
+)
+
+// ReservedContextFieldPrefix is reserved for Durable Task runtime identity tags.
+const ReservedContextFieldPrefix = "__durabletask.context."
 
 // ContextFields are immutable caller-supplied values propagated into task contexts.
 type ContextFields map[string]string
@@ -47,7 +53,8 @@ func ActivityContextInfoFromContext(ctx context.Context) (ActivityContextInfo, b
 	return info, ok
 }
 
-// ContextWithFields returns a context containing a defensive copy of fields.
+// ContextWithFields merges fields with any fields already in ctx, with fields
+// taking precedence on conflicts. The stored map is a defensive copy.
 func ContextWithFields(ctx context.Context, fields ContextFields) context.Context {
 	if len(fields) == 0 {
 		return ctx
@@ -56,9 +63,7 @@ func ContextWithFields(ctx context.Context, fields ContextFields) context.Contex
 	if merged == nil {
 		merged = make(ContextFields, len(fields))
 	}
-	for key, value := range fields {
-		merged[key] = value
-	}
+	maps.Copy(merged, fields)
 	return context.WithValue(ctx, contextFieldsKey{}, merged)
 }
 
@@ -68,9 +73,5 @@ func ContextFieldsFromContext(ctx context.Context) ContextFields {
 	if !ok || len(fields) == 0 {
 		return nil
 	}
-	copyOfFields := make(ContextFields, len(fields))
-	for key, value := range fields {
-		copyOfFields[key] = value
-	}
-	return copyOfFields
+	return maps.Clone(fields)
 }

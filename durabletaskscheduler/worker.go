@@ -28,7 +28,7 @@ func NewWorker(
 	}
 
 	factory := func(ctx context.Context) (grpc.ClientConnInterface, io.Closer, error) {
-		connection, err := connect(ctx, &prepared, workerRole, workerID)
+		connection, err := connect(&prepared, workerRole, workerID)
 		if err != nil {
 			return nil, nil, err
 		}

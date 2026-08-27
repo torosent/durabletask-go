@@ -287,3 +287,28 @@ func completionResult(t *testing.T, response *protos.OrchestratorResponse) strin
 	t.Helper()
 	return completionAction(t, response).GetResult().GetValue()
 }
+
+func TestEventChannelReceiveErrReturnsPayloadError(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("event-error", func(ctx *OrchestrationContext) (any, error) {
+		_, err := NewEventChannel[int](ctx, "value").ReceiveErr(ctx)
+		return err != nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("event-error-instance")
+	result := executeOrchestrationTurn(
+		t,
+		registry,
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent("event-error", string(instanceID), nil, nil, nil, nil),
+			helpers.NewEventRaisedEvent("value", wrapperspb.String(`"not-an-int"`)),
+		},
+	)
+	if got, want := completionResult(t, result), "true"; got != want {
+		t.Fatalf("result = %s, want %s", got, want)
+	}
+}

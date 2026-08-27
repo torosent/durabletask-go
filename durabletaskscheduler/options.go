@@ -154,7 +154,7 @@ func parseAuthenticationType(value string) (AuthenticationType, error) {
 	switch {
 	case strings.EqualFold(value, "VisualStudio"), strings.EqualFold(value, "VisualStudioCode"):
 		return "", fmt.Errorf(
-			"Authentication %q has no Azure Identity for Go equivalent; provide an explicit TokenCredential",
+			"authentication %q has no Azure Identity for Go equivalent; provide an explicit TokenCredential",
 			value,
 		)
 	default:
@@ -178,18 +178,22 @@ func (o *Options) Validate() error {
 	if o.WorkerID != strings.TrimSpace(o.WorkerID) || strings.ContainsAny(o.WorkerID, "\r\n") {
 		return fmt.Errorf("DTS worker ID cannot contain leading/trailing whitespace or newlines")
 	}
-	if o.ResourceID == "" {
-		return fmt.Errorf("DTS resource ID is required")
+	if o.UserAgent != strings.TrimSpace(o.UserAgent) || strings.ContainsAny(o.UserAgent, "\r\n") {
+		return fmt.Errorf("DTS user agent cannot contain leading/trailing whitespace or newlines")
 	}
-	if o.HelloTimeout <= 0 {
-		return fmt.Errorf("DTS Hello timeout must be greater than zero")
+	if o.HelloTimeout < 0 {
+		return fmt.Errorf("DTS Hello timeout cannot be negative")
 	}
 
 	endpoint, err := normalizeEndpoint(o.EndpointAddress)
 	if err != nil {
 		return err
 	}
-	switch o.Authentication {
+	authentication := o.Authentication
+	if authentication == "" {
+		authentication = AuthenticationDefaultAzure
+	}
+	switch authentication {
 	case AuthenticationNone:
 		if o.Credential != nil {
 			return fmt.Errorf("DTS credential must be nil when Authentication is None")
@@ -218,7 +222,7 @@ func (o *Options) Validate() error {
 		if !o.AllowInsecureConnection {
 			return fmt.Errorf("plaintext DTS endpoint requires AllowInsecureConnection")
 		}
-		if o.Authentication != AuthenticationNone {
+		if authentication != AuthenticationNone {
 			return fmt.Errorf("plaintext DTS endpoint cannot be used with credentials")
 		}
 	}

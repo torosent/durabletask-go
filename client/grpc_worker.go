@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -411,7 +412,7 @@ func (w *TaskHubGrpcWorker) execute(run *grpcWorkerRun, connection *grpcWorkerCo
 }
 
 func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerConnection) error {
-	reconnectBackoff := newWorkerReconnectBackoff(w.options.reconnectBaseDelay, w.options.reconnectMaxDelay)
+	reconnectBackoff := newInfiniteBackoff(w.options.reconnectBaseDelay, w.options.reconnectMaxDelay)
 	for {
 		observedMessage, err := w.consumeConnection(run, connection)
 		w.retireConnection(run, connection)
@@ -506,11 +507,18 @@ func (w *TaskHubGrpcWorker) retireConnection(run *grpcWorkerRun, connection *grp
 }
 
 func isTransientWorkerError(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, errSilentDisconnect) {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, errSilentDisconnect) {
 		return true
 	}
 	grpcStatus, ok := status.FromError(err)
 	if !ok {
+		return false
+	}
+	if grpcStatus.Code() == codes.Canceled &&
+		strings.Contains(grpcStatus.Message(), "client connection is closing") {
 		return false
 	}
 	return isTransientWorkerGRPCCode(grpcStatus.Code())
@@ -543,19 +551,17 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func newWorkerReconnectBackoff(baseDelay, maxDelay time.Duration) *backoff.ExponentialBackOff {
+// newInfiniteBackoff returns an exponential backoff that never gives up, so the
+// caller decides when to stop retrying.
+func newInfiniteBackoff(initialInterval, maxInterval time.Duration) *backoff.ExponentialBackOff {
 	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = baseDelay
-	b.MaxInterval = maxDelay
+	b.InitialInterval = initialInterval
+	b.MaxInterval = maxInterval
 	b.MaxElapsedTime = 0
 	b.Reset()
 	return b
 }
 
 func newInfiniteRetries() *backoff.ExponentialBackOff {
-	b := backoff.NewExponentialBackOff()
-	b.MaxInterval = 15 * time.Second
-	b.MaxElapsedTime = 0
-	b.Reset()
-	return b
+	return newInfiniteBackoff(backoff.DefaultInitialInterval, 15*time.Second)
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -162,6 +163,9 @@ func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
 		req.Tags = make(map[string]string, len(fields))
 		for key, value := range fields {
+			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
+				return fmt.Errorf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
+			}
 			req.Tags[key] = value
 		}
 		return nil

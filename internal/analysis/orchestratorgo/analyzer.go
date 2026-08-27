@@ -1,5 +1,6 @@
-// Package orchestratorgo defines an analyzer that rejects raw goroutines in
-// orchestrators registered with task.TaskRegistry.
+// Package orchestratorgo rejects raw goroutines in orchestrators registered
+// with task.TaskRegistry in the same package. It does not perform whole-program
+// determinism analysis or inspect helper implementations in other packages.
 package orchestratorgo
 
 import (

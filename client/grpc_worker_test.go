@@ -610,4 +610,7 @@ func TestTransientWorkerGRPCCodes(t *testing.T) {
 	} {
 		require.False(t, isTransientWorkerGRPCCode(code), code.String())
 	}
+	require.False(t, isTransientWorkerError(
+		status.Error(codes.Canceled, "grpc: the client connection is closing"),
+	))
 }

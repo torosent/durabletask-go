@@ -15,6 +15,13 @@ type WorkItem interface {
 	IsWorkItem() bool
 }
 
+// WorkItemAbandonDelayError optionally asks local workers to defer redelivery
+// after a processing error.
+type WorkItemAbandonDelayError interface {
+	error
+	WorkItemAbandonDelay() time.Duration
+}
+
 type OrchestrationWorkItem struct {
 	InstanceID api.InstanceID
 	NewEvents  []*HistoryEvent
@@ -54,6 +61,7 @@ type ActivityWorkItem struct {
 	LockedBy       string
 	RetryCount     int32
 	EnqueuedAt     time.Time
+	AbandonDelay   time.Duration
 	Properties     map[string]any
 }
 
@@ -67,4 +75,11 @@ func (wi ActivityWorkItem) String() string {
 // IsWorkItem implements core.WorkItem
 func (wi ActivityWorkItem) IsWorkItem() bool {
 	return true
+}
+
+func (wi *ActivityWorkItem) GetAbandonDelay() time.Duration {
+	if wi == nil {
+		return 0
+	}
+	return wi.AbandonDelay
 }

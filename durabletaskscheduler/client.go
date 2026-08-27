@@ -2,8 +2,10 @@ package durabletaskscheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
@@ -28,7 +30,7 @@ func NewClient(ctx context.Context, options *Options, logger backend.Logger) (*C
 	if err != nil {
 		return nil, err
 	}
-	connection, err := connect(ctx, &prepared, clientRole, "")
+	connection, err := connect(&prepared, clientRole, "")
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +53,10 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closeOnce.Do(func() {
-		c.closeErr = c.connection.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stopErr := c.StopWorkItemListener(shutdownCtx)
+		cancel()
+		c.closeErr = errors.Join(stopErr, c.connection.Close())
 	})
 	return c.closeErr
 }
