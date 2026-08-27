@@ -18,18 +18,28 @@ const DefaultResourceID = "https://durabletask.io"
 type AuthenticationType string
 
 const (
-	AuthenticationNone            AuthenticationType = "None"
-	AuthenticationDefaultAzure    AuthenticationType = "DefaultAzure"
-	AuthenticationTokenCredential AuthenticationType = "TokenCredential"
+	AuthenticationNone               AuthenticationType = "None"
+	AuthenticationDefaultAzure       AuthenticationType = "DefaultAzure"
+	AuthenticationManagedIdentity    AuthenticationType = "ManagedIdentity"
+	AuthenticationWorkloadIdentity   AuthenticationType = "WorkloadIdentity"
+	AuthenticationEnvironment        AuthenticationType = "Environment"
+	AuthenticationAzureCLI           AuthenticationType = "AzureCLI"
+	AuthenticationAzurePowerShell    AuthenticationType = "AzurePowerShell"
+	AuthenticationInteractiveBrowser AuthenticationType = "InteractiveBrowser"
+	AuthenticationTokenCredential    AuthenticationType = "TokenCredential"
 )
 
 // Options configures connections to a Durable Task Scheduler endpoint.
 type Options struct {
-	EndpointAddress string
-	TaskHubName     string
-	Authentication  AuthenticationType
-	Credential      azcore.TokenCredential
-	ResourceID      string
+	EndpointAddress            string
+	TaskHubName                string
+	Authentication             AuthenticationType
+	Credential                 azcore.TokenCredential
+	ResourceID                 string
+	ClientID                   string
+	TenantID                   string
+	TokenFilePath              string
+	AdditionallyAllowedTenants []string
 
 	// AllowInsecureConnection must be true to use an http:// endpoint. Plaintext
 	// connections are supported only when Authentication is None.
@@ -66,7 +76,7 @@ func NewOptionsWithCredential(endpointAddress, taskHubName string, credential az
 
 // NewOptionsFromConnectionString parses the DTS connection-string form:
 //
-//	Endpoint=<url>;TaskHub=<name>;Authentication=DefaultAzure|None
+//	Endpoint=<url>;TaskHub=<name>;Authentication=<type>
 func NewOptionsFromConnectionString(connectionString string) (*Options, error) {
 	values := make(map[string]string)
 	for _, segment := range strings.Split(connectionString, ";") {
@@ -81,7 +91,7 @@ func NewOptionsFromConnectionString(connectionString string) (*Options, error) {
 		key := strings.ToLower(strings.TrimSpace(keyValue[0]))
 		value := strings.TrimSpace(keyValue[1])
 		switch key {
-		case "endpoint", "taskhub", "authentication":
+		case "endpoint", "taskhub", "authentication", "clientid", "tenantid", "tokenfilepath", "additionallyallowedtenants":
 			values[key] = value
 		default:
 			return nil, fmt.Errorf("unsupported connection string key %q", keyValue[0])
@@ -102,19 +112,54 @@ func NewOptionsFromConnectionString(connectionString string) (*Options, error) {
 	}
 
 	options := NewOptions(endpoint, taskHub)
-	switch {
-	case strings.EqualFold(authentication, string(AuthenticationDefaultAzure)):
-		options.Authentication = AuthenticationDefaultAzure
-	case strings.EqualFold(authentication, string(AuthenticationNone)):
-		options.Authentication = AuthenticationNone
+	parsedAuthentication, err := parseAuthenticationType(authentication)
+	if err != nil {
+		return nil, err
+	}
+	options.Authentication = parsedAuthentication
+	options.ClientID = values["clientid"]
+	options.TenantID = values["tenantid"]
+	options.TokenFilePath = values["tokenfilepath"]
+	if tenants := values["additionallyallowedtenants"]; tenants != "" {
+		for _, tenant := range strings.Split(tenants, ",") {
+			if tenant = strings.TrimSpace(tenant); tenant != "" {
+				options.AdditionallyAllowedTenants = append(options.AdditionallyAllowedTenants, tenant)
+			}
+		}
+	}
+	if options.Authentication == AuthenticationNone {
 		options.AllowInsecureConnection = true
-	default:
-		return nil, fmt.Errorf("unsupported Authentication value %q", authentication)
 	}
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
 	return options, nil
+}
+
+func parseAuthenticationType(value string) (AuthenticationType, error) {
+	for _, authentication := range []AuthenticationType{
+		AuthenticationDefaultAzure,
+		AuthenticationManagedIdentity,
+		AuthenticationWorkloadIdentity,
+		AuthenticationEnvironment,
+		AuthenticationAzureCLI,
+		AuthenticationAzurePowerShell,
+		AuthenticationInteractiveBrowser,
+		AuthenticationNone,
+	} {
+		if strings.EqualFold(value, string(authentication)) {
+			return authentication, nil
+		}
+	}
+	switch {
+	case strings.EqualFold(value, "VisualStudio"), strings.EqualFold(value, "VisualStudioCode"):
+		return "", fmt.Errorf(
+			"Authentication %q has no Azure Identity for Go equivalent; provide an explicit TokenCredential",
+			value,
+		)
+	default:
+		return "", fmt.Errorf("unsupported Authentication value %q", value)
+	}
 }
 
 func (o *Options) Validate() error {
@@ -152,6 +197,15 @@ func (o *Options) Validate() error {
 	case AuthenticationDefaultAzure:
 		if o.Credential != nil {
 			return fmt.Errorf("use Authentication TokenCredential for an explicit DTS credential")
+		}
+	case AuthenticationManagedIdentity,
+		AuthenticationWorkloadIdentity,
+		AuthenticationEnvironment,
+		AuthenticationAzureCLI,
+		AuthenticationAzurePowerShell,
+		AuthenticationInteractiveBrowser:
+		if o.Credential != nil {
+			return fmt.Errorf("DTS credential must be nil when Authentication is %s", o.Authentication)
 		}
 	case AuthenticationTokenCredential:
 		if o.Credential == nil {

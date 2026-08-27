@@ -8,11 +8,15 @@ import (
 
 func TestNewOptionsFromConnectionString(t *testing.T) {
 	tests := []struct {
-		name       string
-		value      string
-		wantAuth   AuthenticationType
-		wantUnsafe bool
-		wantErr    string
+		name          string
+		value         string
+		wantAuth      AuthenticationType
+		wantUnsafe    bool
+		wantClientID  string
+		wantTenantID  string
+		wantTokenFile string
+		wantTenants   []string
+		wantErr       string
 	}{
 		{
 			name:     "default azure",
@@ -24,6 +28,32 @@ func TestNewOptionsFromConnectionString(t *testing.T) {
 			value:      "Endpoint=http://127.0.0.1:8080;TaskHub=default;Authentication=None",
 			wantAuth:   AuthenticationNone,
 			wantUnsafe: true,
+		},
+		{
+			name:         "managed identity",
+			value:        "Endpoint=scheduler.example.com;TaskHub=hub;Authentication=ManagedIdentity;ClientID=client",
+			wantAuth:     AuthenticationManagedIdentity,
+			wantClientID: "client",
+		},
+		{
+			name:          "workload identity",
+			value:         "Endpoint=scheduler.example.com;TaskHub=hub;Authentication=WorkloadIdentity;ClientID=client;TenantID=tenant;TokenFilePath=/token;AdditionallyAllowedTenants=one, two",
+			wantAuth:      AuthenticationWorkloadIdentity,
+			wantClientID:  "client",
+			wantTenantID:  "tenant",
+			wantTokenFile: "/token",
+			wantTenants:   []string{"one", "two"},
+		},
+		{
+			name:         "Azure CLI",
+			value:        "Endpoint=scheduler.example.com;TaskHub=hub;Authentication=AzureCLI;TenantID=tenant",
+			wantAuth:     AuthenticationAzureCLI,
+			wantTenantID: "tenant",
+		},
+		{
+			name:    "unsupported Visual Studio",
+			value:   "Endpoint=scheduler.example.com;TaskHub=hub;Authentication=VisualStudio",
+			wantErr: "no Azure Identity for Go equivalent",
 		},
 		{
 			name:    "missing authentication",
@@ -53,6 +83,10 @@ func TestNewOptionsFromConnectionString(t *testing.T) {
 			require.Equal(t, tt.wantAuth, options.Authentication)
 			require.Equal(t, tt.wantUnsafe, options.AllowInsecureConnection)
 			require.Equal(t, DefaultResourceID, options.ResourceID)
+			require.Equal(t, tt.wantClientID, options.ClientID)
+			require.Equal(t, tt.wantTenantID, options.TenantID)
+			require.Equal(t, tt.wantTokenFile, options.TokenFilePath)
+			require.Equal(t, tt.wantTenants, options.AdditionallyAllowedTenants)
 		})
 	}
 }

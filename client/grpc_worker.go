@@ -517,6 +517,7 @@ func isTransientWorkerGRPCCode(code codes.Code) bool {
 	switch code {
 	case codes.Canceled,
 		codes.DeadlineExceeded,
+		codes.NotFound,
 		codes.ResourceExhausted,
 		codes.Aborted,
 		codes.Internal,
