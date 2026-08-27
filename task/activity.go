@@ -6,6 +6,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -37,13 +38,22 @@ type RetryPolicy struct {
 	MaxRetryInterval time.Duration
 	// Total timeout across all the retries performed
 	RetryTimeout time.Duration
-	// Optional function to control if retries should proceed
-	Handle func(error) bool
+	// Optional deterministic function that controls whether retries should proceed.
+	Handle func(RetryContext) bool
+}
+
+// RetryContext contains durable inputs for a retry decision.
+// Retry handlers execute during replay and must not perform I/O or depend on wall-clock time.
+type RetryContext struct {
+	LastAttemptNumber int
+	// LastFailure is never nil while Handle is running and must be treated as read-only.
+	LastFailure    *api.FailureDetails
+	TotalRetryTime time.Duration
 }
 
 func (policy *RetryPolicy) Validate() error {
 	if policy.InitialRetryInterval <= 0 {
-		return fmt.Errorf("InitialRetryInterval must be greater than 0")
+		return fmt.Errorf("%w: InitialRetryInterval must be greater than 0", api.ErrInvalidArgument)
 	}
 	if policy.MaxAttempts <= 0 {
 		// setting 1 max attempt is equivalent to not retrying
@@ -59,7 +69,7 @@ func (policy *RetryPolicy) Validate() error {
 		policy.RetryTimeout = math.MaxInt64
 	}
 	if policy.Handle == nil {
-		policy.Handle = func(err error) bool {
+		policy.Handle = func(RetryContext) bool {
 			return true
 		}
 	}

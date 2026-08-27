@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/microsoft/durabletask-go/api"
 )
 
 // VersionMatchStrategy determines which task versions a worker accepts.
@@ -47,6 +49,18 @@ func (e *VersionMismatchError) Error() string {
 	)
 }
 
+func (*VersionMismatchError) DurableTaskErrorType() api.ErrorType {
+	return versionMismatchErrorType
+}
+
+func (*VersionMismatchError) NonRetriable() bool {
+	return true
+}
+
+func (*VersionMismatchError) Is(target error) bool {
+	return target == api.ErrVersionMismatch
+}
+
 // WorkItemAbandonDelay prevents local workers from immediately re-dequeuing
 // version-incompatible activity work items.
 func (*VersionMismatchError) WorkItemAbandonDelay() time.Duration {
@@ -68,13 +82,34 @@ func (o *VersioningOptions) check(taskVersion string) error {
 			return nil
 		}
 	default:
-		return fmt.Errorf("unknown version match strategy %d", o.MatchStrategy)
+		return &versionConfigurationError{strategy: o.MatchStrategy}
 	}
+
 	return &VersionMismatchError{
 		TaskVersion:   taskVersion,
 		WorkerVersion: o.Version,
 		Strategy:      o.MatchStrategy,
 	}
+}
+
+type versionConfigurationError struct {
+	strategy VersionMatchStrategy
+}
+
+func (e *versionConfigurationError) Error() string {
+	return fmt.Sprintf("unknown version match strategy %d", e.strategy)
+}
+
+func (*versionConfigurationError) DurableTaskErrorType() api.ErrorType {
+	return api.ErrorTypeVersionError
+}
+
+func (*versionConfigurationError) NonRetriable() bool {
+	return true
+}
+
+func (*versionConfigurationError) Is(target error) bool {
+	return target == api.ErrVersionMismatch
 }
 
 func compareVersions(left, right string) int {

@@ -41,6 +41,14 @@ func (e *HistoryLimitError) Unwrap() error {
 	return ErrHistoryLimitExceeded
 }
 
+func (*HistoryLimitError) DurableTaskErrorType() api.ErrorType {
+	return api.ErrorTypeHistoryLimitExceeded
+}
+
+func (*HistoryLimitError) NonRetriable() bool {
+	return true
+}
+
 // HistoryLimitInfo is the immutable input passed to a history limit handler.
 type HistoryLimitInfo struct {
 	InstanceID               api.InstanceID

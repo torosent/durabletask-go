@@ -95,8 +95,8 @@ func TestVersionFailureFailPersistsNonRetriableOrchestrationFailure(t *testing.T
 
 		metadata, err := be.GetOrchestrationMetadata(ctx, "version-fail")
 		require.NoError(t, err)
-		require.Equal(t, "VersionMismatch", metadata.FailureDetails.GetErrorType())
-		require.True(t, metadata.FailureDetails.GetIsNonRetriable())
+		require.Equal(t, api.ErrorTypeVersionMismatch, metadata.FailureDetails.ErrorType)
+		require.True(t, metadata.FailureDetails.IsNonRetriable)
 	}
 }
 

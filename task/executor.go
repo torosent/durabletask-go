@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"runtime/debug"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -20,19 +22,45 @@ import (
 type taskExecutor struct {
 	Registry             *TaskRegistry
 	versioning           *VersioningOptions
+	orchestratorNotFound OrchestratorNotFoundStrategy
 	orchestrationOptions OrchestrationOptions
 	logger               *slog.Logger
 	metrics              backend.MetricsHooks
 	contextFields        api.ContextFields
+	errorProperties      api.ErrorPropertiesProvider
 }
 
 // TaskExecutorOption configures the in-memory task executor.
 type TaskExecutorOption func(*taskExecutor)
 
+// OrchestratorNotFoundStrategy determines whether missing orchestrators fail or reject work items.
+type OrchestratorNotFoundStrategy int
+
+const (
+	// OrchestratorNotFoundFail completes the orchestration with an OrchestratorTaskNotFound failure.
+	OrchestratorNotFoundFail OrchestratorNotFoundStrategy = iota
+	// OrchestratorNotFoundReject abandons the work item so another worker or deployment can process it.
+	OrchestratorNotFoundReject
+)
+
 // WithVersioning configures version-aware orchestration and activity dispatch.
 func WithVersioning(options VersioningOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.versioning = &options
+	}
+}
+
+// WithErrorPropertiesProvider configures custom durable failure properties.
+func WithErrorPropertiesProvider(provider api.ErrorPropertiesProvider) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.errorProperties = provider
+	}
+}
+
+// WithOrchestratorNotFoundStrategy configures missing-orchestrator handling.
+func WithOrchestratorNotFoundStrategy(strategy OrchestratorNotFoundStrategy) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.orchestratorNotFound = strategy
 	}
 }
 
@@ -124,10 +152,12 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		// try the wildcard match
 		invoker, ok = te.Registry.activities["*"]
 		if !ok {
-			return helpers.NewTaskFailedEvent(e.EventId, &protos.TaskFailureDetails{
-				ErrorType:    "TaskActivityNotRegistered",
-				ErrorMessage: fmt.Sprintf("no task activity named '%s' was registered", ts.Name),
-			}), nil
+			notFound := newTaskNotRegisteredError(
+				activityTaskNotFoundErrorType,
+				ts.Name,
+				ts.GetVersion().GetValue(),
+			)
+			return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(notFound, te.errorProperties)), nil
 		}
 	}
 	activityCtx := newTaskActivityContext(ctx, e.EventId, ts)
@@ -136,27 +166,24 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 	defer func() {
 		panicVal := recover()
 		if panicVal != nil {
-			response = helpers.NewTaskFailedEvent(e.EventId, &protos.TaskFailureDetails{
-				ErrorType:    "TaskActivityPanic",
-				ErrorMessage: fmt.Sprintf("panic: %v", panicVal),
-			})
+			panicErr := newPanicFailureError(
+				api.ErrorTypeActivityPanic,
+				fmt.Sprintf("panic: %v", panicVal),
+				string(debug.Stack()),
+				panicCause(panicVal),
+			)
+			response = helpers.NewTaskFailedEvent(e.EventId, failure.FromError(panicErr, te.errorProperties))
 		}
 	}()
 
 	result, err := invoker(activityCtx)
 	if err != nil {
-		return helpers.NewTaskFailedEvent(e.EventId, &protos.TaskFailureDetails{
-			ErrorType:    fmt.Sprintf("%T", err),
-			ErrorMessage: fmt.Sprintf("%+v", err),
-		}), nil
+		return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(err, te.errorProperties)), nil
 	}
 
 	bytes, err := marshalData(result)
 	if err != nil {
-		return helpers.NewTaskFailedEvent(e.EventId, &protos.TaskFailureDetails{
-			ErrorType:    fmt.Sprintf("%T", err),
-			ErrorMessage: fmt.Sprintf("%+v", err),
-		}), nil
+		return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(err, te.errorProperties)), nil
 	}
 	var rawResult *wrapperspb.StringValue
 	if len(bytes) > 0 {
@@ -167,7 +194,8 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 
 // ExecuteOrchestrator implements backend.Executor and executes an orchestrator function in the current goroutine.
 func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*backend.ExecutionResults, error) {
-	version := orchestrationVersion(oldEvents, newEvents)
+	started := startedEvent(oldEvents, newEvents)
+	version := started.GetVersion().GetValue()
 	if versionErr := te.versioning.check(version); versionErr != nil {
 		if te.versioning.FailureStrategy == VersionFailureReject {
 			return nil, versionErr
@@ -187,6 +215,18 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 			},
 		}, nil
 	}
+	name := started.GetName()
+	if te.orchestratorNotFound == OrchestratorNotFoundReject && name != "" {
+		_, registered := te.Registry.orchestrators[name]
+		_, wildcard := te.Registry.orchestrators["*"]
+		if !registered && !wildcard {
+			return nil, newTaskNotRegisteredError(
+				orchestratorTaskNotFoundErrorType,
+				name,
+				version,
+			)
+		}
+	}
 	orchestrationCtx := newOrchestrationContext(
 		ctx,
 		te.Registry,
@@ -197,6 +237,7 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		te.logger,
 		te.metrics,
 		te.contextFields,
+		te.errorProperties,
 	)
 	actions := orchestrationCtx.start()
 	te.reportHistoryMetric(orchestrationCtx)
@@ -231,14 +272,17 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 		}
 		for range req.Operations {
 			now := time.Now().UTC()
-			failure := entityOperationFailure(
-				"EntityTaskNotFound",
-				fmt.Sprintf("no entity named '%s' was registered", entityID.Name),
+			failureResult := entityOperationFailure(
+				newTaskNotRegisteredError(
+					entityTaskNotFoundErrorType,
+					entityID.Name,
+					"",
+				),
 				now,
 				now,
+				te.errorProperties,
 			)
-			failure.GetFailure().FailureDetails.IsNonRetriable = true
-			result.Results = append(result.Results, failure)
+			result.Results = append(result.Results, failureResult)
 		}
 		return result, nil
 	}
@@ -260,10 +304,10 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 	for _, operation := range req.Operations {
 		if operation == nil {
 			result.Results = append(result.Results, entityOperationFailure(
-				"InvalidEntityOperation",
-				"entity operation request must not be nil",
+				fmt.Errorf("entity operation request must not be nil"),
 				time.Now().UTC(),
 				time.Now().UTC(),
+				te.errorProperties,
 			))
 			continue
 		}
@@ -285,10 +329,10 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 
 		if operationErr != nil {
 			result.Results = append(result.Results, entityOperationFailure(
-				fmt.Sprintf("%T", operationErr),
-				fmt.Sprintf("%+v", operationErr),
+				operationErr,
 				startedAt,
 				endedAt,
+				te.errorProperties,
 			))
 			continue
 		}
@@ -356,22 +400,29 @@ func (te *taskExecutor) newEntityContext(
 func invokeEntity(invoker Entity, entityCtx *EntityContext) (result any, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("entity operation panic: %v", recovered)
+			err = newPanicFailureError(
+				api.ErrorTypeEntityOperationPanic,
+				fmt.Sprintf("entity operation panic: %v", recovered),
+				string(debug.Stack()),
+				panicCause(recovered),
+			)
 		}
 	}()
 	return invoker(entityCtx)
 }
 
-func entityOperationFailure(errorType, message string, startedAt, endedAt time.Time) *protos.OperationResult {
+func entityOperationFailure(
+	err error,
+	startedAt time.Time,
+	endedAt time.Time,
+	provider api.ErrorPropertiesProvider,
+) *protos.OperationResult {
 	return &protos.OperationResult{
 		ResultType: &protos.OperationResult_Failure{
 			Failure: &protos.OperationResultFailure{
-				FailureDetails: &protos.TaskFailureDetails{
-					ErrorType:    errorType,
-					ErrorMessage: message,
-				},
-				StartTimeUtc: timestamppb.New(startedAt),
-				EndTimeUtc:   timestamppb.New(endedAt),
+				FailureDetails: failure.FromError(err, provider),
+				StartTimeUtc:   timestamppb.New(startedAt),
+				EndTimeUtc:     timestamppb.New(endedAt),
 			},
 		},
 	}
@@ -397,23 +448,20 @@ func (te *taskExecutor) reportHistoryMetric(ctx *OrchestrationContext) {
 	te.metrics.History(metric)
 }
 
-func orchestrationVersion(eventLists ...[]*protos.HistoryEvent) string {
+// startedEvent returns the ExecutionStarted event found across the given event lists, or nil if none is present.
+func startedEvent(eventLists ...[]*protos.HistoryEvent) *protos.ExecutionStartedEvent {
 	for _, events := range eventLists {
 		for _, event := range events {
 			if started := event.GetExecutionStarted(); started != nil {
-				return started.GetVersion().GetValue()
+				return started
 			}
 		}
 	}
-	return ""
+	return nil
 }
 
 func versionFailureDetails(err error) *protos.TaskFailureDetails {
-	return &protos.TaskFailureDetails{
-		ErrorType:      "VersionMismatch",
-		ErrorMessage:   err.Error(),
-		IsNonRetriable: true,
-	}
+	return failure.FromError(err)
 }
 
 func (te taskExecutor) Shutdown(ctx context.Context) error {

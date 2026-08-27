@@ -3,7 +3,10 @@ package task
 import (
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
+
+	"github.com/microsoft/durabletask-go/api"
 )
 
 type coroutineState uint8
@@ -27,6 +30,7 @@ const (
 type coroutineSignal struct {
 	kind       coroutineSignalKind
 	panicValue any
+	panicStack []byte
 }
 
 type coroutine struct {
@@ -54,7 +58,11 @@ func (c *coroutine) run() {
 				c.sendSignal(coroutineSignal{kind: coroutineCanceled})
 				return
 			}
-			c.sendSignal(coroutineSignal{kind: coroutinePanicked, panicValue: value})
+			c.sendSignal(coroutineSignal{
+				kind:       coroutinePanicked,
+				panicValue: value,
+				panicStack: debug.Stack(),
+			})
 		}
 	}()
 
@@ -102,9 +110,12 @@ func isTaskCanceled(value any) bool {
 	return ok && errors.Is(err, ErrTaskCanceled)
 }
 
-func coroutinePanicError(id uint64, value any) error {
+func coroutinePanicError(id uint64, value any, stack []byte) error {
+	var message string
 	if err, ok := value.(error); ok {
-		return fmt.Errorf("coroutine %d panicked: %w", id, err)
+		message = fmt.Sprintf("coroutine %d panicked: %v", id, err)
+		return newPanicFailureError(api.ErrorTypeOrchestratorPanic, message, string(stack), err)
 	}
-	return fmt.Errorf("coroutine %d panicked: %v", id, value)
+	message = fmt.Sprintf("coroutine %d panicked: %v", id, value)
+	return newPanicFailureError(api.ErrorTypeOrchestratorPanic, message, string(stack), nil)
 }

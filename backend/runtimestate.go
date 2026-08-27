@@ -422,7 +422,7 @@ func (s *OrchestrationRuntimeState) NewEvents() []*HistoryEvent {
 	return s.newEvents
 }
 
-func (s *OrchestrationRuntimeState) FailureDetails() (*TaskFailureDetails, error) {
+func (s *OrchestrationRuntimeState) FailureDetails() (*protos.TaskFailureDetails, error) {
 	if s.completedEvent == nil {
 		return nil, api.ErrNotCompleted
 	} else if s.completedEvent.FailureDetails == nil {

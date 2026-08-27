@@ -26,6 +26,8 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
+	"github.com/microsoft/durabletask-go/internal/failure"
+	"github.com/microsoft/durabletask-go/internal/grpcerrors"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -878,7 +880,7 @@ func (g *grpcExecutor) CreateTaskHub(ctx context.Context, req *protos.CreateTask
 		}
 	}
 	if err := g.backend.CreateTaskHub(ctx); err != nil {
-		return nil, fmt.Errorf("failed to create task hub: %w", err)
+		return nil, managementRPCError(err, "failed to create task hub")
 	}
 	return &protos.CreateTaskHubResponse{}, nil
 }
@@ -889,7 +891,7 @@ func (g *grpcExecutor) DeleteTaskHub(ctx context.Context, _ *protos.DeleteTaskHu
 		return nil, status.Error(codes.Unimplemented, "task hub lifecycle management is not enabled")
 	}
 	if err := g.backend.DeleteTaskHub(ctx); err != nil {
-		return nil, fmt.Errorf("failed to delete task hub: %w", err)
+		return nil, managementRPCError(err, "failed to delete task hub")
 	}
 	return &protos.DeleteTaskHubResponse{}, nil
 }
@@ -1413,7 +1415,7 @@ func createOrchestrationState(metadata *api.OrchestrationMetadata, fetchInputsAn
 		state.Input = wrapperspb.String(metadata.SerializedInput)
 		state.CustomStatus = wrapperspb.String(metadata.SerializedCustomStatus)
 		state.Output = wrapperspb.String(metadata.SerializedOutput)
-		state.FailureDetails = metadata.FailureDetails
+		state.FailureDetails = failure.ToProto(metadata.FailureDetails)
 	}
 	return state
 }
@@ -1421,16 +1423,36 @@ func createOrchestrationState(metadata *api.OrchestrationMetadata, fetchInputsAn
 func managementRPCError(err error, operation string) error {
 	switch {
 	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, err.Error())
+		return status.Error(codes.Canceled, rpcStatusMessage(err, context.Canceled))
 	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, err.Error())
+		return status.Error(codes.DeadlineExceeded, rpcStatusMessage(err, context.DeadlineExceeded))
+	case errors.Is(err, ErrTaskHubExists):
+		return grpcerrors.New(codes.AlreadyExists, rpcStatusMessage(err, ErrTaskHubExists), grpcerrors.ReasonTaskHubExists)
+	case errors.Is(err, api.ErrDuplicateInstance):
+		return grpcerrors.New(codes.AlreadyExists, rpcStatusMessage(err, api.ErrDuplicateInstance), grpcerrors.ReasonDuplicateInstance)
+	case errors.Is(err, ErrTaskHubNotFound):
+		return grpcerrors.New(codes.NotFound, rpcStatusMessage(err, ErrTaskHubNotFound), grpcerrors.ReasonTaskHubNotFound)
 	case errors.Is(err, api.ErrInstanceNotFound):
-		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, api.ErrInvalidState), errors.Is(err, api.ErrNotCompleted):
-		return status.Error(codes.FailedPrecondition, err.Error())
+		return grpcerrors.New(codes.NotFound, rpcStatusMessage(err, api.ErrInstanceNotFound), grpcerrors.ReasonInstanceNotFound)
+	case errors.Is(err, api.ErrInvalidArgument):
+		return grpcerrors.New(codes.InvalidArgument, rpcStatusMessage(err, api.ErrInvalidArgument), grpcerrors.ReasonInvalidArgument)
+	case errors.Is(err, api.ErrNotCompleted):
+		return grpcerrors.New(codes.FailedPrecondition, rpcStatusMessage(err, api.ErrNotCompleted), grpcerrors.ReasonNotCompleted)
+	case errors.Is(err, api.ErrInvalidState):
+		return grpcerrors.New(codes.FailedPrecondition, rpcStatusMessage(err, api.ErrInvalidState), grpcerrors.ReasonInvalidState)
 	case errors.Is(err, api.ErrFeatureNotSupported):
-		return status.Error(codes.Unimplemented, err.Error())
+		return grpcerrors.New(codes.Unimplemented, rpcStatusMessage(err, api.ErrFeatureNotSupported), grpcerrors.ReasonFeatureUnsupported)
 	default:
 		return fmt.Errorf("%s: %w", operation, err)
 	}
+}
+
+func rpcStatusMessage(err, category error) string {
+	message := err.Error()
+	categoryMessage := category.Error()
+	message = strings.TrimPrefix(message, categoryMessage+": ")
+	if message == "" {
+		return categoryMessage
+	}
+	return message
 }

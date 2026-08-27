@@ -112,7 +112,7 @@ func (s *coroutineScheduler) runNext() {
 		c.state = coroutineCompleted
 	case coroutinePanicked:
 		c.state = coroutineCompleted
-		s.terminalErr = coroutinePanicError(c.id, signal.panicValue)
+		s.terminalErr = coroutinePanicError(c.id, signal.panicValue, signal.panicStack)
 	default:
 		panic(fmt.Sprintf("unknown coroutine signal %d", signal.kind))
 	}

@@ -199,6 +199,37 @@ func UpdateDevicesOrchestrator(ctx *task.OrchestrationContext) (any, error) {
 
 The full sample can be found [here](./samples/parallel).
 
+### Failure handling and retries
+
+Activity and sub-orchestration failures return `*task.TaskFailedError`. Entity calls return
+`*task.EntityOperationFailedError`. Both include API-owned `api.FailureDetails` with the stable error type,
+message, stack trace, inner failure, non-retriable marker, and custom properties received over the Durable Task
+protocol.
+
+```go
+err := ctx.CallActivity("ChargeCard").Await(nil)
+var failed *task.TaskFailedError
+if errors.As(err, &failed) {
+	fmt.Printf("%s failed: %s\n", failed.TaskName, failed.FailureDetails)
+}
+```
+
+Retry handlers receive deterministic failure data and run during orchestration replay, so handlers must not
+perform I/O or depend on wall-clock time.
+
+```go
+policy := &task.RetryPolicy{
+	MaxAttempts:          3,
+	InitialRetryInterval: time.Second,
+	Handle: func(retry task.RetryContext) bool {
+		return !retry.LastFailure.IsCausedBy(api.ErrorTypeActivityTaskNotFound)
+	},
+}
+```
+
+Failures marked non-retriable, including missing activity/entity registrations and version mismatches, bypass
+custom retry handlers.
+
 ### External orchestration inputs (events) example
 
 Sometimes orchestrations need asynchronous input from external systems. For example, an approval workflow may require a manual approval signal from an authorized user. Or perhaps an orchestration pauses and waits for a command from an operator. The `WaitForSingleEvent` method can be used in an orchestrator function to pause execution and wait for such inputs. You an even specify a timeout value indicating how long to wait for the input before resuming execution (use `-1` to indicate infinite timeout).

@@ -358,9 +358,9 @@ func Test_CompleteOrchestration(t *testing.T) {
 				assert.False(t, metadata.IsRunning())
 
 				if expectedStatus == protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED {
-					assert.Equal(t, "MyError", metadata.FailureDetails.ErrorType)
+					assert.Equal(t, api.ErrorType("MyError"), metadata.FailureDetails.ErrorType)
 					assert.Equal(t, "Kah-BOOOM!!", metadata.FailureDetails.ErrorMessage)
-					assert.Equal(t, expectedStackTrace, metadata.FailureDetails.StackTrace.GetValue())
+					assert.Equal(t, expectedStackTrace, metadata.FailureDetails.StackTrace)
 				} else {
 					assert.Equal(t, expectedResult, metadata.SerializedOutput)
 				}

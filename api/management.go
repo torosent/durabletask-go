@@ -99,11 +99,11 @@ func (request PurgeInstancesRequest) Validate() error {
 	hasInstanceIDs := len(request.InstanceIDs) > 0
 	hasFilter := request.Filter != nil
 	if hasInstanceIDs == hasFilter {
-		return errors.New("purge request must specify exactly one of instance IDs or a filter")
+		return invalidArgument("purge request must specify exactly one of instance IDs or a filter")
 	}
 	for _, id := range request.InstanceIDs {
 		if id == EmptyInstanceID {
-			return errors.New("purge instance ID cannot be empty")
+			return invalidArgument("purge instance ID cannot be empty")
 		}
 	}
 	if request.Filter != nil {
@@ -111,7 +111,7 @@ func (request PurgeInstancesRequest) Validate() error {
 			return fmt.Errorf("invalid purge filter: %w", err)
 		}
 		if request.Filter.Timeout < 0 {
-			return errors.New("purge timeout cannot be negative")
+			return invalidArgument("purge timeout cannot be negative")
 		}
 	}
 	return nil
@@ -129,11 +129,11 @@ func WithRecreateTaskHub(recreateIfExists bool) CreateTaskHubOptions {
 func NormalizeInstanceQueryPageSize(pageSize int) (int, error) {
 	switch {
 	case pageSize < 0:
-		return 0, errors.New("page size cannot be negative")
+		return 0, invalidArgument("page size cannot be negative")
 	case pageSize == 0:
 		return DefaultInstanceQueryPageSize, nil
 	case pageSize > MaxInstanceQueryPageSize:
-		return 0, fmt.Errorf("page size cannot exceed %d", MaxInstanceQueryPageSize)
+		return 0, invalidArgument(fmt.Sprintf("page size cannot exceed %d", MaxInstanceQueryPageSize))
 	default:
 		return pageSize, nil
 	}
@@ -141,7 +141,7 @@ func NormalizeInstanceQueryPageSize(pageSize int) (int, error) {
 
 func ValidateTimeRange(from, to time.Time) error {
 	if !from.IsZero() && !to.IsZero() && from.After(to) {
-		return errors.New("start time must not be after end time")
+		return invalidArgument("start time must not be after end time")
 	}
 	return nil
 }

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
 
@@ -27,6 +29,11 @@ type completableTask struct {
 	isCanceled         bool
 	rawResult          []byte
 	failureDetails     *protos.TaskFailureDetails
+	localErr           error
+	taskName           string
+	taskID             int32
+	entityID           api.EntityID
+	entityOperation    string
 	completionID       uint64
 	completedCallbacks []func()
 	waiters            map[*coroutine]struct{}
@@ -59,10 +66,26 @@ func newTaskInScope(ctx *OrchestrationContext, scope *cancellationScope) *comple
 func (t *completableTask) Await(v any) error {
 	for {
 		if t.isCompleted {
-			if t.failureDetails != nil {
-				return fmt.Errorf("task failed with an error: %v", t.failureDetails.ErrorMessage)
-			} else if t.isCanceled {
+			if t.localErr != nil {
+				return t.localErr
+			}
+			if t.isCanceled {
 				return ErrTaskCanceled
+			}
+			if t.failureDetails != nil {
+				details := failure.FromProto(t.failureDetails)
+				if t.entityOperation != "" {
+					return &EntityOperationFailedError{
+						EntityID:       t.entityID,
+						OperationName:  t.entityOperation,
+						FailureDetails: details,
+					}
+				}
+				return &TaskFailedError{
+					TaskName:       t.taskName,
+					TaskID:         t.taskID,
+					FailureDetails: details,
+				}
 			}
 			if v != nil && len(t.rawResult) > 0 {
 				if err := unmarshalData(t.rawResult, v); err != nil {
@@ -114,6 +137,14 @@ func (t *completableTask) fail(fd *protos.TaskFailureDetails) {
 		return
 	}
 	t.failureDetails = fd
+	t.completeInternal()
+}
+
+func (t *completableTask) failLocal(err error) {
+	if t.isCompleted {
+		return
+	}
+	t.localErr = err
 	t.completeInternal()
 }
 

@@ -78,7 +78,7 @@ func TestWhenAllReturnsFirstFailureByHistory(t *testing.T) {
 		},
 	)
 	completed := completionAction(t, result)
-	if got := completed.GetFailureDetails().GetErrorMessage(); got != "task failed with an error: second failed" {
+	if got := completed.GetFailureDetails().GetErrorMessage(); got != "Task 'second' (#1) failed with an unhandled exception: second failed" {
 		t.Fatalf("failure = %q", got)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
@@ -800,7 +801,7 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 		input.String,
 		output.String,
 		customStatus.String,
-		failureDetails,
+		failure.FromProto(failureDetails),
 	)
 	metadata.ExecutionID = executionID
 	if scheduledStartAt.Valid {
