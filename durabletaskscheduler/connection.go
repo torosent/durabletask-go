@@ -152,6 +152,10 @@ func prepareOptions(options *Options) (Options, error) {
 	}
 	prepared := *options
 	prepared.AdditionallyAllowedTenants = slices.Clone(options.AdditionallyAllowedTenants)
+	if options.Versioning != nil {
+		versioning := *options.Versioning
+		prepared.Versioning = &versioning
+	}
 	if prepared.Authentication == "" {
 		prepared.Authentication = AuthenticationDefaultAzure
 	}

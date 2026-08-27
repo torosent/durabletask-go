@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -196,6 +197,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	var delayed backend.WorkItemAbandonDelayError
 	if errors.As(err, &delayed) {
 		w.logger.Warnf("%s: orchestration work item rejected; abandoning it: %v", request.InstanceId, err)
+		_ = waitForRetry(ctx, delayed.WorkItemAbandonDelay())
 		w.abandonOrchestration(ctx, client, completionToken)
 		return
 	}
@@ -338,6 +340,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 			request.TaskId,
 			err,
 		)
+		_ = waitForRetry(ctx, delayed.WorkItemAbandonDelay())
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
@@ -495,20 +498,16 @@ func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, 
 	if rejectAll {
 		return false
 	}
-	if candidates == nil {
-		return true
-	}
-	if len(candidates) == 0 {
-		return true
-	}
 	if len(candidates) == 0 {
 		return true
 	}
 	for _, filter := range candidates {
-		if filter.Name != name {
+		if !strings.EqualFold(filter.Name, name) {
 			continue
 		}
-		if len(filter.Versions) == 0 || slices.Contains(filter.Versions, version) {
+		if len(filter.Versions) == 0 || slices.ContainsFunc(filter.Versions, func(candidate string) bool {
+			return strings.EqualFold(candidate, version)
+		}) {
 			return true
 		}
 	}
@@ -522,7 +521,7 @@ func matchesEntityWorkItemFilters(filters *WorkItemFilters, name string) bool {
 	if filters.RejectAllEntities {
 		return false
 	}
-	if filters.Entities == nil {
+	if len(filters.Entities) == 0 {
 		return true
 	}
 	return slices.Contains(filters.Entities, name)

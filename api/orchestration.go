@@ -76,19 +76,20 @@ type OrchestrationMetadata struct {
 	SerializedCustomStatus string
 	FailureDetails         *FailureDetails
 	Tags                   map[string]string
+	Converter              DataConverter `json:"-"`
 }
 
 // NewOrchestrationOptions configures options for starting a new orchestration.
-type NewOrchestrationOptions func(*protos.CreateInstanceRequest) error
+type NewOrchestrationOptions func(*protos.CreateInstanceRequest, DataConverter) error
 
 // GetOrchestrationMetadataOptions is a set of options for fetching orchestration metadata.
 type FetchOrchestrationMetadataOptions func(*protos.GetInstanceRequest)
 
 // RaiseEventOptions is a set of options for raising an orchestration event.
-type RaiseEventOptions func(*protos.RaiseEventRequest) error
+type RaiseEventOptions func(*protos.RaiseEventRequest, DataConverter) error
 
 // TerminateOptions is a set of options for terminating an orchestration.
-type TerminateOptions func(*protos.TerminateRequest) error
+type TerminateOptions func(*protos.TerminateRequest, DataConverter) error
 
 // PurgeOptions is a set of options for purging an orchestration.
 type PurgeOptions func(*protos.PurgeInstancesRequest) error
@@ -96,7 +97,7 @@ type PurgeOptions func(*protos.PurgeInstancesRequest) error
 // WithInstanceID configures an explicit orchestration instance ID. If not specified,
 // a random UUID value will be used for the orchestration instance ID.
 func WithInstanceID(id InstanceID) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		if err := helpers.ValidateOrchestrationInstanceID(string(id)); err != nil {
 			return err
 		}
@@ -107,7 +108,7 @@ func WithInstanceID(id InstanceID) NewOrchestrationOptions {
 
 // WithOrchestrationIdReusePolicy configures Orchestration ID reuse policy.
 func WithOrchestrationIdReusePolicy(policy *OrchestrationIdReusePolicy) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		if policy == nil {
 			req.OrchestrationIdReusePolicy = nil
 			return nil
@@ -131,19 +132,19 @@ func WithOrchestrationIdReusePolicy(policy *OrchestrationIdReusePolicy) NewOrche
 
 // WithInput configures an input for the orchestration. The specified input must be serializable.
 func WithInput(input any) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
-		bytes, err := json.Marshal(input)
+	return func(req *protos.CreateInstanceRequest, converter DataConverter) error {
+		payload, err := SerializeData(converter, input)
 		if err != nil {
 			return err
 		}
-		req.Input = wrapperspb.String(string(bytes))
+		req.Input = wrapperspb.String(payload)
 		return nil
 	}
 }
 
 // WithRawInput configures an input for the orchestration. The specified input must be a string.
 func WithRawInput(rawInput string) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		req.Input = wrapperspb.String(rawInput)
 		return nil
 	}
@@ -153,7 +154,7 @@ func WithRawInput(rawInput string) NewOrchestrationOptions {
 // Note that the actual start time could be later than the specified start time if the
 // task hub is under load or if the app is not running at the specified start time.
 func WithStartTime(startTime time.Time) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		req.ScheduledStartTimestamp = timestamppb.New(startTime)
 		return nil
 	}
@@ -161,7 +162,7 @@ func WithStartTime(startTime time.Time) NewOrchestrationOptions {
 
 // WithVersion configures the orchestration version.
 func WithVersion(version string) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		req.Version = wrapperspb.String(version)
 		return nil
 	}
@@ -170,7 +171,7 @@ func WithVersion(version string) NewOrchestrationOptions {
 // WithContextFields configures immutable fields propagated into orchestration
 // and activity contexts. The fields are persisted with orchestration history.
 func WithContextFields(fields ContextFields) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		for key := range fields {
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
 				return invalidArgument(fmt.Sprintf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix))
@@ -186,7 +187,7 @@ func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 
 // WithTags configures orchestration tags that are persisted and returned by metadata queries.
 func WithTags(tags map[string]string) NewOrchestrationOptions {
-	return func(req *protos.CreateInstanceRequest) error {
+	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
 		for key := range tags {
 			if key == "" {
 				return invalidArgument("tag key cannot be empty")
@@ -212,19 +213,19 @@ func WithFetchPayloads(fetchPayloads bool) FetchOrchestrationMetadataOptions {
 
 // WithEventPayload configures an event payload. The specified payload must be serializable.
 func WithEventPayload(data any) RaiseEventOptions {
-	return func(req *protos.RaiseEventRequest) error {
-		bytes, err := json.Marshal(data)
+	return func(req *protos.RaiseEventRequest, converter DataConverter) error {
+		payload, err := SerializeData(converter, data)
 		if err != nil {
 			return err
 		}
-		req.Input = wrapperspb.String(string(bytes))
+		req.Input = wrapperspb.String(payload)
 		return nil
 	}
 }
 
 // WithRawEventData configures an event payload that is a raw, unprocessed string (e.g. JSON data).
 func WithRawEventData(data string) RaiseEventOptions {
-	return func(req *protos.RaiseEventRequest) error {
+	return func(req *protos.RaiseEventRequest, _ DataConverter) error {
 		req.Input = wrapperspb.String(data)
 		return nil
 	}
@@ -232,19 +233,19 @@ func WithRawEventData(data string) RaiseEventOptions {
 
 // WithOutput configures an output for the terminated orchestration. The specified output must be serializable.
 func WithOutput(data any) TerminateOptions {
-	return func(req *protos.TerminateRequest) error {
-		bytes, err := json.Marshal(data)
+	return func(req *protos.TerminateRequest, converter DataConverter) error {
+		payload, err := SerializeData(converter, data)
 		if err != nil {
 			return err
 		}
-		req.Output = wrapperspb.String(string(bytes))
+		req.Output = wrapperspb.String(payload)
 		return nil
 	}
 }
 
 // WithRawOutput configures a raw, unprocessed output (i.e. pre-serialized) for the terminated orchestration.
 func WithRawOutput(data string) TerminateOptions {
-	return func(req *protos.TerminateRequest) error {
+	return func(req *protos.TerminateRequest, _ DataConverter) error {
 		req.Output = wrapperspb.String(data)
 		return nil
 	}
@@ -252,10 +253,25 @@ func WithRawOutput(data string) TerminateOptions {
 
 // WithRecursiveTerminate configures whether to terminate all sub-orchestrations created by the target orchestration.
 func WithRecursiveTerminate(recursive bool) TerminateOptions {
-	return func(req *protos.TerminateRequest) error {
+	return func(req *protos.TerminateRequest, _ DataConverter) error {
 		req.Recursive = recursive
 		return nil
 	}
+}
+
+// ReadInput deserializes the orchestration input with the metadata converter.
+func (m *OrchestrationMetadata) ReadInput(target any) error {
+	return deserializePayload(m.Converter, m.SerializedInput, target)
+}
+
+// ReadOutput deserializes the orchestration output with the metadata converter.
+func (m *OrchestrationMetadata) ReadOutput(target any) error {
+	return deserializePayload(m.Converter, m.SerializedOutput, target)
+}
+
+// ReadCustomStatus deserializes custom status with the metadata converter.
+func (m *OrchestrationMetadata) ReadCustomStatus(target any) error {
+	return deserializePayload(m.Converter, m.SerializedCustomStatus, target)
 }
 
 // WithRecursivePurge configures whether to purge all sub-orchestrations created by the target orchestration.

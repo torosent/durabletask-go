@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -33,6 +34,7 @@ type OrchestrationRuntimeState struct {
 	lastUpdatedTime time.Time
 	completedTime   time.Time
 	continuedAsNew  bool
+	versionBoundary bool
 	isSuspended     bool
 
 	CustomStatus *wrapperspb.StringValue
@@ -138,6 +140,15 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				}
 
 				// Duplicate the start event info, updating just the input
+				version := s.startEvent.Version
+				if completedAction.NewVersion != nil {
+					newVersion := completedAction.NewVersion.GetValue()
+					version = completedAction.NewVersion
+					newState.versionBoundary = !strings.EqualFold(
+						s.startEvent.Version.GetValue(),
+						newVersion,
+					)
+				}
 				startEvent := helpers.NewExecutionStartedEvent(
 					s.startEvent.Name,
 					string(s.instanceID),
@@ -145,7 +156,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 					s.startEvent.ParentInstance,
 					s.startEvent.ParentTraceContext,
 					nil,
-					s.startEvent.Version,
+					version,
 				)
 				startEvent.GetExecutionStarted().Tags = contextprop.Clone(s.startEvent.Tags)
 				if err := newState.AddEvent(startEvent); err != nil {
@@ -450,6 +461,12 @@ func (s *OrchestrationRuntimeState) PendingEntityMessages() []EntityMessage {
 
 func (s *OrchestrationRuntimeState) ContinuedAsNew() bool {
 	return s.continuedAsNew
+}
+
+// ContinueAsNewVersionChanged reports whether ContinueAsNew selected a new
+// version that must be dispatched to a compatible worker.
+func (s *OrchestrationRuntimeState) ContinueAsNewVersionChanged() bool {
+	return s.versionBoundary
 }
 
 func (s *OrchestrationRuntimeState) String() string {

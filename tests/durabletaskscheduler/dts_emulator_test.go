@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,170 @@ func startEmulatorClientAndWorker(
 		require.NoError(t, managementClient.Close())
 	})
 	return managementClient, worker, options
+}
+
+type dtsPayload struct {
+	Value int
+}
+
+type dtsDataConverter struct{}
+
+func (dtsDataConverter) Serialize(value any) (string, error) {
+	payload, ok := value.(dtsPayload)
+	if !ok {
+		return "", fmt.Errorf("unsupported DTS payload %T", value)
+	}
+	return "dts:" + strconv.Itoa(payload.Value), nil
+}
+
+func (dtsDataConverter) Deserialize(payload string, target any) error {
+	if !strings.HasPrefix(payload, "dts:") {
+		return fmt.Errorf("unexpected DTS payload %q", payload)
+	}
+	value, err := strconv.Atoi(strings.TrimPrefix(payload, "dts:"))
+	if err != nil {
+		return err
+	}
+	decoded, ok := target.(*dtsPayload)
+	if !ok {
+		return fmt.Errorf("unsupported DTS target %T", target)
+	}
+	decoded.Value = value
+	return nil
+}
+
+func TestDTSEmulatorCustomConverterAndVersionMigration(t *testing.T) {
+	converter := dtsDataConverter{}
+	options := emulatorOptions(t)
+	options.DataConverter = converter
+	options.Versioning = &task.VersioningOptions{
+		DefaultVersion: "1.0",
+		MatchStrategy:  task.VersionMatchNone,
+	}
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityNVersion("DTSIncrement", "1.0", func(ctx task.ActivityContext) (any, error) {
+		var input dtsPayload
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		input.Value++
+		return input, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorNVersion("DTSConverter", "1.0", func(ctx *task.OrchestrationContext) (any, error) {
+		var input dtsPayload
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		var result dtsPayload
+		if err := ctx.CallActivity("DTSIncrement", task.WithActivityInput(input)).Await(&result); err != nil {
+			return nil, err
+		}
+		ctx.ContinueAsNew(result, task.WithContinueAsNewVersion("2.0"))
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorNVersion("DTSConverter", "2.0", func(ctx *task.OrchestrationContext) (any, error) {
+		var input dtsPayload
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		input.Value++
+		return input, nil
+	}))
+
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(
+		options,
+		registry,
+		logger,
+		durabletaskclient.WithAutoWorkItemFilters(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	testCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		testCtx,
+		"DTSConverter",
+		api.WithInput(dtsPayload{Value: 1}),
+	)
+	require.NoError(t, err)
+	metadata, err := managementClient.WaitForOrchestrationCompletion(testCtx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, "2.0", metadata.Version)
+	var output dtsPayload
+	require.NoError(t, metadata.ReadOutput(&output))
+	require.Equal(t, 3, output.Value)
+}
+
+func TestDTSEmulatorMixedVersionWorkers(t *testing.T) {
+	baseOptions := emulatorOptions(t)
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), baseOptions, logger)
+	require.NoError(t, err)
+
+	newWorker := func(version, output string) *durabletaskclient.TaskHubGrpcWorker {
+		registry := task.NewTaskRegistry()
+		require.NoError(t, registry.AddOrchestratorNVersion(
+			"DTSMixedVersion",
+			version,
+			func(*task.OrchestrationContext) (any, error) {
+				return output, nil
+			},
+		))
+		options := *baseOptions
+		options.WorkerID = "go-mixed-" + strings.ReplaceAll(version, ".", "-") + "-" + uuid.NewString()
+		options.Versioning = &task.VersioningOptions{
+			Version:         version,
+			DefaultVersion:  version,
+			MatchStrategy:   task.VersionMatchStrict,
+			FailureStrategy: task.VersionFailureReject,
+		}
+		worker, workerErr := durabletaskscheduler.NewWorker(
+			&options,
+			registry,
+			logger,
+			durabletaskclient.WithAutoWorkItemFilters(),
+		)
+		require.NoError(t, workerErr)
+		require.NoError(t, worker.Start(context.Background()))
+		return worker
+	}
+
+	workerV1 := newWorker("1.0", "worker-v1")
+	workerV2 := newWorker("2.0", "worker-v2")
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, workerV1.Shutdown(shutdownCtx))
+		require.NoError(t, workerV2.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	testCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for version, expected := range map[string]string{"1.0": "worker-v1", "2.0": "worker-v2"} {
+		instanceID, scheduleErr := managementClient.ScheduleNewOrchestration(
+			testCtx,
+			"DTSMixedVersion",
+			api.WithVersion(version),
+		)
+		require.NoError(t, scheduleErr)
+		metadata, waitErr := managementClient.WaitForOrchestrationCompletion(testCtx, instanceID)
+		require.NoError(t, waitErr)
+		var output string
+		require.NoError(t, metadata.ReadOutput(&output))
+		require.Equal(t, expected, output)
+		require.Equal(t, version, metadata.Version)
+	}
 }
 
 func TestDTSEmulatorAdvancedManagementOperations(t *testing.T) {

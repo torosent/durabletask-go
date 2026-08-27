@@ -132,3 +132,146 @@ func TestVersionMismatchFailsActivity(t *testing.T) {
 		t.Fatalf("activity result = %v", result)
 	}
 }
+
+func TestVersionedRegistryDispatchAndSchedulingDefaults(t *testing.T) {
+	registry := NewTaskRegistry()
+	requireNoError := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireNoError(registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {
+		ctx.CallActivity("activity")
+		ctx.CallSubOrchestrator("child")
+		ctx.ContinueAsNew("next", WithContinueAsNewVersion("v3"))
+		return nil, nil
+	}))
+
+	instanceID := api.InstanceID("versioned-defaults")
+	executor := NewTaskExecutor(registry, WithVersioning(VersioningOptions{
+		DefaultVersion: "v2",
+		MatchStrategy:  VersionMatchNone,
+	}))
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewExecutionStartedEvent(
+				"parent",
+				string(instanceID),
+				nil,
+				nil,
+				nil,
+				nil,
+				wrapperspb.String("v1"),
+			),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var activityVersion, subVersion, newVersion string
+	for _, action := range result.Response.Actions {
+		switch {
+		case action.GetScheduleTask() != nil:
+			activityVersion = action.GetScheduleTask().GetVersion().GetValue()
+		case action.GetCreateSubOrchestration() != nil:
+			subVersion = action.GetCreateSubOrchestration().GetVersion().GetValue()
+		case action.GetCompleteOrchestration() != nil:
+			newVersion = action.GetCompleteOrchestration().GetNewVersion().GetValue()
+		}
+	}
+	if activityVersion != "v1" {
+		t.Fatalf("activity version = %q, want inherited v1", activityVersion)
+	}
+	if subVersion != "v2" {
+		t.Fatalf("sub-orchestration version = %q, want default v2", subVersion)
+	}
+	if newVersion != "v3" {
+		t.Fatalf("continue-as-new version = %q, want v3", newVersion)
+	}
+}
+
+func TestExplicitUnversionedSchedulingOverridesDefaults(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {
+		ctx.CallActivity("activity", WithActivityVersion(""))
+		ctx.CallSubOrchestrator("child", WithSubOrchestrationVersion(""))
+		ctx.ContinueAsNew(nil, WithContinueAsNewVersion(""))
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("explicit-unversioned")
+	executor := NewTaskExecutor(registry, WithVersioning(VersioningOptions{
+		DefaultVersion: "v2",
+		MatchStrategy:  VersionMatchNone,
+	}))
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{helpers.NewExecutionStartedEvent(
+			"parent",
+			string(instanceID),
+			nil,
+			nil,
+			nil,
+			nil,
+			wrapperspb.String("v1"),
+		)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range result.Response.Actions {
+		if scheduled := action.GetScheduleTask(); scheduled != nil && scheduled.Version == nil {
+			t.Fatal("explicit unversioned activity must retain wrapper presence")
+		}
+		if scheduled := action.GetCreateSubOrchestration(); scheduled != nil && scheduled.Version == nil {
+			t.Fatal("explicit unversioned sub-orchestration must retain wrapper presence")
+		}
+		if completed := action.GetCompleteOrchestration(); completed != nil {
+			if completed.NewVersion == nil || completed.NewVersion.GetValue() != "" {
+				t.Fatal("explicit unversioned ContinueAsNew must retain wrapper presence")
+			}
+		}
+	}
+}
+
+func TestVersionedReplayAcceptsLegacyUnversionedChildHistory(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {
+		ctx.CallActivity("activity")
+		ctx.CallSubOrchestrator("child")
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	instanceID := api.InstanceID("legacy-unversioned-children")
+	executor := NewTaskExecutor(registry, WithVersioning(VersioningOptions{
+		DefaultVersion: "v2",
+		MatchStrategy:  VersionMatchNone,
+	}))
+	oldEvents := []*protos.HistoryEvent{
+		helpers.NewExecutionStartedEvent(
+			"parent",
+			string(instanceID),
+			nil,
+			nil,
+			nil,
+			nil,
+			wrapperspb.String("v1"),
+		),
+		helpers.NewTaskScheduledEvent(0, "activity", nil, nil, nil),
+		helpers.NewSubOrchestrationCreatedEvent(1, "child", nil, nil, "child-instance", nil),
+	}
+
+	if _, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, nil); err != nil {
+		t.Fatalf("legacy unversioned child history failed replay: %v", err)
+	}
+}

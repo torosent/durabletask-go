@@ -120,6 +120,10 @@ func (w *orchestratorProcessor) ProcessWorkItem(ctx context.Context, cwi WorkIte
 
 				// We create a new trace span for every continue-as-new
 				w.endOrchestratorSpan(ctx, wi, span, true)
+				if wi.State.ContinueAsNewVersionChanged() {
+					wi.State.CustomStatus = wrapperspb.String("")
+					break
+				}
 				ctx, span = w.startOrResumeOrchestratorSpan(ctx, wi)
 				continue
 			}

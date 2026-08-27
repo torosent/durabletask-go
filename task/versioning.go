@@ -26,11 +26,36 @@ const (
 	VersionFailureFail
 )
 
+// UnversionedTaskVersion explicitly selects an unversioned task.
+const UnversionedTaskVersion = ""
+
 // VersioningOptions configures version-aware orchestration and activity dispatch.
 type VersioningOptions struct {
 	Version         string
+	DefaultVersion  string
 	MatchStrategy   VersionMatchStrategy
 	FailureStrategy VersionFailureStrategy
+}
+
+// Validate checks that the versioning configuration is supported.
+func (o VersioningOptions) Validate() error {
+	switch o.MatchStrategy {
+	case VersionMatchNone, VersionMatchStrict, VersionMatchCurrentOrOlder:
+	default:
+		return &versionConfigurationError{strategy: o.MatchStrategy}
+	}
+	switch o.FailureStrategy {
+	case VersionFailureReject, VersionFailureFail:
+	default:
+		return fmt.Errorf("unknown version failure strategy %d", o.FailureStrategy)
+	}
+	if _, err := normalizeTaskVersionForRegistration(o.Version); err != nil {
+		return fmt.Errorf("invalid worker version: %w", err)
+	}
+	if _, err := normalizeTaskVersionForRegistration(o.DefaultVersion); err != nil {
+		return fmt.Errorf("invalid default version: %w", err)
+	}
+	return nil
 }
 
 // VersionMismatchError indicates that a work item is incompatible with this worker.
@@ -68,7 +93,13 @@ func (*VersionMismatchError) WorkItemAbandonDelay() time.Duration {
 }
 
 func (o *VersioningOptions) check(taskVersion string) error {
-	if o == nil || o.MatchStrategy == VersionMatchNone {
+	if o == nil {
+		return nil
+	}
+	if err := o.Validate(); err != nil {
+		return err
+	}
+	if o.MatchStrategy == VersionMatchNone {
 		return nil
 	}
 	comparison := compareVersions(taskVersion, o.Version)
@@ -90,6 +121,13 @@ func (o *VersioningOptions) check(taskVersion string) error {
 		WorkerVersion: o.Version,
 		Strategy:      o.MatchStrategy,
 	}
+}
+
+func (o *VersioningOptions) defaultVersion() string {
+	if o == nil {
+		return ""
+	}
+	return o.DefaultVersion
 }
 
 type versionConfigurationError struct {

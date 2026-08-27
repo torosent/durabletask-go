@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -20,6 +22,7 @@ type largePayloadSidecarClient struct {
 	start     *protos.CreateInstanceRequest
 	event     *protos.RaiseEventRequest
 	terminate *protos.TerminateRequest
+	signal    *protos.SignalEntityRequest
 	state     *protos.OrchestrationState
 }
 
@@ -50,12 +53,43 @@ func (c *largePayloadSidecarClient) TerminateInstance(
 	return &protos.TerminateResponse{}, nil
 }
 
+func (c *largePayloadSidecarClient) SignalEntity(
+	_ context.Context,
+	req *protos.SignalEntityRequest,
+	_ ...grpc.CallOption,
+) (*protos.SignalEntityResponse, error) {
+	c.signal = req
+	return &protos.SignalEntityResponse{}, nil
+}
+
 func (c *largePayloadSidecarClient) GetInstance(
 	context.Context,
 	*protos.GetInstanceRequest,
 	...grpc.CallOption,
 ) (*protos.GetInstanceResponse, error) {
 	return &protos.GetInstanceResponse{Exists: true, OrchestrationState: c.state}, nil
+}
+
+type textDataConverter struct{}
+
+func (textDataConverter) Serialize(value any) (string, error) {
+	return "text:" + base64.RawStdEncoding.EncodeToString([]byte(fmt.Sprint(value))), nil
+}
+
+func (textDataConverter) Deserialize(payload string, target any) error {
+	if len(payload) < len("text:") || payload[:len("text:")] != "text:" {
+		return fmt.Errorf("unexpected payload %q", payload)
+	}
+	data, err := base64.RawStdEncoding.DecodeString(payload[len("text:"):])
+	if err != nil {
+		return err
+	}
+	value, ok := target.(*string)
+	if !ok {
+		return fmt.Errorf("unsupported target %T", target)
+	}
+	*value = string(data)
+	return nil
 }
 
 func TestTaskHubGrpcClientLargePayloadManagementFields(t *testing.T) {
@@ -104,6 +138,62 @@ func TestTaskHubGrpcClientLargePayloadManagementFields(t *testing.T) {
 	require.Equal(t, "metadata-input", metadata.SerializedInput)
 	require.Equal(t, "metadata-output", metadata.SerializedOutput)
 	require.Equal(t, "metadata-status", metadata.SerializedCustomStatus)
+}
+
+func TestTaskHubGrpcClientUsesConverterBeforeLargePayloadExternalization(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	fake := &largePayloadSidecarClient{}
+	converter := textDataConverter{}
+	client := &TaskHubGrpcClient{
+		client:        fake,
+		logger:        backend.DefaultLogger(),
+		largePayloads: options,
+		converter:     converter,
+	}
+	ctx := context.Background()
+
+	id, err := client.ScheduleNewOrchestration(ctx, "orchestrator", api.WithInput("start"))
+	require.NoError(t, err)
+	requireLargePayloadValue(t, options, fake.start.Input, mustSerialize(t, converter, "start"))
+
+	require.NoError(t, client.RaiseEvent(ctx, id, "event", api.WithEventPayload("event")))
+	requireLargePayloadValue(t, options, fake.event.Input, mustSerialize(t, converter, "event"))
+
+	require.NoError(t, client.TerminateOrchestration(ctx, id, api.WithOutput("output")))
+	requireLargePayloadValue(t, options, fake.terminate.Output, mustSerialize(t, converter, "output"))
+
+	entityID := api.NewEntityID("counter", "one")
+	require.NoError(t, client.SignalEntity(ctx, entityID, "add", api.WithSignalInput("signal")))
+	requireLargePayloadValue(t, options, fake.signal.Input, mustSerialize(t, converter, "signal"))
+
+	serializedInput := mustSerialize(t, converter, "metadata")
+	externalizedInput, err := largepayload.Externalize(ctx, options, wrapperspb.String(serializedInput))
+	require.NoError(t, err)
+	fake.state = &protos.OrchestrationState{
+		InstanceId:           string(id),
+		Name:                 "orchestrator",
+		CreatedTimestamp:     timestamppb.Now(),
+		LastUpdatedTimestamp: timestamppb.Now(),
+		Input:                externalizedInput,
+	}
+	metadata, err := client.FetchOrchestrationMetadata(ctx, id)
+	require.NoError(t, err)
+	var decoded string
+	require.NoError(t, metadata.ReadInput(&decoded))
+	require.Equal(t, "metadata", decoded)
+}
+
+func mustSerialize(t *testing.T, converter api.DataConverter, value any) string {
+	t.Helper()
+	payload, err := converter.Serialize(value)
+	require.NoError(t, err)
+	return payload
 }
 
 func requireLargePayloadValue(

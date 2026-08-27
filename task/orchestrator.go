@@ -3,7 +3,6 @@ package task
 import (
 	"container/list"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,7 +68,10 @@ type OrchestrationContext struct {
 	pendingEntityTasks       map[string]*completableTask
 	continuedAsNew           bool
 	continuedAsNewInput      any
+	continuedAsNewVersion    *wrapperspb.StringValue
 	customStatus             string
+	defaultVersion           string
+	converter                api.DataConverter
 	scheduler                *coroutineScheduler
 	root                     *OrchestrationContext
 	scope                    *cancellationScope
@@ -96,8 +98,18 @@ type callSubOrchestratorOptions struct {
 	retryPolicy *RetryPolicy
 }
 
+func (options *callSubOrchestratorOptions) versionOrDefault(defaultVersion string) *wrapperspb.StringValue {
+	if options.version != nil {
+		return options.version
+	}
+	if defaultVersion == "" {
+		return nil
+	}
+	return wrapperspb.String(defaultVersion)
+}
+
 // subOrchestratorOption is a functional option type for the CallSubOrchestrator orchestrator method.
-type subOrchestratorOption func(*callSubOrchestratorOptions) error
+type subOrchestratorOption func(*callSubOrchestratorOptions, api.DataConverter) error
 
 // ContinueAsNewOption is a functional option type for the ContinueAsNew orchestrator method.
 type ContinueAsNewOption func(*OrchestrationContext)
@@ -110,13 +122,24 @@ func WithKeepUnprocessedEvents() ContinueAsNewOption {
 	}
 }
 
+// WithContinueAsNewVersion migrates the next execution to a new orchestration version.
+func WithContinueAsNewVersion(version string) ContinueAsNewOption {
+	return func(ctx *OrchestrationContext) {
+		if version != "" && strings.TrimSpace(version) == "" {
+			ctx.continuedAsNewVersion = nil
+			return
+		}
+		ctx.continuedAsNewVersion = wrapperspb.String(version)
+	}
+}
+
 // WithSubOrchestratorInput is a functional option type for the CallSubOrchestrator
-// orchestrator method that takes an input value and marshals it to JSON.
+// orchestrator method that serializes an input value with the configured converter.
 func WithSubOrchestratorInput(input any) subOrchestratorOption {
-	return func(opts *callSubOrchestratorOptions) error {
-		bytes, err := marshalData(input)
+	return func(opts *callSubOrchestratorOptions, converter api.DataConverter) error {
+		bytes, err := marshalData(converter, input)
 		if err != nil {
-			return fmt.Errorf("failed to marshal input to JSON: %w", err)
+			return fmt.Errorf("failed to serialize input: %w", err)
 		}
 		opts.rawInput = wrapperspb.String(string(bytes))
 		return nil
@@ -126,7 +149,7 @@ func WithSubOrchestratorInput(input any) subOrchestratorOption {
 // WithRawSubOrchestratorInput is a functional option type for the CallSubOrchestrator
 // orchestrator method that takes a raw input value.
 func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
-	return func(opts *callSubOrchestratorOptions) error {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.rawInput = wrapperspb.String(input)
 		return nil
 	}
@@ -135,7 +158,7 @@ func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
 // WithSubOrchestrationInstanceID is a functional option type for the CallSubOrchestrator
 // orchestrator method that specifies the instance ID of the sub-orchestration.
 func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
-	return func(opts *callSubOrchestratorOptions) error {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.instanceID = instanceID
 		return nil
 	}
@@ -143,14 +166,14 @@ func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
 
 // WithSubOrchestrationVersion configures the sub-orchestration version.
 func WithSubOrchestrationVersion(version string) subOrchestratorOption {
-	return func(opts *callSubOrchestratorOptions) error {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.version = wrapperspb.String(version)
 		return nil
 	}
 }
 
 func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) subOrchestratorOption {
-	return func(opt *callSubOrchestratorOptions) error {
+	return func(opt *callSubOrchestratorOptions, _ api.DataConverter) error {
 		if policy == nil {
 			return nil
 		}
@@ -176,6 +199,8 @@ func NewOrchestrationContext(registry *TaskRegistry, id api.InstanceID, oldEvent
 		backend.MetricsHooks{},
 		nil,
 		nil,
+		"",
+		api.DefaultDataConverter(),
 	)
 }
 
@@ -190,6 +215,8 @@ func newOrchestrationContext(
 	metrics backend.MetricsHooks,
 	contextFields api.ContextFields,
 	errorProperties api.ErrorPropertiesProvider,
+	defaultVersion string,
+	converter api.DataConverter,
 ) *OrchestrationContext {
 	ctx := &OrchestrationContext{
 		ID:                        id,
@@ -199,6 +226,8 @@ func newOrchestrationContext(
 		logger:                    logger,
 		metrics:                   metrics,
 		orchestrationOptions:      options,
+		defaultVersion:            defaultVersion,
+		converter:                 api.NormalizeDataConverter(converter),
 		registry:                  registry,
 		oldEvents:                 oldEvents,
 		newEvents:                 newEvents,
@@ -485,8 +514,26 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	return err
 }
 
+// SetCustomStatus stores a raw, pre-serialized custom status string.
+// Use SetCustomStatusValue to apply the configured data converter.
 func (octx *OrchestrationContext) SetCustomStatus(cs string) {
 	octx.engineContext().customStatus = cs
+}
+
+// SetCustomStatusValue serializes and stores a typed custom status value.
+func (octx *OrchestrationContext) SetCustomStatusValue(value any) error {
+	engine := octx.engineContext()
+	payload, err := api.SerializeData(engine.converter, value)
+	if err != nil {
+		return fmt.Errorf("failed to serialize custom status: %w", err)
+	}
+	engine.customStatus = payload
+	return nil
+}
+
+// SetRawCustomStatus stores a pre-serialized custom status value.
+func (octx *OrchestrationContext) SetRawCustomStatus(payload string) {
+	octx.engineContext().customStatus = payload
 }
 
 var guidNamespace = uuid.MustParse("9e952958-5e33-4daf-827f-2fa12937b875")
@@ -502,7 +549,8 @@ func (ctx *OrchestrationContext) NewGuid() string {
 
 // GetInput unmarshals the serialized orchestration input and stores it in [v].
 func (octx *OrchestrationContext) GetInput(v any) error {
-	return unmarshalData(octx.engineContext().rawInput, v)
+	engine := octx.engineContext()
+	return unmarshalData(engine.converter, engine.rawInput, v)
 }
 
 // CallActivity schedules an asynchronous invocation of an activity function. The [activity]
@@ -512,7 +560,7 @@ func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivity
 	engine := ctx.engineContext()
 	options := new(callActivityOptions)
 	for _, configure := range opts {
-		if err := configure(options); err != nil {
+		if err := configure(options, engine.converter); err != nil {
 			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
@@ -524,7 +572,7 @@ func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivity
 		retryInfo := retryTaskInfo{
 			kind:    backend.WorkItemKindActivity,
 			name:    helpers.GetTaskFunctionName(activity),
-			version: options.version.GetValue(),
+			version: options.versionOrInherited(engine.Version).GetValue(),
 		}
 		return engine.internalScheduleTaskWithRetries(engine.CurrentTimeUtc, func() Task {
 			return engine.internalScheduleActivity(activity, options, ctx.scope)
@@ -578,7 +626,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 		ctx.getNextSequenceNumber(),
 		helpers.GetTaskFunctionName(activity),
 		options.rawInput,
-		options.version)
+		options.versionOrInherited(ctx.Version))
 	scheduleTaskAction.GetScheduleTask().Tags = contextprop.Encode(api.OrchestrationContextInfo{
 		InstanceID:       ctx.ID,
 		Name:             ctx.Name,
@@ -590,6 +638,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 
 	task := newTaskInScope(ctx, scope)
 	task.taskName = scheduleTaskAction.GetScheduleTask().GetName()
+	task.taskVersion = scheduleTaskAction.GetScheduleTask().GetVersion().GetValue()
 	task.taskID = scheduleTaskAction.Id
 	ctx.pendingTasks[scheduleTaskAction.Id] = task
 	return task
@@ -602,7 +651,7 @@ func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...s
 	}
 	options := new(callSubOrchestratorOptions)
 	for _, configure := range opts {
-		if err := configure(options); err != nil {
+		if err := configure(options, engine.converter); err != nil {
 			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
@@ -614,7 +663,7 @@ func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...s
 		retryInfo := retryTaskInfo{
 			kind:    backend.WorkItemKindOrchestration,
 			name:    helpers.GetTaskFunctionName(orchestrator),
-			version: options.version.GetValue(),
+			version: options.versionOrDefault(engine.defaultVersion).GetValue(),
 		}
 		return engine.internalScheduleTaskWithRetries(engine.CurrentTimeUtc, func() Task {
 			return engine.internalCallSubOrchestrator(orchestrator, options, ctx.scope)
@@ -637,7 +686,7 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 		helpers.GetTaskFunctionName(orchestrator),
 		options.instanceID,
 		options.rawInput,
-		options.version,
+		options.versionOrDefault(ctx.defaultVersion),
 	)
 	createSubOrchestrationAction.GetCreateSubOrchestration().Tags = contextprop.Encode(
 		api.OrchestrationContextInfo{
@@ -660,6 +709,7 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 
 	task := newTaskInScope(ctx, scope)
 	task.taskName = createSubOrchestrationAction.GetCreateSubOrchestration().GetName()
+	task.taskVersion = createSubOrchestrationAction.GetCreateSubOrchestration().GetVersion().GetValue()
 	task.taskID = createSubOrchestrationAction.Id
 	ctx.pendingTasks[createSubOrchestrationAction.Id] = task
 	return task
@@ -721,6 +771,7 @@ func (t *completableTask) completeFrom(source Task, fallback error) {
 		return
 	}
 	t.taskName = state.taskName
+	t.taskVersion = state.taskVersion
 	t.taskID = state.taskID
 	t.entityID = state.entityID
 	t.entityOperation = state.entityOperation
@@ -845,7 +896,7 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 	}
 	options := new(callEntityOptions)
 	for _, configure := range opts {
-		if err := configure(options); err != nil {
+		if err := configure(options, engine.converter); err != nil {
 			return ctx.newFailedTask(engine, api.WrapInvalidArgument(err))
 		}
 	}
@@ -903,7 +954,7 @@ func (ctx *OrchestrationContext) SignalEntity(entityID api.EntityID, operationNa
 	}
 	options := new(signalEntityOptions)
 	for _, configure := range opts {
-		if err := configure(options); err != nil {
+		if err := configure(options, engine.converter); err != nil {
 			return api.WrapInvalidArgument(err)
 		}
 	}
@@ -1014,11 +1065,11 @@ func (ctx *OrchestrationContext) ContinueAsNew(newInput any, options ...Continue
 // SendEvent sends an event to another orchestration instance as part of the
 // current durable orchestration transaction.
 func (ctx *OrchestrationContext) SendEvent(instanceID api.InstanceID, eventName string, payload any) error {
-	raw, err := marshalData(payload)
+	engine := ctx.engineContext()
+	raw, err := marshalData(engine.converter, payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event payload: %w", err)
 	}
-	engine := ctx.engineContext()
 	if engine.isTerminated || ctx.scope.isCanceled() {
 		return ErrTaskCanceled
 	}
@@ -1029,17 +1080,13 @@ func (ctx *OrchestrationContext) SendEvent(instanceID api.InstanceID, eventName 
 }
 
 func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedEvent) error {
-	orchestrator, ok := ctx.registry.orchestrators[es.Name]
+	orchestrator, ok := ctx.registry.getOrchestrator(es.Name, es.GetVersion().GetValue())
 	if !ok {
-		// try looking for a "default" orchestrator
-		orchestrator, ok = ctx.registry.orchestrators["*"]
-		if !ok {
-			return newTaskNotRegisteredError(
-				orchestratorTaskNotFoundErrorType,
-				es.Name,
-				es.GetVersion().GetValue(),
-			)
-		}
+		return newTaskNotRegisteredError(
+			orchestratorTaskNotFoundErrorType,
+			es.Name,
+			es.GetVersion().GetValue(),
+		)
 	}
 	ctx.Name = es.Name
 	ctx.Version = es.GetVersion().GetValue()
@@ -1058,10 +1105,15 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 }
 
 func (ctx *OrchestrationContext) onTaskScheduled(taskID int32, ts *protos.TaskScheduledEvent) error {
-	if a, ok := ctx.pendingActions[taskID]; !ok || a.GetScheduleTask() == nil {
+	action, ok := ctx.pendingActions[taskID]
+	scheduled := action.GetScheduleTask()
+	if !ok || scheduled == nil ||
+		!strings.EqualFold(scheduled.GetName(), ts.GetName()) ||
+		!versionsMatchReplayHistory(scheduled.GetVersion(), ts.GetVersion(), ctx.Version) {
 		return fmt.Errorf(
-			"a previous execution called CallActivity for '%s' and sequence number %d at this point in the orchestration logic, but the current execution doesn't have this action with this sequence number",
+			"a previous execution called CallActivity for '%s' with version '%s' and sequence number %d at this point in the orchestration logic, but the current execution doesn't have a matching action",
 			ts.Name,
+			ts.GetVersion().GetValue(),
 			taskID,
 		)
 	}
@@ -1105,15 +1157,35 @@ func (ctx *OrchestrationContext) onTaskFailed(tf *protos.TaskFailedEvent) error 
 }
 
 func (ctx *OrchestrationContext) onSubOrchestrationScheduled(taskID int32, ts *protos.SubOrchestrationInstanceCreatedEvent) error {
-	if a, ok := ctx.pendingActions[taskID]; !ok || a.GetCreateSubOrchestration() == nil {
+	action, ok := ctx.pendingActions[taskID]
+	scheduled := action.GetCreateSubOrchestration()
+	if !ok || scheduled == nil ||
+		!strings.EqualFold(scheduled.GetName(), ts.GetName()) ||
+		!versionsMatchReplayHistory(scheduled.GetVersion(), ts.GetVersion(), ctx.defaultVersion) {
 		return fmt.Errorf(
-			"a previous execution called CallSubOrchestrator for '%s' and sequence number %d at this point in the orchestration logic, but the current execution doesn't have this action with this sequence number",
+			"a previous execution called CallSubOrchestrator for '%s' with version '%s' and sequence number %d at this point in the orchestration logic, but the current execution doesn't have a matching action",
 			ts.Name,
+			ts.GetVersion().GetValue(),
 			taskID,
 		)
 	}
 	delete(ctx.pendingActions, taskID)
 	return nil
+}
+
+func versionsMatchReplayHistory(
+	scheduled *wrapperspb.StringValue,
+	historical *wrapperspb.StringValue,
+	legacyDefault string,
+) bool {
+	if strings.EqualFold(scheduled.GetValue(), historical.GetValue()) {
+		return true
+	}
+	// A nil historical version predates version inheritance/defaulting. A non-nil
+	// empty wrapper is an explicit unversioned selection and must still mismatch.
+	return historical == nil &&
+		legacyDefault != "" &&
+		strings.EqualFold(scheduled.GetValue(), legacyDefault)
 }
 
 func (ctx *OrchestrationContext) onSubOrchestrationCompleted(soc *protos.SubOrchestrationInstanceCompletedEvent) error {
@@ -1388,9 +1460,9 @@ func (ctx *OrchestrationContext) takePendingEntityTask(requestID string) *comple
 func (ctx *OrchestrationContext) setComplete(output any) error {
 	var rawOutput *wrapperspb.StringValue
 	if output != nil {
-		bytes, err := json.Marshal(output)
+		bytes, err := marshalData(ctx.converter, output)
 		if err != nil {
-			return fmt.Errorf("failed to marshal output to JSON: %w", err)
+			return fmt.Errorf("failed to serialize output: %w", err)
 		}
 		rawOutput = wrapperspb.String(string(bytes))
 	}
@@ -1399,10 +1471,14 @@ func (ctx *OrchestrationContext) setComplete(output any) error {
 
 func (ctx *OrchestrationContext) setFailed(appError error) error {
 	ctx.clearCompletionActions()
+	provider := ctx.errorProperties
+	if errors.Is(appError, api.ErrTaskNotRegistered) {
+		provider = nil
+	}
 	return ctx.setCompleteInternal(
 		nil,
 		protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
-		failure.FromError(appError, ctx.errorProperties),
+		failure.FromError(appError, provider),
 	)
 }
 
@@ -1427,6 +1503,7 @@ func (ctx *OrchestrationContext) enforceHistoryLimit() {
 		MaxEventsPerTurnExceeded: ctx.maxEventsPerTurnExceeded,
 		UnprocessedEventCount:    unprocessedEventCount,
 		SerializedInput:          string(ctx.rawInput),
+		Converter:                ctx.converter,
 	})
 	if err != nil {
 		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(err))
@@ -1500,9 +1577,9 @@ func (ctx *OrchestrationContext) hasCompletionAction() bool {
 func (ctx *OrchestrationContext) setContinuedAsNew() error {
 	var newRawInput *wrapperspb.StringValue
 	if ctx.continuedAsNewInput != nil {
-		bytes, err := json.Marshal(ctx.continuedAsNewInput)
+		bytes, err := marshalData(ctx.converter, ctx.continuedAsNewInput)
 		if err != nil {
-			return fmt.Errorf("failed to marshal continue-as-new payload to JSON: %w", err)
+			return fmt.Errorf("failed to serialize continue-as-new payload: %w", err)
 		}
 		newRawInput = wrapperspb.String(string(bytes))
 	}
@@ -1527,6 +1604,9 @@ func (ctx *OrchestrationContext) setCompleteInternal(
 		nil, // carryoverEvents is assigned later
 		failureDetails,
 	)
+	if status == protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW {
+		completedAction.GetCompleteOrchestration().NewVersion = ctx.continuedAsNewVersion
+	}
 	ctx.pendingActions[sequenceNumber] = completedAction
 	return nil
 }
