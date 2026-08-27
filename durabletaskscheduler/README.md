@@ -47,6 +47,7 @@ cancels them only if the shutdown context expires.
 | Completion tokens and abandon RPCs | Supported |
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
 | Streamed orchestration history | Supported and advertised |
+| Version-aware dispatch | Supported with `client.WithTaskExecutorOptions(task.WithVersioning(...))` |
 | Scheduled-task capability | Not advertised |
 | Large-payload capability | Not advertised |
 | Durable entities | Not implemented; tokenized entity work is abandoned |

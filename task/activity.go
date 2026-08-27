@@ -14,7 +14,16 @@ type callActivityOption func(*callActivityOptions) error
 
 type callActivityOptions struct {
 	rawInput    *wrapperspb.StringValue
+	version     *wrapperspb.StringValue
 	retryPolicy *RetryPolicy
+}
+
+// WithActivityVersion configures the activity version.
+func WithActivityVersion(version string) callActivityOption {
+	return func(opt *callActivityOptions) error {
+		opt.version = wrapperspb.String(version)
+		return nil
+	}
 }
 
 type RetryPolicy struct {

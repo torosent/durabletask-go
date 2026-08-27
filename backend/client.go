@@ -58,7 +58,7 @@ func (c *backendClient) ScheduleNewOrchestration(ctx context.Context, orchestrat
 	defer span.End()
 
 	tc := helpers.TraceContextFromSpan(span)
-	e := helpers.NewExecutionStartedEvent(req.Name, req.InstanceId, req.Input, nil, tc, req.ScheduledStartTimestamp)
+	e := helpers.NewExecutionStartedEvent(req.Name, req.InstanceId, req.Input, nil, tc, req.ScheduledStartTimestamp, req.Version)
 	policy, err := orchestrationIDReusePolicyFromProto(req.OrchestrationIdReusePolicy)
 	if err != nil {
 		return api.EmptyInstanceID, fmt.Errorf("failed to decode orchestration ID reuse policy: %w", err)

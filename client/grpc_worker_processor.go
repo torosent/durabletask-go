@@ -11,6 +11,7 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -136,6 +137,12 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	}
 
 	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
+	var versionMismatch *task.VersionMismatchError
+	if errors.As(err, &versionMismatch) {
+		w.logger.Warnf("%s: orchestration version mismatch; abandoning work item: %v", request.InstanceId, err)
+		w.abandonOrchestration(ctx, client, completionToken)
+		return
+	}
 	if err != nil && ctx.Err() != nil {
 		w.logger.Warnf("%s: orchestration execution canceled; abandoning work item", request.InstanceId)
 		w.abandonOrchestration(ctx, client, completionToken)
@@ -250,6 +257,18 @@ func (w *TaskHubGrpcWorker) processActivity(
 		request.ParentTraceContext,
 	)
 	result, err := w.executor.ExecuteActivity(ctx, api.InstanceID(request.OrchestrationInstance.InstanceId), event)
+	var versionMismatch *task.VersionMismatchError
+	if errors.As(err, &versionMismatch) {
+		w.logger.Warnf(
+			"%s/%s#%d: activity version mismatch; abandoning work item: %v",
+			request.OrchestrationInstance.InstanceId,
+			request.Name,
+			request.TaskId,
+			err,
+		)
+		w.abandonActivity(ctx, client, completionToken)
+		return
+	}
 	if err != nil && ctx.Err() != nil {
 		w.logger.Warnf("%s/%s#%d: activity execution canceled; abandoning work item", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId)
 		w.abandonActivity(ctx, client, completionToken)

@@ -77,6 +77,7 @@ type fakeSidecarClient struct {
 	orchestrationCompletions []*protos.OrchestratorResponse
 	activityCompletions      []*protos.ActivityResponse
 	orchestrationAbandons    int
+	activityAbandons         int
 	entityAbandonAttempts    int
 	entityAbandonFailures    int
 }
@@ -136,6 +137,17 @@ func (c *fakeSidecarClient) AbandonTaskOrchestratorWorkItem(
 	c.orchestrationAbandons++
 	c.mu.Unlock()
 	return &protos.AbandonOrchestrationTaskResponse{}, nil
+}
+
+func (c *fakeSidecarClient) AbandonTaskActivityWorkItem(
+	_ context.Context,
+	_ *protos.AbandonActivityTaskRequest,
+	_ ...grpc.CallOption,
+) (*protos.AbandonActivityTaskResponse, error) {
+	c.mu.Lock()
+	c.activityAbandons++
+	c.mu.Unlock()
+	return &protos.AbandonActivityTaskResponse{}, nil
 }
 
 func (c *fakeSidecarClient) AbandonTaskEntityWorkItem(
@@ -421,6 +433,39 @@ func TestTaskHubGrpcWorkerAbandonsUnsupportedEntityWithBoundedRetry(t *testing.T
 		defer client.mu.Unlock()
 		return client.entityAbandonAttempts == 3
 	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerRejectsMismatchedTaskVersion(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSidecarClient{stream: stream}
+	worker := newFakeWorker(t, client, WithTaskExecutorOptions(task.WithVersioning(task.VersioningOptions{
+		Version:         "1.0",
+		MatchStrategy:   task.VersionMatchStrict,
+		FailureStrategy: task.VersionFailureReject,
+	})))
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_ActivityRequest{ActivityRequest: &protos.ActivityRequest{
+			Name:                  "activity",
+			Version:               wrapperspb.String("2.0"),
+			TaskId:                1,
+			OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: "instance"},
+		}},
+		CompletionToken: "version-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.activityAbandons == 1
+	}, time.Second, time.Millisecond)
+	client.mu.Lock()
+	require.Empty(t, client.activityCompletions)
+	client.mu.Unlock()
+
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
 }
