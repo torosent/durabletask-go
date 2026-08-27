@@ -12,7 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/payload"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -247,8 +249,9 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 		WithMaxConcurrentOrchestrationWorkItems(2),
 		WithMaxConcurrentActivityWorkItems(3),
 		WithMaxConcurrentEntityWorkItems(4),
-		WithWorkItemFilters(WorkItemFilters{
-			Entities: []string{"counter"},
+		WithWorkItemFilters(&WorkItemFilters{
+			Activities: []WorkItemFilter{{Name: "activity"}},
+			Entities:   []string{"counter"},
 		}),
 	)
 	worker.executor = &recordingExecutor{
@@ -291,6 +294,169 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 	}, client.request.Capabilities)
 	require.Equal(t, "activity-token", client.activityCompletions[0].CompletionToken)
 	client.mu.Unlock()
+
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSidecarClient{stream: stream}
+	worker := newFakeWorker(
+		t,
+		client,
+		WithScheduledTaskCapability(true),
+		WithWorkItemFilters(&WorkItemFilters{
+			Orchestrations: []WorkItemFilter{{Name: "orchestration", Versions: []string{"v1", "v2"}}},
+			Activities:     []WorkItemFilter{{Name: "activity", Versions: []string{"v3"}}},
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.request != nil
+	}, time.Second, time.Millisecond)
+
+	client.mu.Lock()
+	require.Equal(t, []protos.WorkerCapability{
+		protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING,
+		protos.WorkerCapability_WORKER_CAPABILITY_SCHEDULED_TASKS,
+	}, client.request.Capabilities)
+	require.Equal(t, []*protos.OrchestrationFilter{{
+		Name:     "orchestration",
+		Versions: []string{"v1", "v2"},
+	}}, client.request.WorkItemFilters.Orchestrations)
+	require.Equal(t, []*protos.ActivityFilter{{
+		Name:     "activity",
+		Versions: []string{"v3"},
+	}}, client.request.WorkItemFilters.Activities)
+	client.mu.Unlock()
+
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerLocallyRejectsFilteredWorkItems(t *testing.T) {
+	stream := newFakeWorkItemStream(2)
+	client := &fakeSidecarClient{stream: stream}
+	worker := newFakeWorker(
+		t,
+		client,
+		WithWorkItemFilters(&WorkItemFilters{
+			Orchestrations: []WorkItemFilter{{Name: "allowed-orchestration", Versions: []string{"v1"}}},
+			Activities:     []WorkItemFilter{{Name: "allowed-activity", Versions: []string{"v1"}}},
+		}),
+	)
+	var executionCount atomic.Int32
+	worker.executor = &recordingExecutor{
+		executeOrchestrator: func(
+			context.Context,
+			api.InstanceID,
+			[]*protos.HistoryEvent,
+			[]*protos.HistoryEvent,
+		) (*backend.ExecutionResults, error) {
+			executionCount.Add(1)
+			return &backend.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+		},
+		executeActivity: func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error) {
+			executionCount.Add(1)
+			return &protos.HistoryEvent{
+				EventType: &protos.HistoryEvent_TaskCompleted{
+					TaskCompleted: &protos.TaskCompletedEvent{},
+				},
+			}, nil
+		},
+	}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_OrchestratorRequest{OrchestratorRequest: &protos.OrchestratorRequest{
+			InstanceId: "instance",
+			NewEvents: []*protos.HistoryEvent{{
+				EventType: &protos.HistoryEvent_ExecutionStarted{
+					ExecutionStarted: &protos.ExecutionStartedEvent{
+						Name:    "other-orchestration",
+						Version: wrapperspb.String("v1"),
+					},
+				},
+			}},
+		}},
+		CompletionToken: "orchestration-token",
+	}}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_ActivityRequest{ActivityRequest: &protos.ActivityRequest{
+			Name:                  "allowed-activity",
+			Version:               wrapperspb.String("v2"),
+			TaskId:                7,
+			OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: "instance"},
+		}},
+		CompletionToken: "activity-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.orchestrationAbandons == 1 && client.activityAbandons == 1
+	}, time.Second, time.Millisecond)
+	require.Zero(t, executionCount.Load())
+
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerHydratesAndExternalizesLargePayloads(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	input, err := largepayload.Externalize(context.Background(), options, wrapperspb.String(`"large-input"`))
+	require.NoError(t, err)
+
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSidecarClient{stream: stream}
+	worker := newFakeWorker(t, client, WithWorkerLargePayloads(options))
+	worker.executor = &recordingExecutor{
+		executeActivity: func(_ context.Context, _ api.InstanceID, event *protos.HistoryEvent) (*protos.HistoryEvent, error) {
+			require.Equal(t, `"large-input"`, event.GetTaskScheduled().GetInput().GetValue())
+			return &protos.HistoryEvent{
+				EventType: &protos.HistoryEvent_TaskCompleted{
+					TaskCompleted: &protos.TaskCompletedEvent{Result: wrapperspb.String(`"large-output"`)},
+				},
+			}, nil
+		},
+	}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_ActivityRequest{ActivityRequest: &protos.ActivityRequest{
+			Name:                  "activity",
+			Input:                 input,
+			TaskId:                7,
+			OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: "instance"},
+		}},
+		CompletionToken: "activity-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return len(client.activityCompletions) == 1
+	}, time.Second, time.Millisecond)
+
+	client.mu.Lock()
+	require.Contains(t, client.request.Capabilities, protos.WorkerCapability_WORKER_CAPABILITY_LARGE_PAYLOADS)
+	result := client.activityCompletions[0].Result
+	client.mu.Unlock()
+	require.NotEqual(t, `"large-output"`, result.GetValue())
+	hydrated, err := largepayload.Hydrate(context.Background(), options, result)
+	require.NoError(t, err)
+	require.Equal(t, `"large-output"`, hydrated.GetValue())
 
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))

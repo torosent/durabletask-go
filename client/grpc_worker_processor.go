@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
+	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc/codes"
@@ -171,6 +173,23 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		}
 		pastEvents = history
 	}
+	payloadRequest := &protos.OrchestratorRequest{
+		PastEvents: pastEvents,
+		NewEvents:  request.NewEvents,
+	}
+	if err := largepayload.TransformOrchestratorRequest(ctx, w.options.largePayloads, payloadRequest); err != nil {
+		w.logger.Errorf("%s: failed to hydrate orchestration work item payloads: %v", request.InstanceId, err)
+		w.abandonOrchestration(ctx, client, completionToken)
+		return
+	}
+	if w.options.workItemFilters != nil {
+		name, version, ok := orchestrationWorkItemIdentity(pastEvents, request.NewEvents)
+		if !ok || !matchesWorkItemFilters(w.options.workItemFilters, true, name, version) {
+			w.logger.Warnf("%s: orchestration work item does not match configured filters; abandoning it", request.InstanceId)
+			w.abandonOrchestration(ctx, client, completionToken)
+			return
+		}
+	}
 
 	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
 	var versionMismatch *task.VersionMismatchError
@@ -220,6 +239,11 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		if response.OrchestrationTraceContext == nil {
 			response.OrchestrationTraceContext = request.OrchestrationTraceContext
 		}
+	}
+	if err := largepayload.TransformOrchestratorResponse(ctx, w.options.largePayloads, response); err != nil {
+		w.logger.Errorf("%s: failed to externalize orchestration response payloads: %v", request.InstanceId, err)
+		w.abandonOrchestration(ctx, client, completionToken)
+		return
 	}
 
 	err = w.executeRPCWithRetry(ctx, "complete orchestration task", func(callCtx context.Context) error {
@@ -275,6 +299,27 @@ func (w *TaskHubGrpcWorker) processActivity(
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
+	if err := largepayload.TransformActivityRequest(ctx, w.options.largePayloads, request); err != nil {
+		w.logger.Errorf(
+			"%s/%s#%d: failed to hydrate activity payload: %v",
+			request.OrchestrationInstance.InstanceId,
+			request.Name,
+			request.TaskId,
+			err,
+		)
+		w.abandonActivity(ctx, client, completionToken)
+		return
+	}
+	if !matchesWorkItemFilters(w.options.workItemFilters, false, request.Name, request.Version.GetValue()) {
+		w.logger.Warnf(
+			"%s/%s#%d: activity work item does not match configured filters; abandoning it",
+			request.OrchestrationInstance.InstanceId,
+			request.Name,
+			request.TaskId,
+		)
+		w.abandonActivity(ctx, client, completionToken)
+		return
+	}
 
 	event := helpers.NewTaskScheduledEvent(
 		request.TaskId,
@@ -297,6 +342,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
+
 	if err != nil && ctx.Err() != nil {
 		w.logger.Warnf("%s/%s#%d: activity execution canceled; abandoning work item", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId)
 		w.abandonActivity(ctx, client, completionToken)
@@ -322,6 +368,17 @@ func (w *TaskHubGrpcWorker) processActivity(
 			ErrorType:    "UnknownTaskResult",
 			ErrorMessage: "activity executor returned an unknown task result",
 		}
+	}
+	if err := largepayload.TransformActivityResponse(ctx, w.options.largePayloads, response); err != nil {
+		w.logger.Errorf(
+			"%s/%s#%d: failed to externalize activity response payload: %v",
+			request.OrchestrationInstance.InstanceId,
+			request.Name,
+			request.TaskId,
+			err,
+		)
+		w.abandonActivity(ctx, client, completionToken)
+		return
 	}
 
 	err = w.executeRPCWithRetry(ctx, "complete activity task", func(callCtx context.Context) error {
@@ -356,6 +413,17 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 	request *protos.EntityBatchRequest,
 	operationInfos []*protos.OperationInfo,
 ) {
+	entityID, parseErr := api.EntityIDFromString(request.GetInstanceId())
+	if parseErr != nil {
+		w.logger.Errorf("%s: invalid entity instance ID: %v", request.GetInstanceId(), parseErr)
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
+	if !matchesEntityWorkItemFilters(w.options.workItemFilters, entityID.Name) {
+		w.logger.Warnf("%s: entity work item does not match configured filters; abandoning it", request.GetInstanceId())
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
 	executor, ok := w.executor.(backend.EntityExecutor)
 	if !ok {
 		w.logger.Error("task executor does not support entity work items")
@@ -388,6 +456,50 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		w.logger.Errorf("%s: failed to complete entity work item: %v", request.GetInstanceId(), err)
 		w.abandonEntity(ctx, client, completionToken)
 	}
+}
+
+func orchestrationWorkItemIdentity(pastEvents, newEvents []*protos.HistoryEvent) (string, string, bool) {
+	for _, events := range [][]*protos.HistoryEvent{newEvents, pastEvents} {
+		for i := len(events) - 1; i >= 0; i-- {
+			event := events[i]
+			if event == nil {
+				continue
+			}
+			if rewound := event.GetExecutionRewound(); rewound != nil && rewound.GetName().GetValue() != "" {
+				return rewound.GetName().GetValue(), rewound.GetVersion().GetValue(), true
+			}
+			if started := event.GetExecutionStarted(); started != nil {
+				return started.GetName(), started.GetVersion().GetValue(), true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func matchesWorkItemFilters(filters *WorkItemFilters, orchestration bool, name, version string) bool {
+	if filters == nil {
+		return true
+	}
+	candidates := filters.Activities
+	if orchestration {
+		candidates = filters.Orchestrations
+	}
+	for _, filter := range candidates {
+		if filter.Name != name {
+			continue
+		}
+		if len(filter.Versions) == 0 || slices.Contains(filter.Versions, version) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesEntityWorkItemFilters(filters *WorkItemFilters, name string) bool {
+	if filters == nil {
+		return true
+	}
+	return slices.Contains(filters.Entities, name)
 }
 
 func (w *TaskHubGrpcWorker) abandonOrchestration(

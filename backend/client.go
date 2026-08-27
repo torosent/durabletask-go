@@ -41,11 +41,29 @@ type EntityTaskHubClient interface {
 	CleanEntityStorage(ctx context.Context, req api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error)
 }
 
+type TaskHubManagementClient interface {
+	TaskHubClient
+	QueryInstances(context.Context, api.OrchestrationQuery) (*api.OrchestrationQueryResult, error)
+	ListInstanceIDs(context.Context, api.InstanceIDQuery) (*api.InstanceIDQueryResult, error)
+	RestartInstance(context.Context, api.InstanceID, ...api.RestartOptions) (api.InstanceID, error)
+	RewindInstance(context.Context, api.InstanceID, ...api.RewindOptions) error
+	PurgeInstances(context.Context, api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error)
+	SkipGracefulOrchestrationTerminations(context.Context, []api.InstanceID, string) ([]api.InstanceID, error)
+	CreateTaskHub(context.Context, ...api.CreateTaskHubOptions) error
+	DeleteTaskHub(context.Context) error
+}
+
 type backendClient struct {
 	be Backend
 }
 
 func NewTaskHubClient(be Backend) TaskHubClient {
+	return &backendClient{
+		be: be,
+	}
+}
+
+func NewTaskHubManagementClient(be Backend) TaskHubManagementClient {
 	return &backendClient{
 		be: be,
 	}
@@ -281,6 +299,131 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 	return nil
 }
 
+func (c *backendClient) QueryInstances(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
+	capability, ok := c.be.(OrchestrationQueryBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	return capability.QueryOrchestrations(ctx, query)
+}
+
+func (c *backendClient) ListInstanceIDs(ctx context.Context, query api.InstanceIDQuery) (*api.InstanceIDQueryResult, error) {
+	capability, ok := c.be.(InstanceIDQueryBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	return capability.ListInstanceIDs(ctx, query)
+}
+
+func (c *backendClient) RestartInstance(ctx context.Context, id api.InstanceID, opts ...api.RestartOptions) (api.InstanceID, error) {
+	req := &protos.RestartInstanceRequest{InstanceId: string(id)}
+	for _, configure := range opts {
+		if err := configure(req); err != nil {
+			return api.EmptyInstanceID, fmt.Errorf("failed to configure restart request: %w", err)
+		}
+	}
+	capability, ok := c.be.(RestartInstanceBackend)
+	if !ok {
+		return api.EmptyInstanceID, api.ErrFeatureNotSupported
+	}
+	return capability.RestartInstance(ctx, id, req.RestartWithNewInstanceId)
+}
+
+func (c *backendClient) RewindInstance(ctx context.Context, id api.InstanceID, opts ...api.RewindOptions) error {
+	req := &protos.RewindInstanceRequest{InstanceId: string(id)}
+	for _, configure := range opts {
+		if err := configure(req); err != nil {
+			return fmt.Errorf("failed to configure rewind request: %w", err)
+		}
+	}
+	capability, ok := c.be.(RewindInstanceBackend)
+	if !ok {
+		return api.ErrFeatureNotSupported
+	}
+	return capability.RewindInstance(ctx, id, req.Reason.GetValue())
+}
+
+func (c *backendClient) PurgeInstances(ctx context.Context, req api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
+	capability, ok := c.be.(PurgeInstancesBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	if len(req.InstanceIDs) > api.MaxInstanceBatchSize {
+		result := &api.PurgeInstancesResult{IsComplete: true}
+		for start := 0; start < len(req.InstanceIDs); start += api.MaxInstanceBatchSize {
+			end := min(start+api.MaxInstanceBatchSize, len(req.InstanceIDs))
+			batchRequest := req
+			batchRequest.InstanceIDs = append([]api.InstanceID(nil), req.InstanceIDs[start:end]...)
+			partial, err := pollBackendPurge(ctx, capability, batchRequest)
+			if err != nil {
+				return nil, err
+			}
+			result.DeletedInstanceCount += partial.DeletedInstanceCount
+			result.IsComplete = result.IsComplete && partial.IsComplete
+		}
+		return result, nil
+	}
+	return pollBackendPurge(ctx, capability, req)
+}
+
+func pollBackendPurge(
+	ctx context.Context,
+	capability PurgeInstancesBackend,
+	req api.PurgeInstancesRequest,
+) (*api.PurgeInstancesResult, error) {
+	pollInterval := req.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = api.DefaultPurgePollInterval
+	}
+	result := &api.PurgeInstancesResult{}
+	for {
+		partial, err := capability.PurgeInstances(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		result.DeletedInstanceCount += partial.DeletedInstanceCount
+		if partial.IsComplete {
+			result.IsComplete = true
+			return result, nil
+		}
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *backendClient) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, reason string) ([]api.InstanceID, error) {
+	capability, ok := c.be.(SkipGracefulTerminationsBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	return capability.SkipGracefulOrchestrationTerminations(ctx, ids, reason)
+}
+
+func (c *backendClient) CreateTaskHub(ctx context.Context, opts ...api.CreateTaskHubOptions) error {
+	req := &protos.CreateTaskHubRequest{}
+	for _, configure := range opts {
+		if err := configure(req); err != nil {
+			return fmt.Errorf("failed to configure task hub creation request: %w", err)
+		}
+	}
+	if req.RecreateIfExists {
+		if err := c.be.DeleteTaskHub(ctx); err != nil && !errors.Is(err, ErrTaskHubNotFound) {
+			return fmt.Errorf("failed to recreate task hub: %w", err)
+		}
+	}
+	if err := c.be.CreateTaskHub(ctx); err != nil {
+		return fmt.Errorf("failed to create task hub: %w", err)
+	}
+	return nil
+}
+
 // FetchEntityMetadata retrieves metadata for an entity instance.
 func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
@@ -322,4 +465,11 @@ func (c *backendClient) CleanEntityStorage(ctx context.Context, req api.CleanEnt
 		return nil, fmt.Errorf("CleanEntityStorage requires an EntityBackend with native entity support")
 	}
 	return entityBackend.CleanEntityStorage(ctx, req)
+}
+
+func (c *backendClient) DeleteTaskHub(ctx context.Context) error {
+	if err := c.be.DeleteTaskHub(ctx); err != nil {
+		return fmt.Errorf("failed to delete task hub: %w", err)
+	}
+	return nil
 }

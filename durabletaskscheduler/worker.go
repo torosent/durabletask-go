@@ -37,6 +37,12 @@ func NewWorker(
 	configuredOptions := []durabletaskclient.TaskHubGrpcWorkerOption{
 		durabletaskclient.WithWorkerHelloTimeout(prepared.HelloTimeout),
 	}
+	if prepared.LargePayloads != nil {
+		configuredOptions = append(
+			configuredOptions,
+			durabletaskclient.WithWorkerLargePayloads(prepared.LargePayloads),
+		)
+	}
 	configuredOptions = append(configuredOptions, workerOptions...)
 	return durabletaskclient.NewTaskHubGrpcWorkerWithConnectionFactory(
 		factory,

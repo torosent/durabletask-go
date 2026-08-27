@@ -57,6 +57,9 @@ func NewSqliteOptions(filePath string) *SqliteOptions {
 
 // NewSqliteBackend creates a new sqlite-based Backend object.
 func NewSqliteBackend(opts *SqliteOptions, logger backend.Logger) backend.Backend {
+	if opts == nil {
+		opts = NewSqliteOptions("")
+	}
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "unknown"
@@ -513,7 +516,27 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx *sql.Tx, e *bac
 	if err != nil {
 		return -1, fmt.Errorf("failed to count the rows affected: %w", err)
 	}
+	if rows > 0 {
+		if err := insertInstanceTags(ctx, tx, startEvent.OrchestrationInstance.InstanceId, startEvent.Tags); err != nil {
+			return -1, err
+		}
+	}
 	return rows, nil
+}
+
+func insertInstanceTags(ctx context.Context, tx *sql.Tx, instanceID string, tags map[string]string) error {
+	for key, value := range tags {
+		if _, err := tx.ExecContext(
+			ctx,
+			"INSERT INTO InstanceTags ([InstanceID], [TagKey], [TagValue]) VALUES (?, ?, ?)",
+			instanceID,
+			key,
+			value,
+		); err != nil {
+			return fmt.Errorf("failed to insert instance tag: %w", err)
+		}
+	}
+	return nil
 }
 
 func (be *sqliteBackend) handleInstanceExists(ctx context.Context, tx *sql.Tx, startEvent *protos.ExecutionStartedEvent, policy *api.OrchestrationIdReusePolicy, e *backend.HistoryEvent) error {
@@ -612,6 +635,11 @@ func (be *sqliteBackend) cleanupOrchestrationStateInternal(ctx context.Context, 
 		return fmt.Errorf("failed to delete from History table: %w", err)
 	}
 
+	_, err = tx.ExecContext(ctx, "DELETE FROM InstanceTags WHERE [InstanceID] = ?", string(id))
+	if err != nil {
+		return fmt.Errorf("failed to delete from InstanceTags table: %w", err)
+	}
+
 	_, err = tx.ExecContext(ctx, "DELETE FROM NewEvents WHERE [InstanceID] = ?", string(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete from NewEvents table: %w", err)
@@ -658,7 +686,7 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 
 	row := be.db.QueryRowContext(
 		ctx,
-		`SELECT [InstanceID], [Name], [Version], [ParentInstanceID], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [Input], [Output], [CustomStatus], [FailureDetails]
+		`SELECT [InstanceID], [ExecutionID], [Name], [Version], [ParentInstanceID], [RuntimeStatus], [CreatedTime], [LastUpdatedTime], [CompletedTime], [Input], [Output], [CustomStatus], [FailureDetails]
 		FROM Instances WHERE [InstanceID] = ?`,
 		string(iid),
 	)
@@ -671,19 +699,21 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	}
 
 	var instanceID *string
+	var executionID *string
 	var name *string
 	var version *string
 	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
 	var lastUpdatedAt *time.Time
+	var completedAt *time.Time
 	var input *string
 	var output *string
 	var customStatus *string
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err = row.Scan(&instanceID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err = row.Scan(&instanceID, &executionID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -723,9 +753,20 @@ func (be *sqliteBackend) GetOrchestrationMetadata(ctx context.Context, iid api.I
 	if version != nil {
 		metadata.Version = *version
 	}
+	if executionID != nil {
+		metadata.ExecutionID = *executionID
+	}
 	if parentInstanceID != nil {
 		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
 	}
+	if completedAt != nil {
+		metadata.CompletedAt = *completedAt
+	}
+	tags, err := be.getInstanceTags(ctx, []api.InstanceID{iid})
+	if err != nil {
+		return nil, err
+	}
+	metadata.Tags = tags[iid]
 	return metadata, nil
 }
 
@@ -1808,7 +1849,9 @@ func (be *sqliteBackend) Stop(context.Context) error {
 	if be.db != nil {
 		db := be.db
 		be.db = nil
-		return db.Close()
+		if err := db.Close(); err != nil {
+			return fmt.Errorf("failed to close the database: %w", err)
+		}
 	}
 
 	return nil

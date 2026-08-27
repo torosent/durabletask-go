@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added the top-level `durabletaskscheduler` transport package, a dedicated resilient gRPC worker, DTS emulator tests, and an environment-driven sample.
+- Added advanced management APIs for bounded instance queries/listing, restart, rewind, batch/filter purge polling, immediate termination, and task-hub lifecycle operations.
+- Added optional sqlite/Postgres backend capabilities and embedded gRPC implementations for advanced management operations, stable continuation tokens, indexed tag queries, and safe rewind history rebuilding.
+- Added orchestration tags to scheduling, metadata, queries, sub-orchestrations, continue-as-new, restart, and rewind.
+- Added explicit worker capability advertisement and orchestration/activity name/version filters with local fallback enforcement.
+- Added pluggable large-payload store/resolver support with size limits, SHA-256 integrity validation, memory/file implementations, and opt-in DTS capability advertisement.
 
 ### Changed
 
@@ -17,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refreshed the vendored Durable Task protobuf contract. `api.OrchestrationIdReusePolicy` and `api.CreateOrchestrationAction` are now API-owned types instead of aliases for generated protobuf types; callers should construct policies with the `api` types.
 - `TaskHubGrpcClient` now rejects the ambiguous legacy `IGNORE` reuse action by default. Known-compatible local sidecars can opt in with `client.WithLegacyOrchestrationIDReusePolicyWire`; DTS callers must use the representable `ERROR` or `TERMINATE` semantics.
 - The standalone gRPC sidecar enables current-proto `replaceableStatus` semantics. Embedded hosts must opt in with `backend.WithCurrentOrchestrationIDReusePolicyWire`; without it, field-1-only policies fail closed because legacy `ERROR` and current `TERMINATE` requests are wire-identical.
+- Orchestration metadata now includes execution ID, completion/scheduled timestamps, parent ID, failure details, and tags when provided by the backend or service.
 
 ## [v0.6.0] - 2025-02-05
 

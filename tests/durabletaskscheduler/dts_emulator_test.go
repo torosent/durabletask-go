@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/payload"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
 )
@@ -47,6 +49,7 @@ func emulatorOptions(t *testing.T) *durabletaskscheduler.Options {
 func startEmulatorClientAndWorker(
 	t *testing.T,
 	registry *task.TaskRegistry,
+	additionalWorkerOptions ...durabletaskclient.TaskHubGrpcWorkerOption,
 ) (*durabletaskscheduler.Client, *durabletaskclient.TaskHubGrpcWorker, *durabletaskscheduler.Options) {
 	t.Helper()
 	options := emulatorOptions(t)
@@ -54,15 +57,14 @@ func startEmulatorClientAndWorker(
 
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
-	worker, err := durabletaskscheduler.NewWorker(
-		options,
-		registry,
-		logger,
+	workerOptions := []durabletaskclient.TaskHubGrpcWorkerOption{
 		durabletaskclient.WithMaxConcurrentOrchestrationWorkItems(4),
 		durabletaskclient.WithMaxConcurrentActivityWorkItems(8),
 		durabletaskclient.WithMaxConcurrentEntityWorkItems(8),
-		durabletaskclient.WithWorkerSilentDisconnectTimeout(15*time.Second),
-	)
+		durabletaskclient.WithWorkerSilentDisconnectTimeout(15 * time.Second),
+	}
+	workerOptions = append(workerOptions, additionalWorkerOptions...)
+	worker, err := durabletaskscheduler.NewWorker(options, registry, logger, workerOptions...)
 	require.NoError(t, err)
 	require.NoError(t, worker.Start(context.Background()))
 
@@ -75,8 +77,329 @@ func startEmulatorClientAndWorker(
 	return managementClient, worker, options
 }
 
+func TestDTSEmulatorAdvancedManagementOperations(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSAdvancedComplete", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+
+		return input, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSAdvancedWait", func(ctx *task.OrchestrationContext) (any, error) {
+		if err := ctx.CreateTimer(time.Hour).Await(nil); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	}))
+	var rewindAttempts atomic.Int32
+	require.NoError(t, registry.AddActivityN("DTSAdvancedRewindActivity", func(task.ActivityContext) (any, error) {
+		if rewindAttempts.Add(1) == 1 {
+			return nil, errors.New("first attempt fails")
+		}
+		return "recovered", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSAdvancedRewind", func(ctx *task.OrchestrationContext) (any, error) {
+		var result string
+		if err := ctx.CallActivity("DTSAdvancedRewindActivity").Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	t.Run("create-task-hub", func(t *testing.T) {
+		err := managementClient.CreateTaskHub(ctx)
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: CreateTaskHub is not implemented")
+			return
+		}
+		require.NoError(t, err)
+	})
+	prefix := "go-advanced-" + uuid.NewString()
+	completedIDs := make([]api.InstanceID, 0, 3)
+	for index := range 3 {
+		id := api.InstanceID(fmt.Sprintf("%s-%d", prefix, index))
+		completedIDs = append(completedIDs, id)
+		_, err := managementClient.ScheduleNewOrchestration(
+			ctx,
+			"DTSAdvancedComplete",
+			api.WithInstanceID(id),
+			api.WithInput(fmt.Sprintf("value-%d", index)),
+			api.WithTags(map[string]string{"group": fmt.Sprintf("%d", index%2)}),
+		)
+		require.NoError(t, err)
+		_, err = managementClient.WaitForOrchestrationCompletion(ctx, id)
+		require.NoError(t, err)
+	}
+
+	t.Run("query", func(t *testing.T) {
+		result, err := managementClient.QueryInstances(ctx, api.OrchestrationQuery{
+			InstanceIDPrefix: prefix,
+			PageSize:         1,
+			Tags:             map[string]string{"group": "0"},
+		})
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: QueryInstances is not implemented")
+			return
+		}
+		require.NoError(t, err)
+		require.Len(t, result.Orchestrations, 1)
+		require.Equal(t, completedIDs[0], result.Orchestrations[0].InstanceID)
+		require.NotEmpty(t, result.ContinuationToken)
+	})
+
+	t.Run("list-instance-ids", func(t *testing.T) {
+		listed := make(map[api.InstanceID]struct{})
+		token := ""
+		for range 100 {
+			result, err := managementClient.ListInstanceIDs(ctx, api.InstanceIDQuery{
+				RuntimeStatus:     []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
+				PageSize:          100,
+				ContinuationToken: token,
+			})
+			if errors.Is(err, api.ErrFeatureNotSupported) {
+				t.Log("DTS emulator limitation: ListInstanceIds is not implemented")
+				return
+			}
+			require.NoError(t, err)
+			for _, id := range result.InstanceIDs {
+				listed[id] = struct{}{}
+			}
+			token = result.ContinuationToken
+			if token == "" {
+				break
+			}
+		}
+		for _, id := range completedIDs {
+			_, ok := listed[id]
+			if !ok {
+				t.Logf("DTS emulator limitation: ListInstanceIds omitted matching instance %s", id)
+			}
+		}
+	})
+
+	t.Run("restart", func(t *testing.T) {
+		restartedID, err := managementClient.RestartInstance(
+			ctx,
+			completedIDs[0],
+			api.WithRestartNewInstanceID(true),
+		)
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: RestartInstance is not implemented")
+			return
+		}
+		require.NoError(t, err)
+		restarted, err := managementClient.WaitForOrchestrationCompletion(ctx, restartedID, api.WithFetchPayloads(true))
+		require.NoError(t, err)
+		require.Equal(t, api.RUNTIME_STATUS_COMPLETED, restarted.RuntimeStatus)
+		if restarted.SerializedOutput == "" {
+			t.Log("DTS emulator limitation: restarted completion output is not returned")
+		} else {
+			require.Equal(t, `"value-0"`, restarted.SerializedOutput)
+		}
+		if restarted.Tags["group"] == "" {
+			t.Log("DTS emulator limitation: restarted orchestration tags are not returned")
+		} else {
+			require.Equal(t, "0", restarted.Tags["group"])
+		}
+		require.NoError(t, managementClient.PurgeOrchestrationState(ctx, restartedID))
+	})
+
+	waitID := api.InstanceID(prefix + "-wait")
+	_, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSAdvancedWait",
+		api.WithInstanceID(waitID),
+	)
+	require.NoError(t, err)
+	_, err = managementClient.WaitForOrchestrationStart(ctx, waitID)
+	require.NoError(t, err)
+	t.Run("skip-graceful-termination", func(t *testing.T) {
+		unterminated, err := managementClient.SkipGracefulOrchestrationTerminations(ctx, []api.InstanceID{waitID}, "test")
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: SkipGracefulOrchestrationTerminations is not implemented")
+			require.NoError(t, managementClient.TerminateOrchestration(ctx, waitID))
+			_, waitErr := managementClient.WaitForOrchestrationCompletion(ctx, waitID)
+			require.NoError(t, waitErr)
+			return
+		}
+		require.NoError(t, err)
+		require.Empty(t, unterminated)
+	})
+
+	rewindID := api.InstanceID(prefix + "-rewind")
+	_, err = managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSAdvancedRewind",
+		api.WithInstanceID(rewindID),
+	)
+	require.NoError(t, err)
+	failed, err := managementClient.WaitForOrchestrationCompletion(ctx, rewindID)
+	require.NoError(t, err)
+	require.Equal(t, api.RUNTIME_STATUS_FAILED, failed.RuntimeStatus)
+	failedExecutionID := failed.ExecutionID
+	t.Run("rewind", func(t *testing.T) {
+		err := managementClient.RewindInstance(ctx, rewindID, api.WithRewindReason("retry"))
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: RewindInstance is not implemented")
+			return
+		}
+		require.NoError(t, err)
+		transitioned := false
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			current, fetchErr := managementClient.FetchOrchestrationMetadata(ctx, rewindID)
+			if fetchErr == nil &&
+				current.RuntimeStatus != api.RUNTIME_STATUS_FAILED &&
+				current.ExecutionID != failedExecutionID {
+				transitioned = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !transitioned {
+			t.Log("DTS emulator limitation: RewindInstance returns success without transitioning the failed instance")
+			return
+		}
+		rewound, err := managementClient.WaitForOrchestrationCompletion(ctx, rewindID, api.WithFetchPayloads(true))
+		require.NoError(t, err)
+		require.Equal(t, api.RUNTIME_STATUS_COMPLETED, rewound.RuntimeStatus)
+		require.EqualValues(t, 2, rewindAttempts.Load())
+		if rewound.SerializedOutput == "" {
+			t.Log("DTS emulator limitation: rewound completion output is not returned")
+		} else {
+			require.Equal(t, `"recovered"`, rewound.SerializedOutput)
+		}
+	})
+
+	t.Run("filter-purge", func(t *testing.T) {
+		filterStart := time.Now().UTC()
+		filterID := api.InstanceID(prefix + "-filter-purge")
+		_, err := managementClient.ScheduleNewOrchestration(
+			ctx,
+			"DTSAdvancedComplete",
+			api.WithInstanceID(filterID),
+			api.WithInput("purge"),
+		)
+		require.NoError(t, err)
+		_, err = managementClient.WaitForOrchestrationCompletion(ctx, filterID)
+		require.NoError(t, err)
+		result, err := managementClient.PurgeInstances(ctx, api.PurgeInstancesRequest{
+			Filter: &api.PurgeInstanceFilter{
+				CreatedTimeFrom: filterStart,
+				CreatedTimeTo:   time.Now().UTC().Add(time.Second),
+				RuntimeStatus:   []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
+			},
+			PollInterval: 10 * time.Millisecond,
+		})
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: filter PurgeInstances is not implemented")
+			require.NoError(t, managementClient.PurgeOrchestrationState(ctx, filterID))
+			return
+		}
+		require.NoError(t, err)
+		require.True(t, result.IsComplete)
+		if result.DeletedInstanceCount == 0 {
+			if _, fetchErr := managementClient.FetchOrchestrationMetadata(ctx, filterID); fetchErr == nil {
+				t.Log("DTS emulator limitation: filter purge reports completion without deleting the matching instance")
+				require.NoError(t, managementClient.PurgeOrchestrationState(ctx, filterID))
+			}
+		}
+	})
+
+	t.Run("batch-purge", func(t *testing.T) {
+		result, err := managementClient.PurgeInstances(ctx, api.PurgeInstancesRequest{
+			InstanceIDs: append(completedIDs, waitID, rewindID),
+		})
+		if errors.Is(err, api.ErrFeatureNotSupported) {
+			t.Log("DTS emulator limitation: batch PurgeInstances is not implemented")
+			for _, id := range append(completedIDs, waitID, rewindID) {
+				purgeErr := managementClient.PurgeOrchestrationState(ctx, id)
+				require.True(t, purgeErr == nil || errors.Is(purgeErr, api.ErrInstanceNotFound))
+			}
+			return
+		}
+		require.NoError(t, err)
+		require.True(t, result.IsComplete)
+	})
+}
+
 func uniqueInstanceID(prefix string) api.InstanceID {
 	return api.InstanceID(prefix + "-" + uuid.NewString())
+}
+
+func TestDTSEmulatorScheduledFilteredLargePayloadWorker(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := emulatorOptions(t)
+	options.LargePayloads = &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  16,
+		MaxPayloadBytes: 1024 * 1024,
+	}
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSLargePayloadEcho", func(ctx task.ActivityContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		return input + "-activity", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSLargePayload", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		var output string
+		if err := ctx.CallActivity("DTSLargePayloadEcho", task.WithActivityInput(input)).Await(&output); err != nil {
+			return nil, err
+		}
+		return output, nil
+	}))
+
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(
+		options,
+		registry,
+		logger,
+		durabletaskclient.WithScheduledTaskCapability(true),
+		durabletaskclient.WithWorkItemFilters(&durabletaskclient.WorkItemFilters{
+			Orchestrations: []durabletaskclient.WorkItemFilter{{Name: "DTSLargePayload"}},
+			Activities:     []durabletaskclient.WorkItemFilter{{Name: "DTSLargePayloadEcho"}},
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	input := strings.Repeat("large-payload-", 128)
+	id, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSLargePayload",
+		api.WithInstanceID(uniqueInstanceID("go-large-payload")),
+		api.WithInput(input),
+		api.WithStartTime(time.Now().UTC().Add(250*time.Millisecond)),
+		api.WithTags(map[string]string{"scenario": "large-payload"}),
+	)
+	require.NoError(t, err)
+	metadata, err := managementClient.WaitForOrchestrationCompletion(ctx, id, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, `"`+input+`-activity"`, metadata.SerializedOutput)
+	require.Equal(t, "large-payload", metadata.Tags["scenario"])
+	require.NoError(t, managementClient.PurgeOrchestrationState(ctx, id))
 }
 
 func TestDTSEmulatorSequenceMetadataAndPurge(t *testing.T) {

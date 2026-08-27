@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -111,6 +112,126 @@ func startGrpcListener(t *testing.T, r *task.TaskRegistry) context.CancelFunc {
 		}
 		require.NoError(t, err)
 	}
+}
+
+func Test_Grpc_AdvancedManagementOperations(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("GrpcManagementComplete", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("GrpcManagementWait", func(ctx *task.OrchestrationContext) (any, error) {
+		if err := ctx.CreateTimer(time.Hour).Await(nil); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	}))
+	var rewindAttempts atomic.Int32
+	require.NoError(t, registry.AddActivityN("GrpcRewindActivity", func(task.ActivityContext) (any, error) {
+		if rewindAttempts.Add(1) == 1 {
+			return nil, errors.New("first attempt fails")
+		}
+		return "recovered", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("GrpcRewind", func(ctx *task.OrchestrationContext) (any, error) {
+		var result string
+		if err := ctx.CallActivity("GrpcRewindActivity").Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}))
+	stopListener := startGrpcListener(t, registry)
+	defer stopListener()
+
+	testCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	prefix := fmt.Sprintf("grpc-management-%d-", time.Now().UnixNano())
+	ids := make([]api.InstanceID, 0, 3)
+	for index := range 3 {
+		id := api.InstanceID(fmt.Sprintf("%s%d", prefix, index))
+		ids = append(ids, id)
+		_, err := grpcClient.ScheduleNewOrchestration(
+			testCtx,
+			"GrpcManagementComplete",
+			api.WithInstanceID(id),
+			api.WithInput(fmt.Sprintf("value-%d", index)),
+			api.WithTags(map[string]string{"group": fmt.Sprintf("%d", index%2)}),
+		)
+		require.NoError(t, err)
+		_, err = grpcClient.WaitForOrchestrationCompletion(testCtx, id)
+		require.NoError(t, err)
+	}
+
+	query, err := grpcClient.QueryInstances(testCtx, api.OrchestrationQuery{
+		InstanceIDPrefix: prefix,
+		PageSize:         1,
+		Tags:             map[string]string{"group": "0"},
+	})
+	require.NoError(t, err)
+	require.Len(t, query.Orchestrations, 1)
+	require.Equal(t, ids[0], query.Orchestrations[0].InstanceID)
+	require.NotEmpty(t, query.ContinuationToken)
+	query, err = grpcClient.QueryInstances(testCtx, api.OrchestrationQuery{
+		InstanceIDPrefix:  prefix,
+		PageSize:          1,
+		ContinuationToken: query.ContinuationToken,
+		Tags:              map[string]string{"group": "0"},
+	})
+	require.NoError(t, err)
+	require.Len(t, query.Orchestrations, 1)
+	require.Equal(t, ids[2], query.Orchestrations[0].InstanceID)
+
+	listed, err := grpcClient.ListInstanceIDs(testCtx, api.InstanceIDQuery{
+		RuntimeStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
+		PageSize:      100,
+	})
+	require.NoError(t, err)
+	for _, id := range ids {
+		require.Contains(t, listed.InstanceIDs, id)
+	}
+
+	restartedID, err := grpcClient.RestartInstance(testCtx, ids[0], api.WithRestartNewInstanceID(true))
+	require.NoError(t, err)
+	_, err = grpcClient.WaitForOrchestrationCompletion(testCtx, restartedID)
+	require.NoError(t, err)
+
+	waitID := api.InstanceID(prefix + "wait")
+	_, err = grpcClient.ScheduleNewOrchestration(
+		testCtx,
+		"GrpcManagementWait",
+		api.WithInstanceID(waitID),
+	)
+	require.NoError(t, err)
+	_, err = grpcClient.WaitForOrchestrationStart(testCtx, waitID)
+	require.NoError(t, err)
+	unterminated, err := grpcClient.SkipGracefulOrchestrationTerminations(testCtx, []api.InstanceID{waitID}, "test")
+	require.NoError(t, err)
+	require.Empty(t, unterminated)
+
+	rewindID := api.InstanceID(prefix + "rewind")
+	_, err = grpcClient.ScheduleNewOrchestration(
+		testCtx,
+		"GrpcRewind",
+		api.WithInstanceID(rewindID),
+	)
+	require.NoError(t, err)
+	failed, err := grpcClient.WaitForOrchestrationCompletion(testCtx, rewindID)
+	require.NoError(t, err)
+	require.Equal(t, api.RUNTIME_STATUS_FAILED, failed.RuntimeStatus)
+	require.NoError(t, grpcClient.RewindInstance(testCtx, rewindID, api.WithRewindReason("retry")))
+	completed, err := grpcClient.WaitForOrchestrationCompletion(testCtx, rewindID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	require.Equal(t, `"recovered"`, completed.SerializedOutput)
+
+	purged, err := grpcClient.PurgeInstances(testCtx, api.PurgeInstancesRequest{
+		InstanceIDs: append(ids, restartedID, waitID, rewindID),
+	})
+	require.NoError(t, err)
+	require.True(t, purged.IsComplete)
+	require.Equal(t, 6, purged.DeletedInstanceCount)
 }
 
 func Test_Grpc_WaitForInstanceStart_Timeout(t *testing.T) {

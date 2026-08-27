@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/microsoft/durabletask-go/api"
 )
 
 const DefaultResourceID = "https://durabletask.io"
@@ -53,6 +54,9 @@ type Options struct {
 
 	// HelloTimeout controls fail-fast connectivity checks.
 	HelloTimeout time.Duration
+
+	// LargePayloads enables external payload references for clients and workers.
+	LargePayloads *api.LargePayloadOptions
 
 	dialer func(context.Context, string) (net.Conn, error)
 }
@@ -183,6 +187,9 @@ func (o *Options) Validate() error {
 	}
 	if o.HelloTimeout < 0 {
 		return fmt.Errorf("DTS Hello timeout cannot be negative")
+	}
+	if _, err := api.NormalizeLargePayloadOptions(o.LargePayloads); err != nil {
+		return fmt.Errorf("invalid DTS large payload options: %w", err)
 	}
 
 	endpoint, err := normalizeEndpoint(o.EndpointAddress)
