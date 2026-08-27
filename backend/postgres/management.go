@@ -314,7 +314,7 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 		result := &api.PurgeInstancesResult{IsComplete: true}
 		for _, id := range request.InstanceIDs {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return result, err
 			}
 			count, err := be.purgeInstance(ctx, id, request.Recursive)
 			if errors.Is(err, api.ErrInstanceNotFound) {
@@ -368,7 +368,7 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 		PageSize:        1,
 	})
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	result.IsComplete = len(remaining.Orchestrations) == 0
 	return result, nil
@@ -429,6 +429,20 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 			unterminated = append(unterminated, id)
 			continue
 		}
+		var entityLockObligations int
+		if err := tx.QueryRow(
+			ctx,
+			`SELECT
+				(SELECT COUNT(*) FROM Entities WHERE LockedBy = $1)
+				+ (SELECT COUNT(*) FROM EntityMessages WHERE ParentInstanceID = $1 AND MessageKind = 'lock')`,
+			string(id),
+		).Scan(&entityLockObligations); err != nil {
+			return nil, fmt.Errorf("failed to inspect entity locks before immediate termination: %w", err)
+		}
+		if entityLockObligations > 0 {
+			unterminated = append(unterminated, id)
+			continue
+		}
 		result, err := tx.Exec(
 			ctx,
 			`UPDATE Instances SET RuntimeStatus = 'TERMINATED', CompletedTime = COALESCE(CompletedTime, $1),
@@ -477,6 +491,9 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM NewTasks WHERE InstanceID = $1", string(id)); err != nil {
 			return nil, fmt.Errorf("failed to delete pending activity tasks: %w", err)
+		}
+		if err := be.releaseEntityLocksForOwnerTx(ctx, tx, id); err != nil {
+			return nil, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

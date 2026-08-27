@@ -145,11 +145,12 @@ func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (ex
 }
 
 func (g *grpcExecutor) dispatchWorkItem(ctx context.Context, workItem *protos.WorkItem) error {
+	matches := workItemFilterMatcher(workItem)
 	for {
 		delivered := false
 		g.workItemSubscribers.Range(func(_, value any) bool {
 			subscriber := value.(*workItemSubscriber)
-			if !workItemMatchesFilters(subscriber.filters, workItem) {
+			if !matches(subscriber.filters) {
 				return true
 			}
 			select {
@@ -175,6 +176,11 @@ func (g *grpcExecutor) dispatchWorkItem(ctx context.Context, workItem *protos.Wo
 			}
 			return ctx.Err()
 		case <-g.shutdownChan:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrOperationAborted
+		case <-g.streamShutdownChan:
 			if !timer.Stop() {
 				<-timer.C
 			}
@@ -208,8 +214,10 @@ func (executor *grpcExecutor) ExecuteOrchestrator(ctx context.Context, iid api.I
 	select {
 	case <-ctx.Done():
 		executor.logger.Warnf("%s: context canceled before dispatching orchestrator work item", iid)
+		executor.pendingOrchestrators.Delete(iid)
 		return nil, ctx.Err()
 	case <-executor.shutdownChan:
+		executor.pendingOrchestrators.Delete(iid)
 		return nil, ErrOperationAborted
 	default:
 	}
@@ -259,8 +267,10 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 	select {
 	case <-ctx.Done():
 		executor.logger.Warnf("%s/%s#%d: context canceled before dispatching activity work item", iid, task.Name, e.EventId)
+		executor.pendingActivities.Delete(key)
 		return nil, ctx.Err()
 	case <-executor.shutdownChan:
+		executor.pendingActivities.Delete(key)
 		return nil, ErrOperationAborted
 	default:
 	}
@@ -497,46 +507,61 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 }
 
 func workItemMatchesFilters(filters *protos.WorkItemFilters, workItem *protos.WorkItem) bool {
-	if filters == nil || workItem == nil {
-		return true
+	return workItemFilterMatcher(workItem)(filters)
+}
+
+func workItemFilterMatcher(workItem *protos.WorkItem) func(*protos.WorkItemFilters) bool {
+	if workItem == nil {
+		return func(*protos.WorkItemFilters) bool { return true }
 	}
 	switch request := workItem.Request.(type) {
 	case *protos.WorkItem_OrchestratorRequest:
-		if len(filters.GetOrchestrations()) == 0 {
-			return true
-		}
 		name, version, ok := orchestrationRequestIdentity(request.OrchestratorRequest)
-		return !ok || matchesOrchestrationFilters(filters.GetOrchestrations(), name, version)
+		return func(filters *protos.WorkItemFilters) bool {
+			if hasRejectAllOrchestrationFilter(filters) {
+				return false
+			}
+			return filters == nil ||
+				len(filters.GetOrchestrations()) == 0 ||
+				!ok ||
+				matchesOrchestrationFilters(filters.GetOrchestrations(), name, version)
+		}
 	case *protos.WorkItem_ActivityRequest:
-		if len(filters.GetActivities()) == 0 {
-			return true
-		}
-		for _, filter := range filters.GetActivities() {
-			if filter.GetName() == request.ActivityRequest.GetName() &&
-				(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), request.ActivityRequest.GetVersion().GetValue())) {
+		name := request.ActivityRequest.GetName()
+		version := request.ActivityRequest.GetVersion().GetValue()
+		return func(filters *protos.WorkItemFilters) bool {
+			if hasRejectAllActivityFilter(filters) {
+				return false
+			}
+			if filters == nil || len(filters.GetActivities()) == 0 {
 				return true
 			}
+			for _, filter := range filters.GetActivities() {
+				if filter.GetName() == name &&
+					(len(filter.GetVersions()) == 0 || slices.Contains(filter.GetVersions(), version)) {
+					return true
+				}
+			}
+			return false
 		}
-		return false
 	case *protos.WorkItem_EntityRequest:
-		if len(filters.GetEntities()) == 0 {
-			return true
-		}
-		entityID, err := api.EntityIDFromString(request.EntityRequest.GetInstanceId())
-		if err != nil {
-			return false
-		}
-		for _, filter := range filters.GetEntities() {
-			if strings.EqualFold(filter.GetName(), entityID.Name) {
-				return true
-			}
-		}
-		return false
+		return entityWorkItemFilterMatcher(request.EntityRequest.GetInstanceId())
 	case *protos.WorkItem_EntityRequestV2:
-		if len(filters.GetEntities()) == 0 {
+		return entityWorkItemFilterMatcher(request.EntityRequestV2.GetInstanceId())
+	default:
+		return func(*protos.WorkItemFilters) bool { return true }
+	}
+}
+
+func entityWorkItemFilterMatcher(instanceID string) func(*protos.WorkItemFilters) bool {
+	entityID, err := api.EntityIDFromString(instanceID)
+	return func(filters *protos.WorkItemFilters) bool {
+		if hasRejectAllEntityFilter(filters) {
+			return false
+		}
+		if filters == nil || len(filters.GetEntities()) == 0 {
 			return true
 		}
-		entityID, err := api.EntityIDFromString(request.EntityRequestV2.GetInstanceId())
 		if err != nil {
 			return false
 		}
@@ -546,9 +571,43 @@ func workItemMatchesFilters(filters *protos.WorkItemFilters, workItem *protos.Wo
 			}
 		}
 		return false
-	default:
-		return true
 	}
+}
+
+func hasRejectAllOrchestrationFilter(filters *protos.WorkItemFilters) bool {
+	if filters == nil {
+		return false
+	}
+	for _, filter := range filters.GetOrchestrations() {
+		if filter.GetName() == helpers.RejectAllWorkItemFilterName {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRejectAllActivityFilter(filters *protos.WorkItemFilters) bool {
+	if filters == nil {
+		return false
+	}
+	for _, filter := range filters.GetActivities() {
+		if filter.GetName() == helpers.RejectAllWorkItemFilterName {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRejectAllEntityFilter(filters *protos.WorkItemFilters) bool {
+	if filters == nil {
+		return false
+	}
+	for _, filter := range filters.GetEntities() {
+		if filter.GetName() == helpers.RejectAllWorkItemFilterName {
+			return true
+		}
+	}
+	return false
 }
 
 func orchestrationRequestIdentity(request *protos.OrchestratorRequest) (string, string, bool) {

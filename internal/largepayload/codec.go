@@ -256,7 +256,7 @@ func TransformEntityBatchRequest(
 	options *api.LargePayloadOptions,
 	request *protos.EntityBatchRequest,
 ) error {
-	if request == nil || options == nil {
+	if request == nil {
 		return nil
 	}
 	var err error
@@ -279,7 +279,7 @@ func TransformEntityBatchResult(
 	options *api.LargePayloadOptions,
 	result *protos.EntityBatchResult,
 ) error {
-	if result == nil || options == nil {
+	if result == nil {
 		return nil
 	}
 	var err error

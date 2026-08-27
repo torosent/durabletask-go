@@ -389,6 +389,65 @@ func TestSkipGracefulRejectsActiveSubOrchestration(t *testing.T) {
 	}
 }
 
+func TestSkipGracefulRejectsEntityLockHolder(t *testing.T) {
+	for i, be := range getRunnableBackends() {
+		t.Run(fmt.Sprintf("backend-%d", i), func(t *testing.T) {
+			initTest(t, be, i, false)
+			entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+			require.True(t, ok)
+			entityID := api.NewEntityID("lockable", fmt.Sprintf("skip-%d", i))
+			registry := task.NewTaskRegistry()
+			require.NoError(t, registry.AddEntityN("lockable", func(*task.EntityContext) (any, error) {
+				return nil, nil
+			}))
+			require.NoError(t, registry.AddOrchestratorN("SkipEntityLock", func(ctx *task.OrchestrationContext) (any, error) {
+				if _, err := ctx.LockEntities(entityID); err != nil {
+					return nil, err
+				}
+				return nil, ctx.WaitForSingleEvent("release", -1).Await(nil)
+			}))
+			executor := task.NewTaskExecutor(registry)
+			worker := backend.NewTaskHubWorker(
+				be,
+				backend.NewOrchestrationWorker(be, executor, logger),
+				backend.NewActivityTaskWorker(be, executor, logger),
+				logger,
+				backend.NewEntityWorker(entityBackend, executor.(backend.EntityExecutor), logger),
+			)
+			testCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			require.NoError(t, worker.Start(testCtx))
+			t.Cleanup(func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				require.NoError(t, worker.Shutdown(shutdownCtx))
+			})
+			client := backend.NewTaskHubManagementClient(be)
+			instanceID, err := client.ScheduleNewOrchestration(testCtx, "SkipEntityLock")
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				entity, fetchErr := entityBackend.GetEntityMetadata(testCtx, entityID, false)
+				return fetchErr == nil && entity != nil && entity.LockedBy == string(instanceID)
+			}, 5*time.Second, 10*time.Millisecond)
+
+			unterminated, err := client.SkipGracefulOrchestrationTerminations(
+				testCtx,
+				[]api.InstanceID{instanceID},
+				"unsafe",
+			)
+			require.NoError(t, err)
+			require.Equal(t, []api.InstanceID{instanceID}, unterminated)
+			require.NoError(t, client.TerminateOrchestration(testCtx, instanceID))
+			_, err = client.WaitForOrchestrationCompletion(testCtx, instanceID)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				entity, fetchErr := entityBackend.GetEntityMetadata(testCtx, entityID, false)
+				return fetchErr == nil && entity != nil && entity.LockedBy == ""
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
 func metadataIDs(metadata []*api.OrchestrationMetadata) []api.InstanceID {
 	ids := make([]api.InstanceID, len(metadata))
 	for i, item := range metadata {
