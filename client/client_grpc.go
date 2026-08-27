@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
@@ -19,8 +20,12 @@ import (
 
 type TaskHubGrpcClient struct {
 	client                       protos.TaskHubSidecarServiceClient
+	connection                   grpc.ClientConnInterface
 	logger                       backend.Logger
 	allowLegacyIDReusePolicyWire bool
+
+	listenerMu sync.Mutex
+	listener   *TaskHubGrpcWorker
 }
 
 type TaskHubGrpcClientOption func(*TaskHubGrpcClient)
@@ -40,8 +45,9 @@ func WithLegacyOrchestrationIDReusePolicyWire() TaskHubGrpcClientOption {
 // The gRPC connection must be to a task hub worker that understands the Durable Task gRPC protocol.
 func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
 	c := &TaskHubGrpcClient{
-		client: protos.NewTaskHubSidecarServiceClient(cc),
-		logger: logger,
+		client:     protos.NewTaskHubSidecarServiceClient(cc),
+		connection: cc,
+		logger:     logger,
 	}
 	for _, configure := range opts {
 		configure(c)
