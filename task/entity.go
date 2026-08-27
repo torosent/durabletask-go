@@ -320,32 +320,3 @@ func timestampOrNil(value time.Time) *timestamppb.Timestamp {
 	}
 	return timestamppb.New(value)
 }
-
-type entityResponseTask struct {
-	delegate Task
-}
-
-func (t *entityResponseTask) Await(v any) error {
-	var response helpers.EntityResponseMessage
-	if err := t.delegate.Await(&response); err != nil {
-		return err
-	}
-	if response.ErrorMessage != "" {
-		return &entityOperationError{message: response.ErrorMessage}
-	}
-	if v == nil || response.Result == "" {
-		return nil
-	}
-	if err := unmarshalData([]byte(response.Result), v); err != nil {
-		return fmt.Errorf("failed to decode entity response: %w", err)
-	}
-	return nil
-}
-
-type entityOperationError struct {
-	message string
-}
-
-func (e *entityOperationError) Error() string {
-	return e.message
-}

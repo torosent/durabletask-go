@@ -123,22 +123,20 @@ func WithWorkItemFilters(filters WorkItemFilters) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		wire := &protos.WorkItemFilters{}
 		for _, filter := range filters.Orchestrations {
-			if strings.TrimSpace(filter.Name) == "" {
-				return fmt.Errorf("orchestration work-item filter name must not be empty")
+			versions, err := sortedFilterVersions("orchestration", filter.Name, filter.Versions)
+			if err != nil {
+				return err
 			}
-			versions := append([]string(nil), filter.Versions...)
-			slices.Sort(versions)
 			wire.Orchestrations = append(wire.Orchestrations, &protos.OrchestrationFilter{
 				Name:     filter.Name,
 				Versions: versions,
 			})
 		}
 		for _, filter := range filters.Activities {
-			if strings.TrimSpace(filter.Name) == "" {
-				return fmt.Errorf("activity work-item filter name must not be empty")
+			versions, err := sortedFilterVersions("activity", filter.Name, filter.Versions)
+			if err != nil {
+				return err
 			}
-			versions := append([]string(nil), filter.Versions...)
-			slices.Sort(versions)
 			wire.Activities = append(wire.Activities, &protos.ActivityFilter{
 				Name:     filter.Name,
 				Versions: versions,
@@ -150,6 +148,7 @@ func WithWorkItemFilters(filters WorkItemFilters) TaskHubGrpcWorkerOption {
 			}
 			wire.Entities = append(wire.Entities, &protos.EntityFilter{Name: name})
 		}
+		// Sort by name so that the filter set sent to the server is deterministic.
 		slices.SortFunc(wire.Orchestrations, func(left, right *protos.OrchestrationFilter) int {
 			return strings.Compare(left.Name, right.Name)
 		})
@@ -162,6 +161,17 @@ func WithWorkItemFilters(filters WorkItemFilters) TaskHubGrpcWorkerOption {
 		options.workItemFilters = wire
 		return nil
 	}
+}
+
+// sortedFilterVersions validates a work-item filter name and returns a sorted copy of
+// its versions, leaving the caller's slice untouched.
+func sortedFilterVersions(kind string, name string, versions []string) ([]string, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("%s work-item filter name must not be empty", kind)
+	}
+	sorted := slices.Clone(versions)
+	slices.Sort(sorted)
+	return sorted, nil
 }
 
 func WithWorkerHelloTimeout(timeout time.Duration) TaskHubGrpcWorkerOption {

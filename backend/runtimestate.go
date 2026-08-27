@@ -448,7 +448,7 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 	action *protos.SendEntityMessageAction,
 ) (*HistoryEvent, EntityMessage, error) {
 	timestamp := timestamppb.Now()
-	message := EntityMessage{}
+	message := EntityMessage{HistoryEvent: &protos.HistoryEvent{EventId: -1, Timestamp: timestamp}}
 	history := &protos.HistoryEvent{EventId: eventID, Timestamp: timestamp}
 	parentInstanceID := wrapperspb.String(string(s.instanceID))
 	var parentExecutionID *wrapperspb.StringValue
@@ -463,11 +463,7 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 		messageValue := proto.Clone(historyValue).(*protos.EntityOperationSignaledEvent)
 		messageValue.TargetInstanceId = nil
 		history.EventType = &protos.HistoryEvent_EntityOperationSignaled{EntityOperationSignaled: historyValue}
-		message.HistoryEvent = &protos.HistoryEvent{
-			EventId:   -1,
-			Timestamp: timestamp,
-			EventType: &protos.HistoryEvent_EntityOperationSignaled{EntityOperationSignaled: messageValue},
-		}
+		message.HistoryEvent.EventType = &protos.HistoryEvent_EntityOperationSignaled{EntityOperationSignaled: messageValue}
 	case action.GetEntityOperationCalled() != nil:
 		historyValue := proto.Clone(action.GetEntityOperationCalled()).(*protos.EntityOperationCalledEvent)
 		message.TargetInstanceID = historyValue.TargetInstanceId.GetValue()
@@ -478,11 +474,7 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 		messageValue.ParentInstanceId = parentInstanceID
 		messageValue.ParentExecutionId = parentExecutionID
 		history.EventType = &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: historyValue}
-		message.HistoryEvent = &protos.HistoryEvent{
-			EventId:   -1,
-			Timestamp: timestamp,
-			EventType: &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: messageValue},
-		}
+		message.HistoryEvent.EventType = &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: messageValue}
 	case action.GetEntityLockRequested() != nil:
 		historyValue := proto.Clone(action.GetEntityLockRequested()).(*protos.EntityLockRequestedEvent)
 		if historyValue.Position < 0 || int(historyValue.Position) >= len(historyValue.LockSet) {
@@ -493,11 +485,7 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 		messageValue := proto.Clone(historyValue).(*protos.EntityLockRequestedEvent)
 		messageValue.ParentInstanceId = parentInstanceID
 		history.EventType = &protos.HistoryEvent_EntityLockRequested{EntityLockRequested: historyValue}
-		message.HistoryEvent = &protos.HistoryEvent{
-			EventId:   -1,
-			Timestamp: timestamp,
-			EventType: &protos.HistoryEvent_EntityLockRequested{EntityLockRequested: messageValue},
-		}
+		message.HistoryEvent.EventType = &protos.HistoryEvent_EntityLockRequested{EntityLockRequested: messageValue}
 	case action.GetEntityUnlockSent() != nil:
 		historyValue := proto.Clone(action.GetEntityUnlockSent()).(*protos.EntityUnlockSentEvent)
 		message.TargetInstanceID = historyValue.TargetInstanceId.GetValue()
@@ -506,11 +494,7 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 		messageValue.TargetInstanceId = nil
 		messageValue.ParentInstanceId = parentInstanceID
 		history.EventType = &protos.HistoryEvent_EntityUnlockSent{EntityUnlockSent: historyValue}
-		message.HistoryEvent = &protos.HistoryEvent{
-			EventId:   -1,
-			Timestamp: timestamp,
-			EventType: &protos.HistoryEvent_EntityUnlockSent{EntityUnlockSent: messageValue},
-		}
+		message.HistoryEvent.EventType = &protos.HistoryEvent_EntityUnlockSent{EntityUnlockSent: messageValue}
 	default:
 		return nil, EntityMessage{}, fmt.Errorf("unknown entity message action: %v", action)
 	}
