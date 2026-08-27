@@ -1,0 +1,400 @@
+package client
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync/atomic"
+	"time"
+
+	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/helpers"
+	"github.com/microsoft/durabletask-go/internal/protos"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+func (w *TaskHubGrpcWorker) consumeConnection(run *grpcWorkerRun, connection *grpcWorkerConnection) (bool, error) {
+	observedMessage := false
+	for {
+		workItem, err := w.receiveWorkItem(connection)
+		if err != nil {
+			return observedMessage, err
+		}
+		observedMessage = true
+
+		if workItem.GetHealthPing() != nil {
+			continue
+		}
+		if request := workItem.GetOrchestratorRequest(); request != nil {
+			if err := w.dispatchOrchestration(run, connection, workItem.GetCompletionToken(), request); err != nil {
+				return observedMessage, err
+			}
+			continue
+		}
+		if request := workItem.GetActivityRequest(); request != nil {
+			if err := w.dispatchActivity(run, connection, workItem.GetCompletionToken(), request); err != nil {
+				return observedMessage, err
+			}
+			continue
+		}
+		if workItem.GetEntityRequest() != nil || workItem.GetEntityRequestV2() != nil {
+			w.logger.Warn("received unsupported entity work item; abandoning it")
+			w.abandonEntity(run.processingCtx, connection.client, workItem.GetCompletionToken())
+			continue
+		}
+
+		w.logger.Warnf("received unknown work item type with completion token present=%t", workItem.GetCompletionToken() != "")
+	}
+}
+
+func (w *TaskHubGrpcWorker) receiveWorkItem(connection *grpcWorkerConnection) (*protos.WorkItem, error) {
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(w.options.silentDisconnectTimeout, func() {
+		timedOut.Store(true)
+		connection.cancelStream()
+	})
+	workItem, err := connection.stream.Recv()
+	timer.Stop()
+	if timedOut.Load() {
+		return nil, errSilentDisconnect
+	}
+	if err != nil {
+		return nil, err
+	}
+	if workItem == nil {
+		return nil, status.Error(codes.Internal, "received a nil work item")
+	}
+	return workItem, nil
+}
+
+func (w *TaskHubGrpcWorker) dispatchOrchestration(
+	run *grpcWorkerRun,
+	connection *grpcWorkerConnection,
+	completionToken string,
+	request *protos.OrchestratorRequest,
+) error {
+	select {
+	case run.orchestrationSlots <- struct{}{}:
+	case <-run.intakeCtx.Done():
+		w.abandonOrchestration(run.processingCtx, connection.client, completionToken)
+		return run.intakeCtx.Err()
+	}
+
+	run.pending.Add(1)
+	connection.pending.Add(1)
+	go func() {
+		defer func() {
+			<-run.orchestrationSlots
+			connection.pending.Done()
+			run.pending.Done()
+		}()
+		w.processOrchestration(run.processingCtx, connection.client, completionToken, request)
+	}()
+	return nil
+}
+
+func (w *TaskHubGrpcWorker) dispatchActivity(
+	run *grpcWorkerRun,
+	connection *grpcWorkerConnection,
+	completionToken string,
+	request *protos.ActivityRequest,
+) error {
+	select {
+	case run.activitySlots <- struct{}{}:
+	case <-run.intakeCtx.Done():
+		w.abandonActivity(run.processingCtx, connection.client, completionToken)
+		return run.intakeCtx.Err()
+	}
+
+	run.pending.Add(1)
+	connection.pending.Add(1)
+	go func() {
+		defer func() {
+			<-run.activitySlots
+			connection.pending.Done()
+			run.pending.Done()
+		}()
+		w.processActivity(run.processingCtx, connection.client, completionToken, request)
+	}()
+	return nil
+}
+
+func (w *TaskHubGrpcWorker) processOrchestration(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+	request *protos.OrchestratorRequest,
+) {
+	pastEvents := request.PastEvents
+	if request.RequiresHistoryStreaming {
+		history, err := w.streamHistory(ctx, client, request)
+		if err != nil {
+			w.logger.Errorf("%s: failed to stream required orchestration history: %v", request.InstanceId, err)
+			w.abandonOrchestration(ctx, client, completionToken)
+			return
+		}
+		pastEvents = history
+	}
+
+	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
+	if err != nil && ctx.Err() != nil {
+		w.logger.Warnf("%s: orchestration execution canceled; abandoning work item", request.InstanceId)
+		w.abandonOrchestration(ctx, client, completionToken)
+		return
+	}
+
+	response := &protos.OrchestratorResponse{
+		InstanceId:                request.InstanceId,
+		CompletionToken:           completionToken,
+		OrchestrationTraceContext: request.OrchestrationTraceContext,
+	}
+	if err != nil {
+		response.Actions = []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
+			-1,
+			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+			wrapperspb.String("An internal error occurred while executing the orchestration."),
+			nil,
+			&protos.TaskFailureDetails{
+				ErrorType:    fmt.Sprintf("%T", err),
+				ErrorMessage: err.Error(),
+			},
+		)}
+	} else if results == nil || results.Response == nil {
+		response.Actions = []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
+			-1,
+			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+			wrapperspb.String("The orchestration executor returned no response."),
+			nil,
+			&protos.TaskFailureDetails{
+				ErrorType:    "MissingOrchestratorResponse",
+				ErrorMessage: "the orchestration executor returned no response",
+			},
+		)}
+	} else {
+		response = proto.Clone(results.Response).(*protos.OrchestratorResponse)
+		response.InstanceId = request.InstanceId
+		response.CompletionToken = completionToken
+		if response.OrchestrationTraceContext == nil {
+			response.OrchestrationTraceContext = request.OrchestrationTraceContext
+		}
+	}
+
+	err = w.executeRPCWithRetry(ctx, "complete orchestration task", func(callCtx context.Context) error {
+		_, callErr := client.CompleteOrchestratorTask(callCtx, response)
+		return callErr
+	})
+	if err != nil {
+		w.logger.Errorf("%s: failed to complete orchestration work item: %v", request.InstanceId, err)
+		w.abandonOrchestration(ctx, client, completionToken)
+	}
+}
+
+func (w *TaskHubGrpcWorker) streamHistory(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	request *protos.OrchestratorRequest,
+) ([]*protos.HistoryEvent, error) {
+	stream, err := client.StreamInstanceHistory(ctx, &protos.StreamInstanceHistoryRequest{
+		InstanceId:            request.InstanceId,
+		ExecutionId:           request.ExecutionId,
+		ForWorkItemProcessing: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var history []*protos.HistoryEvent
+	for {
+		chunk, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			return history, nil
+		}
+		if recvErr != nil {
+			return nil, recvErr
+		}
+		if chunk == nil {
+			return nil, status.Error(codes.Internal, "received a nil history chunk")
+		}
+		history = append(history, chunk.Events...)
+	}
+}
+
+func (w *TaskHubGrpcWorker) processActivity(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+	request *protos.ActivityRequest,
+) {
+	if request.OrchestrationInstance == nil {
+		w.logger.Error("received activity work item without an orchestration instance; abandoning it")
+		w.abandonActivity(ctx, client, completionToken)
+		return
+	}
+
+	event := helpers.NewTaskScheduledEvent(
+		request.TaskId,
+		request.Name,
+		request.Version,
+		request.Input,
+		request.ParentTraceContext,
+	)
+	result, err := w.executor.ExecuteActivity(ctx, api.InstanceID(request.OrchestrationInstance.InstanceId), event)
+	if err != nil && ctx.Err() != nil {
+		w.logger.Warnf("%s/%s#%d: activity execution canceled; abandoning work item", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId)
+		w.abandonActivity(ctx, client, completionToken)
+		return
+	}
+
+	response := &protos.ActivityResponse{
+		InstanceId:      request.OrchestrationInstance.InstanceId,
+		TaskId:          request.TaskId,
+		CompletionToken: completionToken,
+	}
+	if err != nil {
+		response.FailureDetails = &protos.TaskFailureDetails{
+			ErrorType:    fmt.Sprintf("%T", err),
+			ErrorMessage: err.Error(),
+		}
+	} else if completed := result.GetTaskCompleted(); completed != nil {
+		response.Result = completed.Result
+	} else if failed := result.GetTaskFailed(); failed != nil {
+		response.FailureDetails = failed.FailureDetails
+	} else {
+		response.FailureDetails = &protos.TaskFailureDetails{
+			ErrorType:    "UnknownTaskResult",
+			ErrorMessage: "activity executor returned an unknown task result",
+		}
+	}
+
+	err = w.executeRPCWithRetry(ctx, "complete activity task", func(callCtx context.Context) error {
+		_, callErr := client.CompleteActivityTask(callCtx, response)
+		return callErr
+	})
+	if err != nil {
+		w.logger.Errorf("%s/%s#%d: failed to complete activity work item: %v", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId, err)
+		w.abandonActivity(ctx, client, completionToken)
+	}
+}
+
+func (w *TaskHubGrpcWorker) abandonOrchestration(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+) {
+	if completionToken == "" {
+		w.logger.Warn("cannot abandon orchestration work item without a completion token")
+		return
+	}
+	if err := w.executeRPCWithRetry(ctx, "abandon orchestration task", func(callCtx context.Context) error {
+		_, callErr := client.AbandonTaskOrchestratorWorkItem(callCtx, &protos.AbandonOrchestrationTaskRequest{
+			CompletionToken: completionToken,
+		})
+		return callErr
+	}); err != nil {
+		w.logger.Errorf("failed to abandon orchestration work item: %v", err)
+	}
+}
+
+func (w *TaskHubGrpcWorker) abandonActivity(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+) {
+	if completionToken == "" {
+		w.logger.Warn("cannot abandon activity work item without a completion token")
+		return
+	}
+	if err := w.executeRPCWithRetry(ctx, "abandon activity task", func(callCtx context.Context) error {
+		_, callErr := client.AbandonTaskActivityWorkItem(callCtx, &protos.AbandonActivityTaskRequest{
+			CompletionToken: completionToken,
+		})
+		return callErr
+	}); err != nil {
+		w.logger.Errorf("failed to abandon activity work item: %v", err)
+	}
+}
+
+func (w *TaskHubGrpcWorker) abandonEntity(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	completionToken string,
+) {
+	if completionToken == "" {
+		w.logger.Warn("cannot abandon unsupported entity work item without a completion token")
+		return
+	}
+	if err := w.executeRPCWithRetry(ctx, "abandon entity task", func(callCtx context.Context) error {
+		_, callErr := client.AbandonTaskEntityWorkItem(callCtx, &protos.AbandonEntityTaskRequest{
+			CompletionToken: completionToken,
+		})
+		return callErr
+	}); err != nil {
+		w.logger.Errorf("failed to abandon unsupported entity work item: %v", err)
+	}
+}
+
+func (w *TaskHubGrpcWorker) executeRPCWithRetry(
+	ctx context.Context,
+	operation string,
+	action func(context.Context) error,
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= w.options.transientRetryMaxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, w.options.rpcTimeout)
+		lastErr = action(callCtx)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isTransientWorkerRPCError(lastErr) {
+			return fmt.Errorf("%s failed with a non-retryable error: %w", operation, lastErr)
+		}
+		if attempt == w.options.transientRetryMaxAttempts {
+			break
+		}
+		if err := waitForRetry(ctx, w.retryDelay(attempt)); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("%s failed after %d attempts: %w", operation, w.options.transientRetryMaxAttempts, lastErr)
+}
+
+func (w *TaskHubGrpcWorker) retryDelay(attempt int) time.Duration {
+	delay := w.options.transientRetryBaseDelay
+	for i := 1; i < attempt && delay < w.options.transientRetryMaxDelay; i++ {
+		if delay > w.options.transientRetryMaxDelay/2 {
+			return w.options.transientRetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > w.options.transientRetryMaxDelay {
+		return w.options.transientRetryMaxDelay
+	}
+	return delay
+}
+
+func isTransientWorkerRPCError(err error) bool {
+	grpcStatus, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch grpcStatus.Code() {
+	case codes.Canceled,
+		codes.DeadlineExceeded,
+		codes.ResourceExhausted,
+		codes.Aborted,
+		codes.Internal,
+		codes.Unavailable,
+		codes.Unknown:
+		return true
+	default:
+		return false
+	}
+}
