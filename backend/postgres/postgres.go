@@ -105,7 +105,9 @@ func (be *postgresBackend) CreateTaskHub(ctx context.Context) error {
 
 func (be *postgresBackend) DeleteTaskHub(ctx context.Context) error {
 	if be.db == nil {
-		return nil
+		if err := be.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start backend for task hub deletion: %w", err)
+		}
 	}
 
 	_, err := be.db.Exec(ctx, "DROP TABLE IF EXISTS Instances CASCADE")
