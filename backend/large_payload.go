@@ -6,6 +6,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
+	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -105,6 +106,11 @@ func (be *largePayloadBackend) CompleteOrchestrationWorkItem(ctx context.Context
 			return fmt.Errorf("failed to externalize orchestration message: %w", err)
 		}
 	}
+	for _, message := range workItem.State.PendingEntityMessages() {
+		if err := largepayload.TransformHistoryEvent(ctx, be.options, message.HistoryEvent, true); err != nil {
+			return fmt.Errorf("failed to externalize entity message: %w", err)
+		}
+	}
 	var err error
 	workItem.State.CustomStatus, err = largepayload.Externalize(ctx, be.options, workItem.State.CustomStatus)
 	if err != nil {
@@ -131,6 +137,126 @@ func (be *largePayloadBackend) CompleteActivityWorkItem(ctx context.Context, wor
 		}
 	}
 	return be.Backend.CompleteActivityWorkItem(ctx, workItem)
+}
+
+func (be *largePayloadBackend) SignalEntity(ctx context.Context, request *protos.SignalEntityRequest) error {
+	capability, ok := be.Backend.(EntitySignalBackend)
+	if !ok {
+		return api.ErrFeatureNotSupported
+	}
+	if request == nil {
+		return fmt.Errorf("signal entity request is required")
+	}
+	cloned := proto.Clone(request).(*protos.SignalEntityRequest)
+	var err error
+	cloned.Input, err = largepayload.Externalize(ctx, be.options, cloned.Input)
+	if err != nil {
+		return fmt.Errorf("failed to externalize entity signal input: %w", err)
+	}
+	return capability.SignalEntity(ctx, cloned)
+}
+
+func (be *largePayloadBackend) GetEntityWorkItem(ctx context.Context) (*EntityWorkItem, error) {
+	capability, ok := be.Backend.(EntityBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	workItem, err := capability.GetEntityWorkItem(ctx)
+	if err != nil || workItem == nil {
+		return workItem, err
+	}
+	state, err := largepayload.Hydrate(ctx, be.options, StringValue(workItem.State))
+	if err != nil {
+		return nil, fmt.Errorf("failed to hydrate entity state: %w", err)
+	}
+	if workItem.State != nil {
+		value := state.GetValue()
+		workItem.State = &value
+	}
+	for _, event := range workItem.Operations {
+		if err := largepayload.TransformHistoryEvent(ctx, be.options, event, false); err != nil {
+			return nil, fmt.Errorf("failed to hydrate entity operation: %w", err)
+		}
+	}
+	return workItem, nil
+}
+
+func (be *largePayloadBackend) CompleteEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
+	capability, ok := be.Backend.(EntityBackend)
+	if !ok {
+		return api.ErrFeatureNotSupported
+	}
+	if workItem != nil && workItem.Result != nil {
+		if err := largepayload.TransformEntityBatchResult(ctx, be.options, workItem.Result); err != nil {
+			return fmt.Errorf("failed to externalize entity result: %w", err)
+		}
+	}
+	return capability.CompleteEntityWorkItem(ctx, workItem)
+}
+
+func (be *largePayloadBackend) AbandonEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
+	capability, ok := be.Backend.(EntityBackend)
+	if !ok {
+		return api.ErrFeatureNotSupported
+	}
+	return capability.AbandonEntityWorkItem(ctx, workItem)
+}
+
+func (be *largePayloadBackend) GetEntityMetadata(
+	ctx context.Context,
+	entityID api.EntityID,
+	includeState bool,
+) (*api.EntityMetadata, error) {
+	capability, ok := be.Backend.(EntityQueryBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	metadata, err := capability.GetEntityMetadata(ctx, entityID, includeState)
+	if err != nil || metadata == nil || !includeState {
+		return metadata, err
+	}
+	state, err := largepayload.Hydrate(ctx, be.options, wrapperspb.String(metadata.SerializedState))
+	if err != nil {
+		return nil, fmt.Errorf("failed to hydrate entity metadata: %w", err)
+	}
+	metadata.SerializedState = state.GetValue()
+	return metadata, nil
+}
+
+func (be *largePayloadBackend) QueryEntities(
+	ctx context.Context,
+	query api.EntityQuery,
+) (*api.EntityQueryResults, error) {
+	capability, ok := be.Backend.(EntityQueryBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	result, err := capability.QueryEntities(ctx, query)
+	if err != nil || result == nil || !query.IncludeState {
+		return result, err
+	}
+	for _, metadata := range result.Entities {
+		if metadata == nil {
+			continue
+		}
+		state, err := largepayload.Hydrate(ctx, be.options, wrapperspb.String(metadata.SerializedState))
+		if err != nil {
+			return nil, fmt.Errorf("failed to hydrate queried entity state: %w", err)
+		}
+		metadata.SerializedState = state.GetValue()
+	}
+	return result, nil
+}
+
+func (be *largePayloadBackend) CleanEntityStorage(
+	ctx context.Context,
+	request api.CleanEntityStorageRequest,
+) (*api.CleanEntityStorageResult, error) {
+	capability, ok := be.Backend.(EntityQueryBackend)
+	if !ok {
+		return nil, api.ErrFeatureNotSupported
+	}
+	return capability.CleanEntityStorage(ctx, request)
 }
 
 func (be *largePayloadBackend) GetOrchestrationMetadata(ctx context.Context, id api.InstanceID) (*api.OrchestrationMetadata, error) {

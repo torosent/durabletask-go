@@ -197,6 +197,32 @@ func Test_EntityBackend_CriticalSectionChain(t *testing.T) {
 	}
 }
 
+func Test_EntityBackend_AbandonBackoffDefersPoisonedBatch(t *testing.T) {
+	for index, be := range backends {
+		entityBackend := be.(backend.EntityBackend)
+		initTest(t, be, index, true)
+		entityID := api.NewEntityID("counter", fmt.Sprintf("backoff-%d", index))
+		require.NoError(t, entityBackend.SignalEntity(ctx, &protos.SignalEntityRequest{
+			InstanceId: entityID.String(),
+			RequestId:  uuid.NewString(),
+			Name:       "fail",
+		}))
+
+		first, err := entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		require.Zero(t, first.GetAbandonDelay())
+		require.NoError(t, entityBackend.AbandonEntityWorkItem(ctx, first))
+
+		second, err := entityBackend.GetEntityWorkItem(ctx)
+		require.NoError(t, err)
+		require.Equal(t, time.Second, second.GetAbandonDelay())
+		require.NoError(t, entityBackend.AbandonEntityWorkItem(ctx, second))
+
+		_, err = entityBackend.GetEntityWorkItem(ctx)
+		require.ErrorIs(t, err, backend.ErrNoWorkItems)
+	}
+}
+
 // Test_NewOrchestrationWorkItem_Single enqueues a single work item into the backend
 // store and attempts to fetch it immediately afterwards.
 func Test_NewOrchestrationWorkItem_Single(t *testing.T) {

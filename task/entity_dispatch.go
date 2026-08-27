@@ -30,7 +30,15 @@ func NewEntityFor[S any]() Entity {
 	pointerType := reflect.PointerTo(stateType)
 	for i := 0; i < pointerType.NumMethod(); i++ {
 		method := pointerType.Method(i)
-		methods[strings.ToLower(method.Name)] = method
+		name := strings.ToLower(method.Name)
+		if existing, ok := methods[name]; ok {
+			panic(fmt.Sprintf(
+				"NewEntityFor found case-insensitive operation collision between %s and %s",
+				existing.Name,
+				method.Name,
+			))
+		}
+		methods[name] = method
 	}
 
 	return func(ctx *EntityContext) (any, error) {

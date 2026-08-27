@@ -1543,10 +1543,16 @@ func (be *postgresBackend) AbandonEntityWorkItem(ctx context.Context, wi *backen
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	var visibleTime *time.Time
+	if delay := wi.GetAbandonDelay(); delay > 0 {
+		value := time.Now().UTC().Add(delay)
+		visibleTime = &value
+	}
 	for _, messageID := range wi.MessageIDs {
 		if _, err := tx.Exec(
 			ctx,
-			"UPDATE EntityMessages SET LockedBy = NULL WHERE SequenceNumber = $1 AND LockedBy = $2",
+			"UPDATE EntityMessages SET LockedBy = NULL, VisibleTime = $1 WHERE SequenceNumber = $2 AND LockedBy = $3",
+			visibleTime,
 			messageID,
 			wi.LockedBy,
 		); err != nil {
