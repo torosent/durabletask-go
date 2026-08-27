@@ -151,7 +151,7 @@ func TestCoroutinePanicFailsOrchestration(t *testing.T) {
 		ctx.Go(func(*OrchestrationContext) {
 			panic("boom")
 		})
-		ctx.WaitForSingleEvent("never", -1).Await(nil)
+		_ = ctx.WaitForSingleEvent("never", -1).Await(nil)
 		return nil, nil
 	}); err != nil {
 		t.Fatal(err)
@@ -258,7 +258,7 @@ func TestCoroutineSchedulerDoesNotLeakAcrossTurns(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorN("blocked", func(ctx *OrchestrationContext) (any, error) {
 		defer ctx.Go(func(*OrchestrationContext) {})
-		ctx.WaitForSingleEvent("never", -1).Await(nil)
+		_ = ctx.WaitForSingleEvent("never", -1).Await(nil)
 		return nil, nil
 	}); err != nil {
 		t.Fatal(err)
