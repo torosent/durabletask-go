@@ -22,6 +22,18 @@ be := sqlite.NewSqliteBackend(options, backend.DefaultLogger())
 
 Additional storage providers can be created by extending the `Backend` interface.
 
+## Durable Task Scheduler
+
+The top-level [`durabletaskscheduler`](./durabletaskscheduler) package connects
+Go orchestrations and activities to Durable Task Scheduler (DTS) without
+pretending that the remote service is a local storage backend. It provides
+validated connection-string configuration, Azure token credentials, separately
+owned management and worker connections, resilient worker streaming, and
+environment-gated emulator tests.
+
+See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
+and the [environment-driven sample](./samples/durabletaskscheduler).
+
 ## Creating the standalone gRPC sidecar
 
 See the `main.go` file for an example of how to create a standalone gRPC sidecar that embeds the Durable Task engine. In short, you must create an `Backend` (for storage), an `Executor` (for executing user code), and host them as a `TaskHubWorker`.
@@ -257,7 +269,7 @@ The protocol buffer definitions used to generate the gRPC bindings are vendored 
 
 ## Building the project
 
-This project requires go v1.19.x or greater. You can build a standalone executable by simply running `go build` at the project root.
+This project requires Go 1.23 or greater. You can build a standalone executable by simply running `go build` at the project root.
 
 ### Generating protobuf
 
