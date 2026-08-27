@@ -475,6 +475,13 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 		options.rawInput,
 		options.version,
 	)
+	if createSubOrchestrationAction.GetCreateSubOrchestration().GetInstanceId() == "" {
+		createSubOrchestrationAction.GetCreateSubOrchestration().InstanceId = fmt.Sprintf(
+			"%s:%04x",
+			ctx.ID,
+			createSubOrchestrationAction.Id,
+		)
+	}
 	ctx.pendingActions[createSubOrchestrationAction.Id] = createSubOrchestrationAction
 
 	task := newTaskInScope(ctx, scope)
@@ -810,31 +817,33 @@ func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) e
 	er := e.GetEventRaised()
 	key := strings.ToUpper(er.GetName())
 	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok {
-		// Complete the previously allocated task associated with this event name.
-		elem := pendingTasks.Front()
-		task := elem.Value.(*completableTask)
-		if pendingTasks.Len() > 1 {
+		for pendingTasks.Len() > 0 {
+			elem := pendingTasks.Front()
+			task := elem.Value.(*completableTask)
 			pendingTasks.Remove(elem)
-		} else {
-			delete(ctx.pendingExternalEventTasks, key)
+			if pendingTasks.Len() == 0 {
+				delete(ctx.pendingExternalEventTasks, key)
+			}
+			if task.isCompleted {
+				continue
+			}
+			task.complete([]byte(er.Input.GetValue()))
+			return nil
 		}
-		rawValue := []byte(er.Input.GetValue())
-		task.complete(rawValue)
-	} else {
-		// Add this event to the buffered list of events with this name.
-		var eventList *list.List
-		var ok bool
-		if eventList, ok = ctx.bufferedExternalEvents[key]; !ok {
-			eventList = list.New()
-			ctx.bufferedExternalEvents[key] = eventList
-		}
-		eventList.PushBack(&bufferedEvent{
-			event: e,
-			order: ctx.scheduler.nextCompletionID(),
-		})
-		for waiter := range ctx.eventWaiters[key] {
-			ctx.scheduler.makeRunnable(waiter)
-		}
+	}
+
+	// No live waiter consumed the event, so keep it for a future receiver.
+	eventList, ok := ctx.bufferedExternalEvents[key]
+	if !ok {
+		eventList = list.New()
+		ctx.bufferedExternalEvents[key] = eventList
+	}
+	eventList.PushBack(&bufferedEvent{
+		event: e,
+		order: ctx.scheduler.nextCompletionID(),
+	})
+	for waiter := range ctx.eventWaiters[key] {
+		ctx.scheduler.makeRunnable(waiter)
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package durabletaskscheduler
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -26,6 +27,15 @@ import (
 type recordingCredential struct {
 	mu      sync.Mutex
 	options []policy.TokenRequestOptions
+}
+
+type failingCredential struct{}
+
+func (failingCredential) GetToken(
+	context.Context,
+	policy.TokenRequestOptions,
+) (azcore.AccessToken, error) {
+	return azcore.AccessToken{}, errors.New("temporary token failure")
 }
 
 func (c *recordingCredential) GetToken(
@@ -105,6 +115,18 @@ func TestSchedulerCredentialsUseExpectedScope(t *testing.T) {
 	credential.mu.Lock()
 	defer credential.mu.Unlock()
 	require.Equal(t, []string{"https://durabletask.io/.default"}, credential.options[0].Scopes)
+}
+
+func TestSchedulerCredentialFailureIsTransient(t *testing.T) {
+	perRPC := &schedulerPerRPCCredentials{
+		credential: failingCredential{},
+		scope:      "https://durabletask.io/.default",
+		taskHub:    "hub",
+		userAgent:  "agent",
+	}
+	_, err := perRPC.GetRequestMetadata(context.Background())
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "temporary token failure")
 }
 
 func TestConfiguredClientAndWorkerUseSeparateMetadataAndConnections(t *testing.T) {

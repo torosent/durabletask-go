@@ -235,13 +235,11 @@ func setupGrpcExecutor(ctx context.Context, be backend.Backend, logger backend.L
 		_ = lis.Close()
 	}()
 
-	// Create a worker that connects to the gRPC server.
-	// establish a gRPC connection, blocking until the server is ready or the timeout expires
-	conn, err := grpc.DialContext(
-		ctx,
-		lis.Addr().String(),
+	// Create a worker that connects to the gRPC server. The listener's Hello
+	// handshake below provides the fail-fast connectivity check.
+	conn, err := grpc.NewClient(
+		"passthrough:///"+lis.Addr().String(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, err
