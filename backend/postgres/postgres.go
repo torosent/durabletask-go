@@ -956,9 +956,11 @@ func (be *postgresBackend) GetOrchestrationBacklog(ctx context.Context) (backend
 	now := time.Now().UTC()
 	row := be.db.QueryRow(
 		ctx,
-		`SELECT COUNT(DISTINCT InstanceID), MIN(Timestamp)
-		FROM NewEvents
-		WHERE LockedBy IS NULL AND (VisibleTime IS NULL OR VisibleTime <= $1)`,
+		`SELECT COUNT(DISTINCT E.InstanceID), MIN(E.Timestamp)
+		FROM NewEvents E
+		INNER JOIN Instances I ON I.InstanceID = E.InstanceID
+		WHERE (I.LockExpiration IS NULL OR I.LockExpiration < $1)
+			AND (E.VisibleTime IS NULL OR E.VisibleTime <= $1)`,
 		now,
 	)
 	return scanPostgresBacklog(row, backend.WorkItemKindOrchestration, now)
@@ -1036,9 +1038,15 @@ func (be *postgresBackend) AbandonActivityWorkItem(ctx context.Context, wi *back
 		return err
 	}
 
+	var lockExpiration *time.Time
+	if delay := wi.GetAbandonDelay(); delay > 0 {
+		visibleAt := time.Now().UTC().Add(delay)
+		lockExpiration = &visibleAt
+	}
 	dbResult, err := be.db.Exec(
 		ctx,
-		"UPDATE NewTasks SET LockedBy = NULL, LockExpiration = NULL WHERE SequenceNumber = $1 AND LockedBy = $2",
+		"UPDATE NewTasks SET LockedBy = NULL, LockExpiration = $1 WHERE SequenceNumber = $2 AND LockedBy = $3",
+		lockExpiration,
 		wi.SequenceNumber,
 		wi.LockedBy,
 	)

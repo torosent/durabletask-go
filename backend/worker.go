@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,8 +41,10 @@ type worker struct {
 	activitySemaphores map[string]semaphore.Semaphore
 
 	// pending is for keeping track of outstanding orchestration executions.
-	pending  *sync.WaitGroup
-	inFlight atomic.Int64
+	pending           *sync.WaitGroup
+	poller            sync.WaitGroup
+	inFlight          atomic.Int64
+	nextBacklogSample atomic.Int64
 
 	// cancel is used to cancel background polling.
 	// It will be nil if background polling isn't started.
@@ -50,6 +53,11 @@ type worker struct {
 	waiting   bool
 	stop      atomic.Bool
 }
+
+const (
+	activityConcurrencyRetryDelay = 100 * time.Millisecond
+	backlogMetricsInterval        = time.Second
+)
 
 type NewTaskWorkerOptions func(*WorkerOptions)
 
@@ -124,8 +132,10 @@ func (w *worker) Start(ctx context.Context) {
 	w.cancel = cancel
 
 	w.stop.Store(false)
+	w.poller.Add(1)
 
 	go func() {
+		defer w.poller.Done()
 		var b backoff.BackOff = &backoff.ExponentialBackOff{
 			InitialInterval:     50 * time.Millisecond,
 			MaxInterval:         5 * time.Second,
@@ -154,27 +164,13 @@ func (w *worker) Start(ctx context.Context) {
 				// another error was encountered
 				// log the error and inject some extra sleep to avoid tight failure loops
 				w.logger.Errorf("unexpected worker error: %v. Adding 5 extra seconds of backoff.", err)
-				t := time.NewTimer(5 * time.Second)
-				select {
-				case <-t.C:
-					// nop - all good
-				case <-ctx.Done():
-					if !t.Stop() {
-						<-t.C
-					}
+				if !sleep(ctx, 5*time.Second) {
 					w.logger.Infof("%v: received cancellation signal", w.Name())
 					break loop
 				}
 			default:
 				// no work item found, so sleep until the next backoff
-				t := time.NewTimer(b.NextBackOff())
-				select {
-				case <-t.C:
-					// nop - all good
-				case <-ctx.Done():
-					if !t.Stop() {
-						<-t.C
-					}
+				if !sleep(ctx, b.NextBackOff()) {
 					w.logger.Infof("%v: received cancellation signal", w.Name())
 					break loop
 				}
@@ -183,6 +179,18 @@ func (w *worker) Start(ctx context.Context) {
 
 		w.logger.Infof("%v: stopped listening for new work items", w.Name())
 	}()
+}
+
+// sleep waits for the given duration, returning false if ctx is canceled first.
+func sleep(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (w *worker) ProcessNext(ctx context.Context) (bool, error) {
@@ -220,16 +228,12 @@ func (w *worker) ProcessNext(ctx context.Context) (bool, error) {
 	default:
 		activitySemaphore := w.activitySemaphore(wi)
 		if activitySemaphore != nil && !activitySemaphore.TryAcquire(1) {
-			if err := activitySemaphore.Acquire(ctx, 1); err != nil {
-				abandonCtx := ctx
-				if errors.Is(err, ctx.Err()) {
-					abandonCtx = context.Background()
-				}
-				if abandonErr := w.processor.AbandonWorkItem(abandonCtx, wi); abandonErr != nil {
-					w.logger.Errorf("%v: failed to abandon work item after concurrency wait cancellation: %v", w.Name(), abandonErr)
-				}
-				return false, err
+			setActivityAbandonDelay(wi, activityConcurrencyRetryDelay)
+			if err := w.processor.AbandonWorkItem(ctx, wi); err != nil {
+				return false, fmt.Errorf("%v: failed to defer activity work item at its concurrency limit: %w", w.Name(), err)
 			}
+			w.waiting = false
+			return false, nil
 		}
 		// process the work-item in the background
 		w.waiting = false
@@ -250,6 +254,9 @@ func (w *worker) StopAndDrain() {
 		w.cancel()
 	}
 
+	// Ensure the poller cannot add another item to pending before waiting.
+	w.poller.Wait()
+
 	// Wait for outstanding work-items to finish processing.
 	// TODO: Need to find a way to cancel this if it takes too long for some reason.
 	w.pending.Wait()
@@ -261,6 +268,7 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 	if activitySemaphore != nil {
 		defer activitySemaphore.Release(1)
 	}
+	setActivityAbandonDelay(wi, 0)
 
 	startedAt := time.Now()
 	w.inFlight.Add(1)
@@ -270,10 +278,7 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 	w.logger.Debugf("%v: processing work item: %s", w.Name(), wi)
 
 	if w.stop.Load() {
-		if err := w.processor.AbandonWorkItem(context.Background(), wi); err != nil {
-			w.logger.Errorf("%v: failed to abandon work item: %v", w.Name(), err)
-		}
-		w.reportWorkerActivity(wi, WorkerActivityAbandoned, startedAt)
+		w.abandonWorkItem(context.Background(), wi, startedAt)
 		return
 	}
 
@@ -283,13 +288,8 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 		} else {
 			w.logger.Errorf("%v: failed to process work item: %v", w.Name(), err)
 		}
-		if w.stop.Load() {
-			ctx = context.Background()
-		}
-		if err := w.processor.AbandonWorkItem(ctx, wi); err != nil {
-			w.logger.Errorf("%v: failed to abandon work item: %v", w.Name(), err)
-		}
-		w.reportWorkerActivity(wi, WorkerActivityAbandoned, startedAt)
+		applyErrorAbandonDelay(wi, err)
+		w.abandonWorkItem(w.releaseContext(ctx), wi, startedAt)
 		return
 	}
 
@@ -299,13 +299,7 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 		} else {
 			w.logger.Errorf("%v: failed to complete work item: %v", w.Name(), err)
 		}
-		if w.stop.Load() {
-			ctx = context.Background()
-		}
-		if err := w.processor.AbandonWorkItem(ctx, wi); err != nil {
-			w.logger.Errorf("%v: failed to abandon work item: %v", w.Name(), err)
-		}
-		w.reportWorkerActivity(wi, WorkerActivityAbandoned, startedAt)
+		w.abandonWorkItem(w.releaseContext(ctx), wi, startedAt)
 		return
 	}
 
@@ -313,23 +307,58 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 	w.reportWorkerActivity(wi, WorkerActivityCompleted, startedAt)
 }
 
+// releaseContext returns the context to use when releasing a work item. A
+// stopping worker releases on a background context so the release isn't dropped
+// along with the canceled work item context.
+func (w *worker) releaseContext(ctx context.Context) context.Context {
+	if w.stop.Load() {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (w *worker) abandonWorkItem(ctx context.Context, wi WorkItem, startedAt time.Time) {
+	if err := w.processor.AbandonWorkItem(ctx, wi); err != nil {
+		w.logger.Errorf("%v: failed to abandon work item: %v", w.Name(), err)
+	}
+	w.reportWorkerActivity(wi, WorkerActivityAbandoned, startedAt)
+}
+
 func (w *worker) activitySemaphore(wi WorkItem) semaphore.Semaphore {
 	if len(w.activitySemaphores) == 0 {
 		return nil
 	}
-	var event *HistoryEvent
+	activity := asActivityWorkItem(wi)
+	if activity == nil || activity.NewEvent == nil {
+		return nil
+	}
+	return w.activitySemaphores[activity.NewEvent.GetTaskScheduled().GetName()]
+}
+
+// asOrchestrationWorkItem normalizes the pointer and value forms of an
+// orchestration work item, returning nil for any other work item type.
+func asOrchestrationWorkItem(wi WorkItem) *OrchestrationWorkItem {
 	switch workItem := wi.(type) {
-	case *ActivityWorkItem:
-		event = workItem.NewEvent
-	case ActivityWorkItem:
-		event = workItem.NewEvent
+	case *OrchestrationWorkItem:
+		return workItem
+	case OrchestrationWorkItem:
+		return &workItem
 	default:
 		return nil
 	}
-	if event == nil {
+}
+
+// asActivityWorkItem normalizes the pointer and value forms of an activity work
+// item, returning nil for any other work item type.
+func asActivityWorkItem(wi WorkItem) *ActivityWorkItem {
+	switch workItem := wi.(type) {
+	case *ActivityWorkItem:
+		return workItem
+	case ActivityWorkItem:
+		return &workItem
+	default:
 		return nil
 	}
-	return w.activitySemaphores[event.GetTaskScheduled().GetName()]
 }
 
 type backlogMetricSource interface {
@@ -343,6 +372,16 @@ func (w *worker) reportBacklog(ctx context.Context) {
 	source, ok := w.processor.(backlogMetricSource)
 	if !ok {
 		return
+	}
+	now := time.Now()
+	for {
+		next := w.nextBacklogSample.Load()
+		if next > now.UnixNano() {
+			return
+		}
+		if w.nextBacklogSample.CompareAndSwap(next, now.Add(backlogMetricsInterval).UnixNano()) {
+			break
+		}
 	}
 	metric, supported, err := source.GetBacklogMetric(ctx)
 	if err != nil {
@@ -365,32 +404,21 @@ func (w *worker) reportWorkerActivity(wi WorkItem, state WorkerActivityState, st
 		return
 	}
 	metric := WorkerActivityMetric{
-		State:    state,
-		InFlight: w.inFlight.Load(),
-		Duration: time.Since(startedAt),
+		State:        state,
+		InFlight:     w.inFlight.Load(),
+		Duration:     time.Since(startedAt),
+		QueueLatency: workItemQueueLatency(wi, startedAt),
 	}
-	switch workItem := wi.(type) {
-	case *OrchestrationWorkItem:
+	if orchestration := asOrchestrationWorkItem(wi); orchestration != nil {
 		metric.Kind = WorkItemKindOrchestration
-		metric.InstanceID = workItem.InstanceID
-		metric.RetryCount = workItem.RetryCount
-	case OrchestrationWorkItem:
-		metric.Kind = WorkItemKindOrchestration
-		metric.InstanceID = workItem.InstanceID
-		metric.RetryCount = workItem.RetryCount
-	case *ActivityWorkItem:
+		metric.InstanceID = orchestration.InstanceID
+		metric.RetryCount = orchestration.RetryCount
+	} else if activity := asActivityWorkItem(wi); activity != nil {
 		metric.Kind = WorkItemKindActivity
-		metric.InstanceID = workItem.InstanceID
-		metric.RetryCount = workItem.RetryCount
-		if workItem.NewEvent != nil {
-			metric.ActivityName = workItem.NewEvent.GetTaskScheduled().GetName()
-		}
-	case ActivityWorkItem:
-		metric.Kind = WorkItemKindActivity
-		metric.InstanceID = workItem.InstanceID
-		metric.RetryCount = workItem.RetryCount
-		if workItem.NewEvent != nil {
-			metric.ActivityName = workItem.NewEvent.GetTaskScheduled().GetName()
+		metric.InstanceID = activity.InstanceID
+		metric.RetryCount = activity.RetryCount
+		if activity.NewEvent != nil {
+			metric.ActivityName = activity.NewEvent.GetTaskScheduled().GetName()
 		}
 	}
 	defer func() {
@@ -399,4 +427,30 @@ func (w *worker) reportWorkerActivity(wi WorkItem, state WorkerActivityState, st
 		}
 	}()
 	w.options.Metrics.WorkerActivity(metric)
+}
+
+func setActivityAbandonDelay(wi WorkItem, delay time.Duration) {
+	if activity := asActivityWorkItem(wi); activity != nil {
+		activity.AbandonDelay = delay
+	}
+}
+
+func applyErrorAbandonDelay(wi WorkItem, err error) {
+	var delayed WorkItemAbandonDelayError
+	if errors.As(err, &delayed) {
+		setActivityAbandonDelay(wi, delayed.WorkItemAbandonDelay())
+	}
+}
+
+func workItemQueueLatency(wi WorkItem, now time.Time) time.Duration {
+	var enqueuedAt time.Time
+	if orchestration := asOrchestrationWorkItem(wi); orchestration != nil {
+		enqueuedAt = orchestration.EnqueuedAt
+	} else if activity := asActivityWorkItem(wi); activity != nil {
+		enqueuedAt = activity.EnqueuedAt
+	}
+	if enqueuedAt.IsZero() || !enqueuedAt.Before(now) {
+		return 0
+	}
+	return now.Sub(enqueuedAt)
 }

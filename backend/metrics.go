@@ -40,6 +40,7 @@ type WorkerActivityMetric struct {
 	RetryCount   int32
 	InFlight     int64
 	Duration     time.Duration
+	QueueLatency time.Duration
 }
 
 // RetryMetric reports a durable task retry that was scheduled.

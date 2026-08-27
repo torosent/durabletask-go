@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // VersionMatchStrategy determines which task versions a worker accepts.
@@ -44,6 +45,12 @@ func (e *VersionMismatchError) Error() string {
 		e.WorkerVersion,
 		e.Strategy,
 	)
+}
+
+// WorkItemAbandonDelay prevents local workers from immediately re-dequeuing
+// version-incompatible activity work items.
+func (*VersionMismatchError) WorkItemAbandonDelay() time.Duration {
+	return time.Second
 }
 
 func (o *VersioningOptions) check(taskVersion string) error {

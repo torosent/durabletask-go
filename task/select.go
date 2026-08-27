@@ -59,11 +59,8 @@ func (ctx *OrchestrationContext) WhenAny(tasks ...Task) Task {
 // WhenAll blocks until every task completes and returns the earliest failure,
 // ordered by orchestration history.
 func (ctx *OrchestrationContext) WhenAll(tasks ...Task) error {
-	type taskFailure struct {
-		err   error
-		order uint64
-	}
-	failures := make([]taskFailure, 0)
+	var firstErr error
+	var firstOrder uint64
 	for _, task := range tasks {
 		err := task.Await(nil)
 		if err == nil {
@@ -71,20 +68,18 @@ func (ctx *OrchestrationContext) WhenAll(tasks ...Task) error {
 		}
 		state, ok := taskState(task)
 		if !ok {
-			return err
+			if firstErr == nil {
+				firstErr = err
+				firstOrder = ^uint64(0)
+			}
+			continue
 		}
-		failures = append(failures, taskFailure{err: err, order: state.completionID})
-	}
-	if len(failures) == 0 {
-		return nil
-	}
-	first := failures[0]
-	for _, failure := range failures[1:] {
-		if failure.order < first.order {
-			first = failure
+		if firstErr == nil || state.completionID < firstOrder {
+			firstErr = err
+			firstOrder = state.completionID
 		}
 	}
-	return first.err
+	return firstErr
 }
 
 // Select waits until one case is ready and invokes its handler.
@@ -117,6 +112,7 @@ func (ctx *OrchestrationContext) selectCase(cases []SelectCase) SelectCase {
 		}
 
 		current := scheduler.mustCurrent()
+		ctx.scope.addWaiter(current)
 		for _, candidate := range cases {
 			candidate.subscribe(current)
 		}
@@ -125,7 +121,8 @@ func (ctx *OrchestrationContext) selectCase(cases []SelectCase) SelectCase {
 		for _, candidate := range cases {
 			candidate.unsubscribe(current)
 		}
-		if current.scope.isCanceled() {
+		ctx.scope.removeWaiter(current)
+		if current.scope.isCanceled() || ctx.scope.isCanceled() {
 			panic(ErrTaskCanceled)
 		}
 	}

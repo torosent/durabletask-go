@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -47,13 +48,14 @@ type Executor interface {
 
 type grpcExecutor struct {
 	protos.UnimplementedTaskHubSidecarServiceServer
-	workItemQueue        chan *protos.WorkItem
-	pendingOrchestrators *sync.Map // map[api.InstanceID]*ExecutionResults
-	pendingActivities    *sync.Map // map[string]*activityExecutionResult
-	backend              Backend
-	logger               Logger
-	onWorkItemConnection func(context.Context) error
-	streamShutdownChan   <-chan any
+	workItemQueue              chan *protos.WorkItem
+	pendingOrchestrators       *sync.Map // map[api.InstanceID]*ExecutionResults
+	pendingActivities          *sync.Map // map[string]*activityExecutionResult
+	backend                    Backend
+	logger                     Logger
+	onWorkItemConnection       func(context.Context) error
+	streamShutdownChan         <-chan any
+	allowReplaceableStatusWire bool
 }
 
 type grpcExecutorOptions func(g *grpcExecutor)
@@ -76,6 +78,15 @@ func WithOnGetWorkItemsConnectionCallback(callback func(context.Context) error) 
 func WithStreamShutdownChannel(c <-chan any) grpcExecutorOptions {
 	return func(g *grpcExecutor) {
 		g.streamShutdownChan = c
+	}
+}
+
+// WithCurrentOrchestrationIDReusePolicyWire enables current-proto
+// replaceableStatus semantics for external gRPC clients. Without this option,
+// ambiguous field-1-only policies fail closed to protect legacy ERROR callers.
+func WithCurrentOrchestrationIDReusePolicyWire() grpcExecutorOptions {
+	return func(g *grpcExecutor) {
+		g.allowReplaceableStatusWire = true
 	}
 }
 
@@ -153,6 +164,7 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 				Input:                 task.Input,
 				OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: string(iid)},
 				TaskId:                e.EventId,
+				Tags:                  contextprop.Clone(task.Tags),
 			},
 		},
 	}
@@ -419,7 +431,11 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 	defer span.End()
 
 	e := helpers.NewExecutionStartedEvent(req.Name, instanceID, req.Input, nil, helpers.TraceContextFromSpan(span), req.ScheduledStartTimestamp, req.Version)
-	policy, err := orchestrationIDReusePolicyFromProto(req.OrchestrationIdReusePolicy)
+	e.GetExecutionStarted().Tags = contextprop.Clone(req.Tags)
+	policy, err := orchestrationIDReusePolicyFromProto(
+		req.OrchestrationIdReusePolicy,
+		g.allowReplaceableStatusWire,
+	)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid orchestration ID reuse policy: %v", err)
 	}

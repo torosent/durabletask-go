@@ -38,6 +38,7 @@ func newBlockingActivityProcessor(names ...string) *blockingActivityProcessor {
 			InstanceID:     "worker-policy",
 			NewEvent:       helpers.NewTaskScheduledEvent(int32(i), name, nil, nil, nil),
 			RetryCount:     int32(i),
+			EnqueuedAt:     time.Now().Add(-2 * time.Second),
 		})
 	}
 	return processor
@@ -79,7 +80,16 @@ func (p *blockingActivityProcessor) ProcessWorkItem(ctx context.Context, workIte
 	return nil
 }
 
-func (*blockingActivityProcessor) AbandonWorkItem(context.Context, backend.WorkItem) error {
+func (p *blockingActivityProcessor) AbandonWorkItem(_ context.Context, workItem backend.WorkItem) error {
+	activity := workItem.(*backend.ActivityWorkItem)
+	go func() {
+		timer := time.NewTimer(activity.GetAbandonDelay())
+		defer timer.Stop()
+		<-timer.C
+		p.mu.Lock()
+		p.queue = append(p.queue, activity)
+		p.mu.Unlock()
+	}()
 	return nil
 }
 
@@ -194,4 +204,5 @@ func TestWorkerMetricsHooksReportBacklogAndActivity(t *testing.T) {
 	require.Equal(t, backend.WorkerActivityCompleted, activityMetrics[1].State)
 	require.Equal(t, int32(0), activityMetrics[0].RetryCount)
 	require.Equal(t, int64(1), activityMetrics[0].InFlight)
+	require.Greater(t, activityMetrics[0].QueueLatency, time.Second)
 }

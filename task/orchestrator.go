@@ -206,14 +206,20 @@ func (ctx *OrchestrationContext) engineContext() *OrchestrationContext {
 }
 
 func (ctx *OrchestrationContext) syncDerivedContexts() {
+	active := ctx.derived[:0]
 	for _, derived := range ctx.derived {
+		if derived.scope.isCanceled() {
+			continue
+		}
 		derived.ID = ctx.ID
 		derived.Name = ctx.Name
 		derived.Version = ctx.Version
 		derived.IsReplaying = ctx.IsReplaying
 		derived.CurrentTimeUtc = ctx.CurrentTimeUtc
 		derived.scheduler = ctx.scheduler
+		active = append(active, derived)
 	}
+	ctx.derived = active
 }
 
 // WithCancel creates a child orchestration context whose tasks, nested scopes,
@@ -235,9 +241,15 @@ func (ctx *OrchestrationContext) WithCancel() (*OrchestrationContext, func()) {
 	}
 	engine.derived = append(engine.derived, child)
 	cancel := func() {
-		if engine.scheduler != nil {
-			engine.scheduler.requestCancellation(child.scope)
+		scheduler := engine.scheduler
+		if scheduler == nil {
+			panic("orchestration cancel called outside orchestrator execution")
 		}
+		if scheduler.isStopping() {
+			return
+		}
+		scheduler.mustCurrent()
+		scheduler.requestCancellation(child.scope)
 	}
 	return child, cancel
 }
@@ -293,7 +305,10 @@ func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) 
 			markTerminal()
 		}
 	}
-	if ctx.historyLimitExceeded && !ctx.continuedAsNew {
+	if ctx.historyLimitExceeded &&
+		!ctx.continuedAsNew &&
+		!ctx.isTerminated &&
+		!ctx.hasCompletionAction() {
 		ctx.enforceHistoryLimit()
 	}
 	return ctx.actions()
@@ -358,18 +373,16 @@ func (ctx *OrchestrationContext) getNextHistoryEvent() (*protos.HistoryEvent, bo
 	e := historyList[index]
 	if !ctx.IsReplaying && countsTowardTurnBudget(e) {
 		ctx.processedEventsThisTurn++
-		if ctx.orchestrationOptions.MaxEventsPerTurn > 0 &&
-			ctx.processedEventsThisTurn >= ctx.orchestrationOptions.MaxEventsPerTurn &&
-			index+1 < len(ctx.newEvents) {
-			ctx.maxEventsPerTurnExceeded = true
-			ctx.historyLimitExceeded = true
-		}
 	}
 	return e, true
 }
 
 func countsTowardTurnBudget(event *protos.HistoryEvent) bool {
-	return event.GetOrchestratorStarted() == nil && event.GetOrchestratorCompleted() == nil
+	return event.GetOrchestratorStarted() == nil &&
+		event.GetOrchestratorCompleted() == nil &&
+		event.GetExecutionTerminated() == nil &&
+		event.GetExecutionSuspended() == nil &&
+		event.GetExecutionResumed() == nil
 }
 
 // HistoryLength returns the total old and new history supplied to this execution.
@@ -718,24 +731,16 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 		return task
 	}
 	key := strings.ToUpper(eventName)
-	if eventList, ok := engine.bufferedExternalEvents[key]; ok {
+	if buffered, ok := engine.takeBufferedEvent(key); ok {
 		// An event with this name arrived already and can be consumed immediately.
-		next := eventList.Front()
-		if eventList.Len() > 1 {
-			eventList.Remove(next)
-		} else {
-			delete(engine.bufferedExternalEvents, key)
-		}
-		rawValue := []byte(next.Value.(*bufferedEvent).event.GetEventRaised().GetInput().GetValue())
-		task.complete(rawValue)
+		task.complete([]byte(buffered.event.GetEventRaised().GetInput().GetValue()))
 	} else if timeout == 0 {
 		// Zero-timeout means fail immediately if the event isn't already buffered.
 		task.cancel()
 	} else {
 		// Keep a reference to this task so we can complete it when the event of this name arrives
-		var taskList *list.List
-		var ok bool
-		if taskList, ok = engine.pendingExternalEventTasks[key]; !ok {
+		taskList, ok := engine.pendingExternalEventTasks[key]
+		if !ok {
 			taskList = list.New()
 			engine.pendingExternalEventTasks[key] = taskList
 		}
@@ -744,11 +749,7 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 		if timeout > 0 {
 			engine.createTimerInternal(timeout, ctx.scope).onCompleted(func() {
 				task.cancel()
-				if taskList.Len() > 1 {
-					taskList.Remove(taskElement)
-				} else {
-					delete(engine.pendingExternalEventTasks, key)
-				}
+				engine.removePendingEventTask(key, taskElement)
 			})
 		}
 	}
@@ -933,10 +934,7 @@ func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) e
 		for pendingTasks.Len() > 0 {
 			elem := pendingTasks.Front()
 			task := elem.Value.(*completableTask)
-			pendingTasks.Remove(elem)
-			if pendingTasks.Len() == 0 {
-				delete(ctx.pendingExternalEventTasks, key)
-			}
+			ctx.removePendingEventTask(key, elem)
 			if task.isCompleted {
 				continue
 			}
@@ -1001,6 +999,19 @@ func (ctx *OrchestrationContext) takeBufferedEvent(key string) (*bufferedEvent, 
 	return event, true
 }
 
+// removePendingEventTask removes one waiting task from the named list, dropping
+// the list entirely once it becomes empty.
+func (ctx *OrchestrationContext) removePendingEventTask(key string, element *list.Element) {
+	taskList, ok := ctx.pendingExternalEventTasks[key]
+	if !ok {
+		return
+	}
+	taskList.Remove(element)
+	if taskList.Len() == 0 {
+		delete(ctx.pendingExternalEventTasks, key)
+	}
+}
+
 func (ctx *OrchestrationContext) addEventWaiter(key string, co *coroutine) {
 	waiters, ok := ctx.eventWaiters[key]
 	if !ok {
@@ -1035,14 +1046,10 @@ func (ctx *OrchestrationContext) onExecutionResumed(er *protos.ExecutionResumedE
 
 func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTerminatedEvent) error {
 	ctx.isTerminated = true
-	if err := ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil); err != nil {
-		return err
-	}
-	return nil
+	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 
 func (ctx *OrchestrationContext) setComplete(output any) error {
-	status := protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED
 	var rawOutput *wrapperspb.StringValue
 	if output != nil {
 		bytes, err := json.Marshal(output)
@@ -1051,25 +1058,28 @@ func (ctx *OrchestrationContext) setComplete(output any) error {
 		}
 		rawOutput = wrapperspb.String(string(bytes))
 	}
-	if err := ctx.setCompleteInternal(rawOutput, status, nil); err != nil {
-		return err
-	}
-	return nil
+	return ctx.setCompleteInternal(rawOutput, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, nil)
 }
 
 func (ctx *OrchestrationContext) setFailed(appError error) error {
 	ctx.clearCompletionActions()
-	fd := helpers.NewTaskFailureDetails(appError)
-	failedStatus := protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED
-	if err := ctx.setCompleteInternal(nil, failedStatus, fd); err != nil {
-		return err
-	}
-	return nil
+	return ctx.setCompleteInternal(
+		nil,
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+		helpers.NewTaskFailureDetails(appError),
+	)
 }
 
 func (ctx *OrchestrationContext) enforceHistoryLimit() {
 	ctx.clearCompletionActions()
-	info := HistoryLimitInfo{
+	unprocessedEventCount := len(ctx.unprocessedExternalEvents())
+	handler := ctx.orchestrationOptions.OnHistoryLimitExceeded
+	if handler == nil {
+		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(nil))
+		return
+	}
+
+	input, err := invokeHistoryLimitHandler(handler, HistoryLimitInfo{
 		InstanceID:               ctx.ID,
 		OrchestrationName:        ctx.Name,
 		OrchestrationVersion:     ctx.Version,
@@ -1079,25 +1089,29 @@ func (ctx *OrchestrationContext) enforceHistoryLimit() {
 		MaxEventsPerTurn:         ctx.orchestrationOptions.MaxEventsPerTurn,
 		MaxHistoryEventsExceeded: ctx.maxHistoryEventsExceeded,
 		MaxEventsPerTurnExceeded: ctx.maxEventsPerTurnExceeded,
+		UnprocessedEventCount:    unprocessedEventCount,
 		SerializedInput:          string(ctx.rawInput),
-	}
-	if handler := ctx.orchestrationOptions.OnHistoryLimitExceeded; handler != nil {
-		input, err := invokeHistoryLimitHandler(handler, info)
-		if err == nil {
-			ctx.continuedAsNew = true
-			ctx.continuedAsNewInput = input
-			ctx.saveBufferedExternalEvents = true
-			if err := ctx.setContinuedAsNew(); err == nil {
-				return
-			} else {
-				_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(err))
-				return
-			}
-		}
+	})
+	if err != nil {
 		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(err))
 		return
 	}
-	_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(nil))
+
+	ctx.continuedAsNew = true
+	ctx.continuedAsNewInput = input
+	ctx.saveBufferedExternalEvents = true
+	if maxHistoryEvents := ctx.orchestrationOptions.MaxHistoryEvents; maxHistoryEvents > 0 &&
+		2+unprocessedEventCount > maxHistoryEvents {
+		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(fmt.Errorf(
+			"continue-as-new would retain %d external event(s) and exceed MaxHistoryEvents=%d",
+			unprocessedEventCount,
+			maxHistoryEvents,
+		)))
+		return
+	}
+	if err := ctx.setContinuedAsNew(); err != nil {
+		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(err))
+	}
 }
 
 func invokeHistoryLimitHandler(handler HistoryLimitHandler, info HistoryLimitInfo) (input any, err error) {
@@ -1142,8 +1156,16 @@ func (ctx *OrchestrationContext) clearCompletionActions() {
 	}
 }
 
+func (ctx *OrchestrationContext) hasCompletionAction() bool {
+	for _, action := range ctx.pendingActions {
+		if action.GetCompleteOrchestration() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (ctx *OrchestrationContext) setContinuedAsNew() error {
-	status := protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW
 	var newRawInput *wrapperspb.StringValue
 	if ctx.continuedAsNewInput != nil {
 		bytes, err := json.Marshal(ctx.continuedAsNewInput)
@@ -1152,10 +1174,11 @@ func (ctx *OrchestrationContext) setContinuedAsNew() error {
 		}
 		newRawInput = wrapperspb.String(string(bytes))
 	}
-	if err := ctx.setCompleteInternal(newRawInput, status, nil); err != nil {
-		return err
-	}
-	return nil
+	return ctx.setCompleteInternal(
+		newRawInput,
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW,
+		nil,
+	)
 }
 
 func (ctx *OrchestrationContext) setCompleteInternal(
@@ -1217,11 +1240,18 @@ func (ctx *OrchestrationContext) unprocessedExternalEvents() []*protos.HistoryEv
 	for _, event := range buffered {
 		events = append(events, event.event)
 	}
-
-	newEventIndex := ctx.historyIndex - len(ctx.oldEvents)
-	if newEventIndex < 0 {
-		newEventIndex = 0
+	for _, event := range ctx.resumedEvents {
+		if event.event.GetEventRaised() != nil {
+			events = append(events, event.event)
+		}
 	}
+	for _, event := range ctx.suspendedEvents {
+		if event.event.GetEventRaised() != nil {
+			events = append(events, event.event)
+		}
+	}
+
+	newEventIndex := max(ctx.historyIndex-len(ctx.oldEvents), 0)
 	for _, event := range ctx.newEvents[newEventIndex:] {
 		if event.GetEventRaised() != nil {
 			events = append(events, event)

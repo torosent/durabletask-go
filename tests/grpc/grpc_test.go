@@ -2,6 +2,7 @@ package tests_grpc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -521,4 +522,65 @@ func Test_Grpc_SubOrchestratorRetries(t *testing.T) {
 	assert.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED, metadata.RuntimeStatus)
 	// With 3 max attempts there will be two retries with 10 millis delay before each
 	require.GreaterOrEqual(t, metadata.LastUpdatedAt, metadata.CreatedAt.Add(2*10*time.Millisecond))
+}
+
+func Test_Grpc_ContextPropagation(t *testing.T) {
+	type contextResult struct {
+		OrchestrationName    string `json:"orchestrationName"`
+		OrchestrationVersion string `json:"orchestrationVersion"`
+		ActivityName         string `json:"activityName"`
+		ActivityVersion      string `json:"activityVersion"`
+		Tenant               string `json:"tenant"`
+	}
+
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("GrpcContext", func(ctx *task.OrchestrationContext) (any, error) {
+		var result contextResult
+		if err := ctx.CallActivity(
+			"GrpcContextActivity",
+			task.WithActivityVersion("activity-v1"),
+		).Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}))
+	require.NoError(t, registry.AddActivityN("GrpcContextActivity", func(ctx task.ActivityContext) (any, error) {
+		orchestration, _ := api.OrchestrationContextInfoFromContext(ctx.Context())
+		activity, _ := api.ActivityContextInfoFromContext(ctx.Context())
+		fields := api.ContextFieldsFromContext(ctx.Context())
+		return contextResult{
+			OrchestrationName:    orchestration.Name,
+			OrchestrationVersion: orchestration.Version,
+			ActivityName:         activity.Name,
+			ActivityVersion:      activity.Version,
+			Tenant:               fields["tenant"],
+		}, nil
+	}))
+
+	cancelListener := startGrpcListener(t, registry)
+	defer cancelListener()
+	instanceID, err := grpcClient.ScheduleNewOrchestration(
+		ctx,
+		"GrpcContext",
+		api.WithVersion("orchestration-v2"),
+		api.WithContextFields(api.ContextFields{"tenant": "alpha"}),
+	)
+	require.NoError(t, err)
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	metadata, err := grpcClient.WaitForOrchestrationCompletion(
+		waitCtx,
+		instanceID,
+		api.WithFetchPayloads(true),
+	)
+	require.NoError(t, err)
+	var result contextResult
+	require.NoError(t, json.Unmarshal([]byte(metadata.SerializedOutput), &result))
+	require.Equal(t, contextResult{
+		OrchestrationName:    "GrpcContext",
+		OrchestrationVersion: "orchestration-v2",
+		ActivityName:         "GrpcContextActivity",
+		ActivityVersion:      "activity-v1",
+		Tenant:               "alpha",
+	}, result)
 }

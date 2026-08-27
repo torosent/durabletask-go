@@ -172,6 +172,29 @@ func TestConfiguredClientAndWorkerUseSeparateMetadataAndConnections(t *testing.T
 	require.NoError(t, worker.Shutdown(shutdownCtx))
 }
 
+func TestClientCloseStopsCompatibilityListener(t *testing.T) {
+	server := &metadataServer{metadata: make(chan metadata.MD, 4)}
+	listener, stop := startBufconnServer(t, server)
+	defer stop()
+
+	options, err := NewOptionsFromConnectionString(
+		"Endpoint=http://bufconn;TaskHub=default;Authentication=None",
+	)
+	require.NoError(t, err)
+	options.dialer = bufconnDialer(listener)
+	managementClient, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	require.NoError(t, err)
+	<-server.metadata
+	require.NoError(t, managementClient.StartWorkItemListener(context.Background(), task.NewTaskRegistry()))
+	<-server.metadata
+	<-server.metadata
+	require.NoError(t, managementClient.Close())
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, managementClient.StopWorkItemListener(shutdownCtx))
+}
+
 func TestNewClientFailsFastWhenHelloIsRejected(t *testing.T) {
 	server := &metadataServer{
 		metadata: make(chan metadata.MD, 1),

@@ -21,7 +21,21 @@ func TestEncodeDecode(t *testing.T) {
 		info.ParentInstanceID != "parent" {
 		t.Fatalf("unexpected info: %+v", info)
 	}
+
 	if fields["tenant"] != "alpha" {
 		t.Fatalf("tenant = %q, want alpha", fields["tenant"])
+	}
+}
+
+func TestEncodeOverwritesReservedCallerFields(t *testing.T) {
+	tags := Encode(api.OrchestrationContextInfo{}, api.ContextFields{
+		api.ReservedContextFieldPrefix + "orchestration_version": "spoofed",
+	})
+	info, fields := Decode(tags)
+	if info.Version != "" {
+		t.Fatalf("version = %q, want empty", info.Version)
+	}
+	if fields != nil {
+		t.Fatalf("reserved field leaked into caller fields: %v", fields)
 	}
 }

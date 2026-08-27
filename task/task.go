@@ -31,6 +31,7 @@ type completableTask struct {
 	completedCallbacks []func()
 	waiters            map[*coroutine]struct{}
 	scope              *cancellationScope
+	scopeIndex         int
 }
 
 func newTaskInScope(ctx *OrchestrationContext, scope *cancellationScope) *completableTask {
@@ -38,6 +39,7 @@ func newTaskInScope(ctx *OrchestrationContext, scope *cancellationScope) *comple
 		orchestrationCtx: ctx,
 		waiters:          make(map[*coroutine]struct{}),
 		scope:            scope,
+		scopeIndex:       -1,
 	}
 	if scope != nil {
 		scope.addTask(task)
@@ -100,16 +102,25 @@ func (t *completableTask) onCompleted(callback func()) {
 }
 
 func (t *completableTask) complete(rawResult []byte) {
+	if t.isCompleted {
+		return
+	}
 	t.rawResult = rawResult
 	t.completeInternal()
 }
 
 func (t *completableTask) fail(fd *protos.TaskFailureDetails) {
+	if t.isCompleted {
+		return
+	}
 	t.failureDetails = fd
 	t.completeInternal()
 }
 
 func (t *completableTask) cancel() {
+	if t.isCompleted {
+		return
+	}
 	t.isCanceled = true
 	t.completeInternal()
 }
@@ -119,6 +130,7 @@ func (t *completableTask) completeInternal() {
 		return
 	}
 	t.isCompleted = true
+	t.scope.removeTask(t)
 	if scheduler := t.orchestrationCtx.scheduler; scheduler != nil {
 		t.completionID = scheduler.nextCompletionID()
 		for waiter := range t.waiters {

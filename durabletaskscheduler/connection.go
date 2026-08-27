@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -145,10 +147,23 @@ func resolveCredential(options *Options) (azcore.TokenCredential, error) {
 }
 
 func prepareOptions(options *Options) (Options, error) {
-	if err := options.Validate(); err != nil {
-		return Options{}, err
+	if options == nil {
+		return Options{}, fmt.Errorf("DTS options are required")
 	}
 	prepared := *options
+	prepared.AdditionallyAllowedTenants = slices.Clone(options.AdditionallyAllowedTenants)
+	if prepared.Authentication == "" {
+		prepared.Authentication = AuthenticationDefaultAzure
+	}
+	if prepared.ResourceID == "" {
+		prepared.ResourceID = DefaultResourceID
+	}
+	if prepared.HelloTimeout == 0 {
+		prepared.HelloTimeout = 30 * time.Second
+	}
+	if err := prepared.Validate(); err != nil {
+		return Options{}, err
+	}
 	credential, err := resolveCredential(&prepared)
 	if err != nil {
 		return Options{}, err
@@ -161,7 +176,6 @@ func prepareOptions(options *Options) (Options, error) {
 }
 
 func connect(
-	_ context.Context,
 	options *Options,
 	role connectionRole,
 	workerID string,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
@@ -60,9 +61,7 @@ func WithMetricsHooks(hooks backend.MetricsHooks) TaskExecutorOption {
 func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.contextFields = make(api.ContextFields, len(fields))
-		for key, value := range fields {
-			executor.contextFields[key] = value
-		}
+		maps.Copy(executor.contextFields, fields)
 	}
 }
 

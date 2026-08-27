@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -64,16 +65,22 @@ func (p *activityProcessor) ProcessWorkItem(ctx context.Context, wi WorkItem) er
 	}
 
 	if orchestration, ok := api.OrchestrationContextInfoFromContext(ctx); !ok || orchestration.Name == "" {
-		metadata, err := p.be.GetOrchestrationMetadata(ctx, awi.InstanceID)
-		if err != nil {
-			return fmt.Errorf("%v: failed to load orchestration context metadata: %w", awi.InstanceID, err)
+		orchestration, fields := contextprop.Decode(ts.GetTags())
+		if orchestration.InstanceID == "" {
+			orchestration.InstanceID = awi.InstanceID
 		}
-		ctx = api.WithOrchestrationContextInfo(ctx, api.OrchestrationContextInfo{
-			InstanceID:       awi.InstanceID,
-			Name:             metadata.Name,
-			Version:          metadata.Version,
-			ParentInstanceID: metadata.ParentInstanceID,
-		})
+		ctx = api.ContextWithFields(ctx, fields)
+		if orchestration.Name == "" {
+			metadata, err := p.be.GetOrchestrationMetadata(ctx, awi.InstanceID)
+			if err != nil {
+				p.logger.Warnf("%v: unable to load orchestration metadata for activity context: %v", awi.InstanceID, err)
+			} else {
+				orchestration.Name = metadata.Name
+				orchestration.Version = metadata.Version
+				orchestration.ParentInstanceID = metadata.ParentInstanceID
+			}
+		}
+		ctx = api.WithOrchestrationContextInfo(ctx, orchestration)
 	}
 
 	// Create span as child of spanContext found in TaskScheduledEvent
