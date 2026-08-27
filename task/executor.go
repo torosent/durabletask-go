@@ -13,14 +13,29 @@ import (
 )
 
 type taskExecutor struct {
-	Registry *TaskRegistry
+	Registry   *TaskRegistry
+	versioning *VersioningOptions
+}
+
+// TaskExecutorOption configures the in-memory task executor.
+type TaskExecutorOption func(*taskExecutor)
+
+// WithVersioning configures version-aware orchestration and activity dispatch.
+func WithVersioning(options VersioningOptions) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.versioning = &options
+	}
 }
 
 // NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
-func NewTaskExecutor(registry *TaskRegistry) backend.Executor {
-	return &taskExecutor{
+func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
+	executor := &taskExecutor{
 		Registry: registry,
 	}
+	for _, configure := range opts {
+		configure(executor)
+	}
+	return executor
 }
 
 // ExecuteActivity implements backend.Executor and executes an activity function in the current goroutine.
@@ -29,6 +44,12 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 	if ts == nil {
 		// No clean way to deal with this other than to abandon it
 		return nil, fmt.Errorf("unexpected event type for ExecuteActivity: %v", e.EventType)
+	}
+	if versionErr := te.versioning.check(ts.GetVersion().GetValue()); versionErr != nil {
+		if te.versioning.FailureStrategy == VersionFailureReject {
+			return nil, versionErr
+		}
+		return helpers.NewTaskFailedEvent(e.EventId, versionFailureDetails(versionErr)), nil
 	}
 	invoker, ok := te.Registry.activities[ts.Name]
 	if !ok {
@@ -78,6 +99,26 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 
 // ExecuteOrchestrator implements backend.Executor and executes an orchestrator function in the current goroutine.
 func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*backend.ExecutionResults, error) {
+	version := orchestrationVersion(oldEvents, newEvents)
+	if versionErr := te.versioning.check(version); versionErr != nil {
+		if te.versioning.FailureStrategy == VersionFailureReject {
+			return nil, versionErr
+		}
+		return &backend.ExecutionResults{
+			Response: &protos.OrchestratorResponse{
+				InstanceId: string(id),
+				Actions: []*protos.OrchestratorAction{
+					helpers.NewCompleteOrchestrationAction(
+						0,
+						protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+						nil,
+						nil,
+						versionFailureDetails(versionErr),
+					),
+				},
+			},
+		}, nil
+	}
 	orchestrationCtx := NewOrchestrationContext(te.Registry, id, oldEvents, newEvents)
 	actions := orchestrationCtx.start()
 
@@ -89,6 +130,25 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		},
 	}
 	return results, nil
+}
+
+func orchestrationVersion(eventLists ...[]*protos.HistoryEvent) string {
+	for _, events := range eventLists {
+		for _, event := range events {
+			if started := event.GetExecutionStarted(); started != nil {
+				return started.GetVersion().GetValue()
+			}
+		}
+	}
+	return ""
+}
+
+func versionFailureDetails(err error) *protos.TaskFailureDetails {
+	return &protos.TaskFailureDetails{
+		ErrorType:      "VersionMismatch",
+		ErrorMessage:   err.Error(),
+		IsNonRetriable: true,
+	}
 }
 
 func (te taskExecutor) Shutdown(ctx context.Context) error {

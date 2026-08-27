@@ -47,6 +47,7 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryMaxAttempts   int
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
+	taskExecutorOptions         []task.TaskExecutorOption
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -137,6 +138,15 @@ func WithWorkerTransientRetryPolicy(maxAttempts int, baseDelay, maxDelay time.Du
 		options.transientRetryMaxAttempts = maxAttempts
 		options.transientRetryBaseDelay = baseDelay
 		options.transientRetryMaxDelay = maxDelay
+		return nil
+	}
+}
+
+// WithTaskExecutorOptions configures the task executor used by the gRPC worker.
+// This allows task options such as task.WithVersioning to participate in DTS dispatch.
+func WithTaskExecutorOptions(options ...task.TaskExecutorOption) TaskHubGrpcWorkerOption {
+	return func(workerOptions *taskHubGrpcWorkerOptions) error {
+		workerOptions.taskExecutorOptions = append(workerOptions.taskExecutorOptions, options...)
 		return nil
 	}
 }
@@ -257,7 +267,7 @@ func newTaskHubGrpcWorker(
 	}
 	return &TaskHubGrpcWorker{
 		clientFactory: factory,
-		executor:      task.NewTaskExecutor(registry),
+		executor:      task.NewTaskExecutor(registry, options.taskExecutorOptions...),
 		logger:        logger,
 		options:       options,
 	}, nil

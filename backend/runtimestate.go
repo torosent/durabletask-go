@@ -118,6 +118,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 						s.startEvent.ParentInstance,
 						s.startEvent.ParentTraceContext,
 						nil,
+						s.startEvent.Version,
 					),
 				); err != nil {
 					return false, fmt.Errorf("failed to add execution started event: %w", err)
@@ -179,7 +180,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 			if err := s.AddEvent(scheduledEvent); err != nil {
 				return false, fmt.Errorf("failed to add task scheduled event: %w", err)
 			}
-			s.pendingTasks= append(s.pendingTasks, scheduledEvent)
+			s.pendingTasks = append(s.pendingTasks, scheduledEvent)
 		} else if createSO := action.GetCreateSubOrchestration(); createSO != nil {
 			// Autogenerate an instance ID for the sub-orchestration if none is provided, using a
 			// deterministic algorithm based on the parent instance ID to help enable de-duplication.
@@ -202,6 +203,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				helpers.NewParentInfo(action.Id, s.startEvent.Name, string(s.instanceID)),
 				currentTraceContext,
 				nil,
+				createSO.Version,
 			)
 			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: startEvent, TargetInstanceID: createSO.InstanceId})
 		} else if sendEvent := action.GetSendEvent(); sendEvent != nil {

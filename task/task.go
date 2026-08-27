@@ -22,18 +22,27 @@ type Task interface {
 }
 
 type completableTask struct {
-	orchestrationCtx  *OrchestrationContext
-	isCompleted       bool
-	isCanceled        bool
-	rawResult         []byte
-	failureDetails    *protos.TaskFailureDetails
-	completedCallback func()
+	orchestrationCtx   *OrchestrationContext
+	isCompleted        bool
+	isCanceled         bool
+	rawResult          []byte
+	failureDetails     *protos.TaskFailureDetails
+	completionID       uint64
+	completedCallbacks []func()
+	waiters            map[*coroutine]struct{}
+	scope              *cancellationScope
 }
 
-func newTask(ctx *OrchestrationContext) *completableTask {
-	return &completableTask{
+func newTaskInScope(ctx *OrchestrationContext, scope *cancellationScope) *completableTask {
+	task := &completableTask{
 		orchestrationCtx: ctx,
+		waiters:          make(map[*coroutine]struct{}),
+		scope:            scope,
 	}
+	if scope != nil {
+		scope.addTask(task)
+	}
+	return task
 }
 
 // Await blocks the current orchestrator until the task is complete and then saves the unmarshalled
@@ -61,6 +70,14 @@ func (t *completableTask) Await(v any) error {
 			return nil
 		}
 
+		if scheduler := t.orchestrationCtx.scheduler; scheduler != nil {
+			if current := scheduler.mustCurrent(); current.scope.isCanceled() {
+				return ErrTaskCanceled
+			}
+			scheduler.waitForTask(t)
+			continue
+		}
+
 		ok, err := t.orchestrationCtx.processNextEvent()
 		if err != nil {
 			// TODO: If there is an error here, we need some kind of well-known panic to kill the orchestration
@@ -75,7 +92,11 @@ func (t *completableTask) Await(v any) error {
 }
 
 func (t *completableTask) onCompleted(callback func()) {
-	t.completedCallback = callback
+	if t.isCompleted {
+		callback()
+		return
+	}
+	t.completedCallbacks = append(t.completedCallbacks, callback)
 }
 
 func (t *completableTask) complete(rawResult []byte) {
@@ -94,19 +115,29 @@ func (t *completableTask) cancel() {
 }
 
 func (t *completableTask) completeInternal() {
+	if t.isCompleted {
+		return
+	}
 	t.isCompleted = true
-	if t.completedCallback != nil {
-		t.completedCallback()
+	if scheduler := t.orchestrationCtx.scheduler; scheduler != nil {
+		t.completionID = scheduler.nextCompletionID()
+		for waiter := range t.waiters {
+			scheduler.makeRunnable(waiter)
+		}
+		clear(t.waiters)
+	}
+	for _, callback := range t.completedCallbacks {
+		callback()
+	}
+	t.completedCallbacks = nil
+}
+
+func (t *completableTask) addWaiter(c *coroutine) {
+	if !t.isCompleted {
+		t.waiters[c] = struct{}{}
 	}
 }
 
-type taskWrapper struct {
-	delegate      Task
-	onAwaitResult func(any, error) error
-}
-
-var _ Task = &taskWrapper{}
-
-func (t *taskWrapper) Await(v any) error {
-	return t.onAwaitResult(v, t.delegate.Await(v))
+func (t *completableTask) removeWaiter(c *coroutine) {
+	delete(t.waiters, c)
 }
