@@ -589,3 +589,25 @@ func TestTaskHubGrpcWorkerOptionValidation(t *testing.T) {
 	)
 	require.Error(t, err)
 }
+
+func TestTransientWorkerGRPCCodes(t *testing.T) {
+	for _, code := range []codes.Code{
+		codes.Canceled,
+		codes.DeadlineExceeded,
+		codes.NotFound,
+		codes.ResourceExhausted,
+		codes.Aborted,
+		codes.Internal,
+		codes.Unavailable,
+		codes.Unknown,
+	} {
+		require.True(t, isTransientWorkerGRPCCode(code), code.String())
+	}
+	for _, code := range []codes.Code{
+		codes.Unauthenticated,
+		codes.PermissionDenied,
+		codes.InvalidArgument,
+	} {
+		require.False(t, isTransientWorkerGRPCCode(code), code.String())
+	}
+}
