@@ -518,6 +518,7 @@ func createGetInstanceResponse(req *protos.GetInstanceRequest, metadata *api.Orc
 	state := &protos.OrchestrationState{
 		InstanceId:           req.InstanceId,
 		Name:                 metadata.Name,
+		Version:              wrapperspb.String(metadata.Version),
 		OrchestrationStatus:  metadata.RuntimeStatus,
 		CreatedTimestamp:     timestamppb.New(metadata.CreatedAt),
 		LastUpdatedTimestamp: timestamppb.New(metadata.LastUpdatedAt),

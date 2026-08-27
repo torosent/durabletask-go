@@ -240,6 +240,7 @@ func makeOrchestrationMetadata(resp *protos.GetInstanceResponse) (*api.Orchestra
 	metadata := &api.OrchestrationMetadata{
 		InstanceID:             api.InstanceID(resp.OrchestrationState.InstanceId),
 		Name:                   resp.OrchestrationState.Name,
+		Version:                resp.OrchestrationState.Version.GetValue(),
 		RuntimeStatus:          resp.OrchestrationState.OrchestrationStatus,
 		SerializedInput:        resp.OrchestrationState.Input.GetValue(),
 		SerializedCustomStatus: resp.OrchestrationState.CustomStatus.GetValue(),

@@ -677,13 +677,15 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 
 	row := be.db.QueryRow(
 		ctx,
-		`SELECT InstanceID, Name, RuntimeStatus, CreatedTime, LastUpdatedTime, Input, Output, CustomStatus, FailureDetails
+		`SELECT InstanceID, Name, Version, ParentInstanceID, RuntimeStatus, CreatedTime, LastUpdatedTime, Input, Output, CustomStatus, FailureDetails
 		FROM Instances WHERE InstanceID = $1`,
 		string(iid),
 	)
 
 	var instanceID *string
 	var name *string
+	var version *string
+	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
 	var lastUpdatedAt *time.Time
@@ -693,7 +695,7 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err := row.Scan(&instanceID, &name, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err := row.Scan(&instanceID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -730,6 +732,12 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 		*customStatus,
 		failureDetails,
 	)
+	if version != nil {
+		metadata.Version = *version
+	}
+	if parentInstanceID != nil {
+		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
+	}
 	return metadata, nil
 }
 
@@ -821,7 +829,7 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 			WHERE InstanceID = $2 AND (VisibleTime IS NULL OR VisibleTime <= $3)
 			LIMIT 1000
 		)
-		RETURNING EventPayload, DequeueCount`,
+		RETURNING EventPayload, DequeueCount, Timestamp`,
 		be.workerName,
 		instanceID,
 		now,
@@ -832,20 +840,23 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 	defer events.Close()
 
 	type rawEvent struct {
-		payload []byte
-		dequeue int32
+		payload    []byte
+		dequeue    int32
+		enqueuedAt time.Time
 	}
 
 	rawEvents := []rawEvent{}
 	for events.Next() {
 		var eventPayload []byte
 		var dequeueCount int32
-		if err := events.Scan(&eventPayload, &dequeueCount); err != nil {
+		var enqueuedAt time.Time
+		if err := events.Scan(&eventPayload, &dequeueCount, &enqueuedAt); err != nil {
 			return nil, fmt.Errorf("failed to read history event: %w", err)
 		}
 		rawEvents = append(rawEvents, rawEvent{
-			payload: eventPayload,
-			dequeue: dequeueCount,
+			payload:    eventPayload,
+			dequeue:    dequeueCount,
+			enqueuedAt: enqueuedAt,
 		})
 	}
 	events.Close()
@@ -855,10 +866,14 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 	}
 
 	maxDequeueCount := int32(0)
+	var enqueuedAt time.Time
 	newEvents := make([]*protos.HistoryEvent, 0, len(rawEvents))
 	for _, e := range rawEvents {
 		if e.dequeue > maxDequeueCount {
 			maxDequeueCount = e.dequeue
+		}
+		if enqueuedAt.IsZero() || e.enqueuedAt.Before(enqueuedAt) {
+			enqueuedAt = e.enqueuedAt
 		}
 
 		evt, err := backend.UnmarshalHistoryEvent(e.payload)
@@ -874,6 +889,7 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 		NewEvents:  newEvents,
 		LockedBy:   be.workerName,
 		RetryCount: maxDequeueCount - 1,
+		EnqueuedAt: enqueuedAt,
 	}
 
 	return wi, nil
@@ -885,7 +901,7 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 	}
 
 	now := time.Now().UTC()
-	newLockExpiration := now.Add(be.options.OrchestrationLockTimeout)
+	newLockExpiration := now.Add(be.options.ActivityLockTimeout)
 
 	row := be.db.QueryRow(
 		ctx,
@@ -896,7 +912,7 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 			ORDER BY T.InstanceID, T.SequenceNumber ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
-		) RETURNING SequenceNumber, InstanceID, EventPayload`,
+		) RETURNING SequenceNumber, InstanceID, EventPayload, Timestamp, DequeueCount`,
 		be.workerName,
 		newLockExpiration,
 		now,
@@ -905,8 +921,10 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 	var sequenceNumber int64
 	var instanceID string
 	var eventPayload []byte
+	var enqueuedAt time.Time
+	var dequeueCount int32
 
-	if err := row.Scan(&sequenceNumber, &instanceID, &eventPayload); err != nil {
+	if err := row.Scan(&sequenceNumber, &instanceID, &eventPayload, &enqueuedAt, &dequeueCount); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No new activity tasks to process
 			return nil, backend.ErrNoWorkItems
@@ -925,8 +943,52 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 		InstanceID:     api.InstanceID(instanceID),
 		NewEvent:       e,
 		LockedBy:       be.workerName,
+		RetryCount:     dequeueCount - 1,
+		EnqueuedAt:     enqueuedAt,
 	}
 	return wi, nil
+}
+
+func (be *postgresBackend) GetOrchestrationBacklog(ctx context.Context) (backend.BacklogMetric, error) {
+	if err := be.ensureDB(); err != nil {
+		return backend.BacklogMetric{}, err
+	}
+	now := time.Now().UTC()
+	row := be.db.QueryRow(
+		ctx,
+		`SELECT COUNT(DISTINCT InstanceID), MIN(Timestamp)
+		FROM NewEvents
+		WHERE LockedBy IS NULL AND (VisibleTime IS NULL OR VisibleTime <= $1)`,
+		now,
+	)
+	return scanPostgresBacklog(row, backend.WorkItemKindOrchestration, now)
+}
+
+func (be *postgresBackend) GetActivityBacklog(ctx context.Context) (backend.BacklogMetric, error) {
+	if err := be.ensureDB(); err != nil {
+		return backend.BacklogMetric{}, err
+	}
+	now := time.Now().UTC()
+	row := be.db.QueryRow(
+		ctx,
+		`SELECT COUNT(*), MIN(Timestamp)
+		FROM NewTasks
+		WHERE LockExpiration IS NULL OR LockExpiration < $1`,
+		now,
+	)
+	return scanPostgresBacklog(row, backend.WorkItemKindActivity, now)
+}
+
+func scanPostgresBacklog(row pgx.Row, kind backend.WorkItemKind, now time.Time) (backend.BacklogMetric, error) {
+	metric := backend.BacklogMetric{Kind: kind}
+	var oldest *time.Time
+	if err := row.Scan(&metric.Depth, &oldest); err != nil {
+		return backend.BacklogMetric{}, fmt.Errorf("failed to inspect %s backlog: %w", kind, err)
+	}
+	if oldest != nil && oldest.Before(now) {
+		metric.OldestAge = now.Sub(*oldest)
+	}
+	return metric, nil
 }
 
 func (be *postgresBackend) CompleteActivityWorkItem(ctx context.Context, wi *backend.ActivityWorkItem) error {
