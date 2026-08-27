@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -18,6 +19,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -52,7 +54,7 @@ func (be *postgresBackend) QueryOrchestrations(ctx context.Context, query api.Or
 	}
 	fmt.Fprintf(
 		&sqlBuilder,
-		`SELECT i.InstanceID, i.ExecutionID, i.Name, i.Version, i.ParentInstanceID, i.RuntimeStatus,
+		`SELECT i.InstanceID, i.ExecutionID, i.Name, i.Version, i.ScheduledStartTime, i.ParentInstanceID, i.RuntimeStatus,
 			i.CreatedTime, i.LastUpdatedTime, i.CompletedTime, %s, %s, %s, %s
 		FROM Instances AS i WHERE i.InstanceID > $1`,
 		inputColumn,
@@ -296,10 +298,8 @@ func (be *postgresBackend) RewindInstance(ctx context.Context, id api.InstanceID
 }
 
 func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
-	hasInstanceIDs := len(request.InstanceIDs) > 0
-	hasFilter := request.Filter != nil
-	if hasInstanceIDs == hasFilter {
-		return nil, errors.New("purge request must specify exactly one of instance IDs or a filter")
+	if err := request.Validate(); err != nil {
+		return nil, err
 	}
 	if len(request.InstanceIDs) > api.MaxInstanceBatchSize {
 		return nil, fmt.Errorf("instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize)
@@ -321,7 +321,7 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 				continue
 			}
 			if err != nil {
-				return nil, err
+				return result, err
 			}
 			result.DeletedInstanceCount += count
 		}
@@ -341,6 +341,7 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 			return nil, api.ErrNotCompleted
 		}
 	}
+	result := &api.PurgeInstancesResult{}
 	page, err := be.QueryOrchestrations(ctx, api.OrchestrationQuery{
 		RuntimeStatus:   statuses,
 		CreatedTimeFrom: filter.CreatedTimeFrom,
@@ -348,16 +349,15 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 		PageSize:        api.DefaultInstanceQueryPageSize,
 	})
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	result := &api.PurgeInstancesResult{}
 	for _, metadata := range page.Orchestrations {
 		count, err := be.purgeInstance(ctx, metadata.InstanceID, request.Recursive)
 		if errors.Is(err, api.ErrInstanceNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		result.DeletedInstanceCount += count
 	}
@@ -374,7 +374,7 @@ func (be *postgresBackend) PurgeInstances(ctx context.Context, request api.Purge
 	return result, nil
 }
 
-func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, _ string) ([]api.InstanceID, error) {
+func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, reason string) ([]api.InstanceID, error) {
 	if len(ids) == 0 {
 		return nil, errors.New("at least one instance ID is required")
 	}
@@ -383,6 +383,10 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 	}
 	if err := be.ensureDB(); err != nil {
 		return nil, err
+	}
+	serializedReason, err := json.Marshal(reason)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize termination reason: %w", err)
 	}
 	tx, err := be.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -393,12 +397,45 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 	now := time.Now().UTC()
 	unterminated := make([]api.InstanceID, 0)
 	for _, id := range ids {
+		var runtimeStatus string
+		var parentInstanceID *string
+		err := tx.QueryRow(
+			ctx,
+			"SELECT RuntimeStatus, ParentInstanceID FROM Instances WHERE InstanceID = $1 FOR UPDATE",
+			string(id),
+		).Scan(&runtimeStatus, &parentInstanceID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			unterminated = append(unterminated, id)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect orchestration before immediate termination: %w", err)
+		}
+		if parentInstanceID != nil ||
+			(runtimeStatus != "PENDING" && runtimeStatus != "RUNNING" && runtimeStatus != "SUSPENDED") {
+			unterminated = append(unterminated, id)
+			continue
+		}
+		var activeChildren int
+		if err := tx.QueryRow(
+			ctx,
+			`SELECT COUNT(*) FROM Instances
+			WHERE ParentInstanceID = $1 AND RuntimeStatus IN ('PENDING', 'RUNNING', 'SUSPENDED')`,
+			string(id),
+		).Scan(&activeChildren); err != nil {
+			return nil, fmt.Errorf("failed to inspect sub-orchestrations before immediate termination: %w", err)
+		}
+		if activeChildren > 0 {
+			unterminated = append(unterminated, id)
+			continue
+		}
 		result, err := tx.Exec(
 			ctx,
 			`UPDATE Instances SET RuntimeStatus = 'TERMINATED', CompletedTime = COALESCE(CompletedTime, $1),
-				LastUpdatedTime = $1, LockedBy = NULL, LockExpiration = NULL
-			WHERE InstanceID = $2 AND RuntimeStatus IN ('PENDING', 'RUNNING', 'SUSPENDED')`,
+				LastUpdatedTime = $1, Output = $2, FailureDetails = NULL, LockedBy = NULL, LockExpiration = NULL
+			WHERE InstanceID = $3 AND RuntimeStatus IN ('PENDING', 'RUNNING', 'SUSPENDED')`,
 			now,
+			string(serializedReason),
 			string(id),
 		)
 		if err != nil {
@@ -407,6 +444,33 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 		if result.RowsAffected() == 0 {
 			unterminated = append(unterminated, id)
 			continue
+		}
+		var nextSequenceNumber int
+		if err := tx.QueryRow(
+			ctx,
+			"SELECT COALESCE(MAX(SequenceNumber), -1) + 1 FROM History WHERE InstanceID = $1",
+			string(id),
+		).Scan(&nextSequenceNumber); err != nil {
+			return nil, fmt.Errorf("failed to allocate termination history sequence: %w", err)
+		}
+		terminationEvent := helpers.NewExecutionCompletedEvent(
+			-1,
+			api.RUNTIME_STATUS_TERMINATED,
+			wrapperspb.String(string(serializedReason)),
+			nil,
+		)
+		payload, err := backend.MarshalHistoryEvent(terminationEvent)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(
+			ctx,
+			"INSERT INTO History (InstanceID, SequenceNumber, EventPayload) VALUES ($1, $2, $3)",
+			string(id),
+			nextSequenceNumber,
+			payload,
+		); err != nil {
+			return nil, fmt.Errorf("failed to append immediate termination history: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM NewEvents WHERE InstanceID = $1", string(id)); err != nil {
 			return nil, fmt.Errorf("failed to delete pending orchestration events: %w", err)
@@ -422,6 +486,23 @@ func (be *postgresBackend) SkipGracefulOrchestrationTerminations(ctx context.Con
 }
 
 func (be *postgresBackend) purgeInstance(ctx context.Context, id api.InstanceID, recursive bool) (int, error) {
+	return be.purgeInstanceRecursive(ctx, id, recursive, make(map[api.InstanceID]struct{}), 0)
+}
+
+func (be *postgresBackend) purgeInstanceRecursive(
+	ctx context.Context,
+	id api.InstanceID,
+	recursive bool,
+	visited map[api.InstanceID]struct{},
+	depth int,
+) (int, error) {
+	if depth > maxRewindDepth {
+		return 0, fmt.Errorf("%w: purge depth exceeds %d", api.ErrInvalidState, maxRewindDepth)
+	}
+	if _, ok := visited[id]; ok {
+		return 0, fmt.Errorf("%w: cycle detected while purging %q", api.ErrInvalidState, id)
+	}
+	visited[id] = struct{}{}
 	deleted := 0
 	if recursive {
 		for {
@@ -437,7 +518,7 @@ func (be *postgresBackend) purgeInstance(ctx context.Context, id api.InstanceID,
 			if err != nil {
 				return deleted, fmt.Errorf("failed to query sub-orchestration: %w", err)
 			}
-			count, err := be.purgeInstance(ctx, api.InstanceID(childID), true)
+			count, err := be.purgeInstanceRecursive(ctx, api.InstanceID(childID), true, visited, depth+1)
 			deleted += count
 			if err != nil {
 				return deleted, err
@@ -669,13 +750,14 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 	var instanceID, executionID, name, runtimeStatus string
 	var version, parentInstanceID, input, output, customStatus *string
 	var createdAt, lastUpdatedAt time.Time
-	var completedAt *time.Time
+	var scheduledStartAt, completedAt *time.Time
 	var failureDetailsPayload []byte
 	if err := scanner.Scan(
 		&instanceID,
 		&executionID,
 		&name,
 		&version,
+		&scheduledStartAt,
 		&parentInstanceID,
 		&runtimeStatus,
 		&createdAt,
@@ -707,6 +789,9 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 		failureDetails,
 	)
 	metadata.ExecutionID = executionID
+	if scheduledStartAt != nil {
+		metadata.ScheduledStartAt = *scheduledStartAt
+	}
 	if version != nil {
 		metadata.Version = *version
 	}

@@ -16,6 +16,10 @@ type largePayloadBackend struct {
 	options *api.LargePayloadOptions
 }
 
+type largePayloadEntityBackend struct {
+	*largePayloadBackend
+}
+
 // NewLargePayloadBackend decorates a backend with payload externalization and hydration.
 func NewLargePayloadBackend(be Backend, options *api.LargePayloadOptions) (Backend, error) {
 	if be == nil {
@@ -28,7 +32,15 @@ func NewLargePayloadBackend(be Backend, options *api.LargePayloadOptions) (Backe
 	if normalized == nil {
 		return be, nil
 	}
-	return &largePayloadBackend{Backend: be, options: normalized}, nil
+	decorated := &largePayloadBackend{Backend: be, options: normalized}
+	if _, ok := GetBackendCapability[EntityBackend](be); ok {
+		return &largePayloadEntityBackend{largePayloadBackend: decorated}, nil
+	}
+	return decorated, nil
+}
+
+func (be *largePayloadBackend) UnwrapBackend() Backend {
+	return be.Backend
 }
 
 func (be *largePayloadBackend) CreateOrchestrationInstance(
@@ -139,8 +151,8 @@ func (be *largePayloadBackend) CompleteActivityWorkItem(ctx context.Context, wor
 	return be.Backend.CompleteActivityWorkItem(ctx, workItem)
 }
 
-func (be *largePayloadBackend) SignalEntity(ctx context.Context, request *protos.SignalEntityRequest) error {
-	capability, ok := be.Backend.(EntitySignalBackend)
+func (be *largePayloadEntityBackend) SignalEntity(ctx context.Context, request *protos.SignalEntityRequest) error {
+	capability, ok := GetBackendCapability[EntitySignalBackend](be.Backend)
 	if !ok {
 		return api.ErrFeatureNotSupported
 	}
@@ -156,8 +168,8 @@ func (be *largePayloadBackend) SignalEntity(ctx context.Context, request *protos
 	return capability.SignalEntity(ctx, cloned)
 }
 
-func (be *largePayloadBackend) GetEntityWorkItem(ctx context.Context) (*EntityWorkItem, error) {
-	capability, ok := be.Backend.(EntityBackend)
+func (be *largePayloadEntityBackend) GetEntityWorkItem(ctx context.Context) (*EntityWorkItem, error) {
+	capability, ok := GetBackendCapability[EntityBackend](be.Backend)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -181,8 +193,8 @@ func (be *largePayloadBackend) GetEntityWorkItem(ctx context.Context) (*EntityWo
 	return workItem, nil
 }
 
-func (be *largePayloadBackend) CompleteEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
-	capability, ok := be.Backend.(EntityBackend)
+func (be *largePayloadEntityBackend) CompleteEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
+	capability, ok := GetBackendCapability[EntityBackend](be.Backend)
 	if !ok {
 		return api.ErrFeatureNotSupported
 	}
@@ -194,20 +206,20 @@ func (be *largePayloadBackend) CompleteEntityWorkItem(ctx context.Context, workI
 	return capability.CompleteEntityWorkItem(ctx, workItem)
 }
 
-func (be *largePayloadBackend) AbandonEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
-	capability, ok := be.Backend.(EntityBackend)
+func (be *largePayloadEntityBackend) AbandonEntityWorkItem(ctx context.Context, workItem *EntityWorkItem) error {
+	capability, ok := GetBackendCapability[EntityBackend](be.Backend)
 	if !ok {
 		return api.ErrFeatureNotSupported
 	}
 	return capability.AbandonEntityWorkItem(ctx, workItem)
 }
 
-func (be *largePayloadBackend) GetEntityMetadata(
+func (be *largePayloadEntityBackend) GetEntityMetadata(
 	ctx context.Context,
 	entityID api.EntityID,
 	includeState bool,
 ) (*api.EntityMetadata, error) {
-	capability, ok := be.Backend.(EntityQueryBackend)
+	capability, ok := GetBackendCapability[EntityQueryBackend](be.Backend)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -223,11 +235,11 @@ func (be *largePayloadBackend) GetEntityMetadata(
 	return metadata, nil
 }
 
-func (be *largePayloadBackend) QueryEntities(
+func (be *largePayloadEntityBackend) QueryEntities(
 	ctx context.Context,
 	query api.EntityQuery,
 ) (*api.EntityQueryResults, error) {
-	capability, ok := be.Backend.(EntityQueryBackend)
+	capability, ok := GetBackendCapability[EntityQueryBackend](be.Backend)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -248,11 +260,11 @@ func (be *largePayloadBackend) QueryEntities(
 	return result, nil
 }
 
-func (be *largePayloadBackend) CleanEntityStorage(
+func (be *largePayloadEntityBackend) CleanEntityStorage(
 	ctx context.Context,
 	request api.CleanEntityStorageRequest,
 ) (*api.CleanEntityStorageResult, error) {
-	capability, ok := be.Backend.(EntityQueryBackend)
+	capability, ok := GetBackendCapability[EntityQueryBackend](be.Backend)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -270,65 +282,20 @@ func (be *largePayloadBackend) GetOrchestrationMetadata(ctx context.Context, id 
 	return metadata, nil
 }
 
-func (be *largePayloadBackend) QueryOrchestrations(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
-	capability, ok := be.Backend.(OrchestrationQueryBackend)
-	if !ok {
-		return nil, api.ErrFeatureNotSupported
-	}
-	result, err := capability.QueryOrchestrations(ctx, query)
-	if err != nil || result == nil || !query.FetchInputsAndOutputs {
-		return result, err
+func (be *largePayloadBackend) decorateOrchestrationQueryResult(
+	ctx context.Context,
+	query api.OrchestrationQuery,
+	result *api.OrchestrationQueryResult,
+) error {
+	if !query.FetchInputsAndOutputs {
+		return nil
 	}
 	for _, metadata := range result.Orchestrations {
 		if err := hydrateMetadata(ctx, be.options, metadata); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return result, nil
-}
-
-func (be *largePayloadBackend) ListInstanceIDs(ctx context.Context, query api.InstanceIDQuery) (*api.InstanceIDQueryResult, error) {
-	capability, ok := be.Backend.(InstanceIDQueryBackend)
-	if !ok {
-		return nil, api.ErrFeatureNotSupported
-	}
-	return capability.ListInstanceIDs(ctx, query)
-}
-
-func (be *largePayloadBackend) RestartInstance(ctx context.Context, id api.InstanceID, newID bool) (api.InstanceID, error) {
-	capability, ok := be.Backend.(RestartInstanceBackend)
-	if !ok {
-		return api.EmptyInstanceID, api.ErrFeatureNotSupported
-	}
-	return capability.RestartInstance(ctx, id, newID)
-}
-
-func (be *largePayloadBackend) RewindInstance(ctx context.Context, id api.InstanceID, reason string) error {
-	capability, ok := be.Backend.(RewindInstanceBackend)
-	if !ok {
-		return api.ErrFeatureNotSupported
-	}
-	return capability.RewindInstance(ctx, id, reason)
-}
-
-func (be *largePayloadBackend) PurgeInstances(ctx context.Context, request api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
-	capability, ok := be.Backend.(PurgeInstancesBackend)
-	if !ok {
-		return nil, api.ErrFeatureNotSupported
-	}
-	return capability.PurgeInstances(ctx, request)
-}
-
-func (be *largePayloadBackend) SkipGracefulOrchestrationTerminations(
-	ctx context.Context,
-	ids []api.InstanceID,
-	reason string,
-) ([]api.InstanceID, error) {
-	capability, ok := be.Backend.(SkipGracefulTerminationsBackend)
-	if !ok {
-		return nil, api.ErrFeatureNotSupported
-	}
-	return capability.SkipGracefulOrchestrationTerminations(ctx, ids, reason)
+	return nil
 }
 
 func cloneAndTransformHistoryEvent(

@@ -52,8 +52,12 @@ func createTaskHubWorker(server *grpc.Server, sqliteFilePath string, logger back
 	registerFn(server)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger)
 	activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+	if !ok {
+		panic("sqlite backend does not support durable entities")
+	}
 	entityWorker := backend.NewEntityWorker(
-		be.(backend.EntityBackend),
+		entityBackend,
 		executor.(backend.EntityExecutor),
 		logger,
 	)

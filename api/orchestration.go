@@ -10,6 +10,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -170,15 +171,15 @@ func WithVersion(version string) NewOrchestrationOptions {
 // and activity contexts. The fields are persisted with orchestration history.
 func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
-		if req.Tags == nil {
-			req.Tags = make(map[string]string, len(fields))
-		}
-		for key, value := range fields {
+		for key := range fields {
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
 				return fmt.Errorf("context field %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
 			}
-			req.Tags[key] = value
+			if strings.HasPrefix(key, tagcodec.UserTagPrefix) {
+				return fmt.Errorf("context field %q uses reserved prefix %q", key, tagcodec.UserTagPrefix)
+			}
 		}
+		req.Tags = tagcodec.Merge(req.Tags, tagcodec.EncodeContextFields(fields))
 		return nil
 	}
 }
@@ -186,18 +187,18 @@ func WithContextFields(fields ContextFields) NewOrchestrationOptions {
 // WithTags configures orchestration tags that are persisted and returned by metadata queries.
 func WithTags(tags map[string]string) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest) error {
-		if req.Tags == nil {
-			req.Tags = make(map[string]string, len(tags))
-		}
-		for key, value := range tags {
+		for key := range tags {
 			if key == "" {
 				return errors.New("tag key cannot be empty")
 			}
 			if strings.HasPrefix(key, ReservedContextFieldPrefix) {
 				return fmt.Errorf("tag %q uses reserved prefix %q", key, ReservedContextFieldPrefix)
 			}
-			req.Tags[key] = value
+			if strings.HasPrefix(key, tagcodec.UserTagPrefix) {
+				return fmt.Errorf("tag %q uses reserved prefix %q", key, tagcodec.UserTagPrefix)
+			}
 		}
+		req.Tags = tagcodec.Merge(req.Tags, tagcodec.EncodeUserTags(tags))
 		return nil
 	}
 }

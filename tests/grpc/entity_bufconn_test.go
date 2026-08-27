@@ -28,8 +28,10 @@ func Test_Bufconn_DurableEntityEndToEnd(t *testing.T) {
 	register(server)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger)
 	activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+	require.True(t, ok)
 	entityWorker := backend.NewEntityWorker(
-		be.(backend.EntityBackend),
+		entityBackend,
 		executor.(backend.EntityExecutor),
 		logger,
 	)

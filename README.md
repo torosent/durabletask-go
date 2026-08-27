@@ -64,6 +64,8 @@ batch and filtered purge, immediate termination, tags, and explicit worker
 capabilities. Large payloads can be externalized without a cloud dependency by
 configuring an `api.LargePayloadOptions` store/resolver on DTS clients/workers
 or by wrapping an embedded backend with `backend.NewLargePayloadBackend`.
+Destructive task-hub lifecycle RPCs on an embedded gRPC server require the
+explicit `backend.WithTaskHubLifecycleManagement()` executor option.
 
 ## Creating the standalone gRPC sidecar
 

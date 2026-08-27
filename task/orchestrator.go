@@ -20,6 +20,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 )
 
 // Orchestrator is the functional interface for orchestrator functions.
@@ -40,6 +41,7 @@ type OrchestrationContext struct {
 
 	baseContext              context.Context
 	contextFields            api.ContextFields
+	orchestrationTags        map[string]string
 	logger                   *slog.Logger
 	metrics                  backend.MetricsHooks
 	orchestrationOptions     OrchestrationOptions
@@ -577,7 +579,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 		Name:             ctx.Name,
 		Version:          ctx.Version,
 		ParentInstanceID: ctx.parentInstanceID,
-	}, ctx.contextFields)
+	}, ctx.contextFields, ctx.orchestrationTags)
 
 	ctx.pendingActions[scheduleTaskAction.Id] = scheduleTaskAction
 
@@ -638,6 +640,7 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 			ParentInstanceID: ctx.parentInstanceID,
 		},
 		ctx.contextFields,
+		ctx.orchestrationTags,
 	)
 	if createSubOrchestrationAction.GetCreateSubOrchestration().GetInstanceId() == "" {
 		createSubOrchestrationAction.GetCreateSubOrchestration().InstanceId = fmt.Sprintf(
@@ -1004,6 +1007,7 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 	ctx.executionID = es.GetOrchestrationInstance().GetExecutionId().GetValue()
 	_, fields := contextprop.Decode(es.GetTags())
 	ctx.contextFields = mergeContextFields(ctx.contextFields, fields)
+	ctx.orchestrationTags = tagcodec.DecodeUserTagsOrPlain(es.GetTags())
 	if parent := es.GetParentInstance(); parent != nil {
 		ctx.parentInstanceID = api.InstanceID(parent.GetOrchestrationInstance().GetInstanceId())
 	}

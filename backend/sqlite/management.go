@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -18,6 +19,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -52,7 +54,7 @@ func (be *sqliteBackend) QueryOrchestrations(ctx context.Context, query api.Orch
 	}
 	fmt.Fprintf(
 		&sqlBuilder,
-		`SELECT i.InstanceID, i.ExecutionID, i.Name, i.Version, i.ParentInstanceID, i.RuntimeStatus,
+		`SELECT i.InstanceID, i.ExecutionID, i.Name, i.Version, i.ScheduledStartTime, i.ParentInstanceID, i.RuntimeStatus,
 			i.CreatedTime, i.LastUpdatedTime, i.CompletedTime, %s, %s, %s, %s
 		FROM Instances AS i WHERE i.InstanceID > ?`,
 		inputColumn,
@@ -284,10 +286,8 @@ func (be *sqliteBackend) RewindInstance(ctx context.Context, id api.InstanceID, 
 }
 
 func (be *sqliteBackend) PurgeInstances(ctx context.Context, request api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
-	hasInstanceIDs := len(request.InstanceIDs) > 0
-	hasFilter := request.Filter != nil
-	if hasInstanceIDs == hasFilter {
-		return nil, errors.New("purge request must specify exactly one of instance IDs or a filter")
+	if err := request.Validate(); err != nil {
+		return nil, err
 	}
 	if len(request.InstanceIDs) > api.MaxInstanceBatchSize {
 		return nil, fmt.Errorf("instance batch cannot exceed %d IDs", api.MaxInstanceBatchSize)
@@ -309,7 +309,7 @@ func (be *sqliteBackend) PurgeInstances(ctx context.Context, request api.PurgeIn
 				continue
 			}
 			if err != nil {
-				return nil, err
+				return result, err
 			}
 			result.DeletedInstanceCount += count
 		}
@@ -329,6 +329,7 @@ func (be *sqliteBackend) PurgeInstances(ctx context.Context, request api.PurgeIn
 			return nil, api.ErrNotCompleted
 		}
 	}
+	result := &api.PurgeInstancesResult{}
 	page, err := be.QueryOrchestrations(ctx, api.OrchestrationQuery{
 		RuntimeStatus:   statuses,
 		CreatedTimeFrom: filter.CreatedTimeFrom,
@@ -336,16 +337,15 @@ func (be *sqliteBackend) PurgeInstances(ctx context.Context, request api.PurgeIn
 		PageSize:        api.DefaultInstanceQueryPageSize,
 	})
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	result := &api.PurgeInstancesResult{}
 	for _, metadata := range page.Orchestrations {
 		count, err := be.purgeInstance(ctx, metadata.InstanceID, request.Recursive)
 		if errors.Is(err, api.ErrInstanceNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		result.DeletedInstanceCount += count
 	}
@@ -362,7 +362,7 @@ func (be *sqliteBackend) PurgeInstances(ctx context.Context, request api.PurgeIn
 	return result, nil
 }
 
-func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, _ string) ([]api.InstanceID, error) {
+func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, reason string) ([]api.InstanceID, error) {
 	if len(ids) == 0 {
 		return nil, errors.New("at least one instance ID is required")
 	}
@@ -371,6 +371,10 @@ func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Conte
 	}
 	if err := be.ensureDB(); err != nil {
 		return nil, err
+	}
+	serializedReason, err := json.Marshal(reason)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize termination reason: %w", err)
 	}
 	tx, err := be.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -381,13 +385,46 @@ func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Conte
 	now := time.Now().UTC()
 	unterminated := make([]api.InstanceID, 0)
 	for _, id := range ids {
+		var runtimeStatus string
+		var parentInstanceID sql.NullString
+		err := tx.QueryRowContext(
+			ctx,
+			"SELECT RuntimeStatus, ParentInstanceID FROM Instances WHERE InstanceID = ?",
+			string(id),
+		).Scan(&runtimeStatus, &parentInstanceID)
+		if errors.Is(err, sql.ErrNoRows) {
+			unterminated = append(unterminated, id)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect orchestration before immediate termination: %w", err)
+		}
+		if parentInstanceID.Valid ||
+			(runtimeStatus != "PENDING" && runtimeStatus != "RUNNING" && runtimeStatus != "SUSPENDED") {
+			unterminated = append(unterminated, id)
+			continue
+		}
+		var activeChildren int
+		if err := tx.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM Instances
+			WHERE ParentInstanceID = ? AND RuntimeStatus IN ('PENDING', 'RUNNING', 'SUSPENDED')`,
+			string(id),
+		).Scan(&activeChildren); err != nil {
+			return nil, fmt.Errorf("failed to inspect sub-orchestrations before immediate termination: %w", err)
+		}
+		if activeChildren > 0 {
+			unterminated = append(unterminated, id)
+			continue
+		}
 		result, err := tx.ExecContext(
 			ctx,
 			`UPDATE Instances SET RuntimeStatus = 'TERMINATED', CompletedTime = COALESCE(CompletedTime, ?),
-				LastUpdatedTime = ?, LockedBy = NULL, LockExpiration = NULL
+				LastUpdatedTime = ?, Output = ?, FailureDetails = NULL, LockedBy = NULL, LockExpiration = NULL
 			WHERE InstanceID = ? AND RuntimeStatus IN ('PENDING', 'RUNNING', 'SUSPENDED')`,
 			now,
 			now,
+			string(serializedReason),
 			string(id),
 		)
 		if err != nil {
@@ -400,6 +437,33 @@ func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Conte
 		if affected == 0 {
 			unterminated = append(unterminated, id)
 			continue
+		}
+		var nextSequenceNumber int
+		if err := tx.QueryRowContext(
+			ctx,
+			"SELECT COALESCE(MAX(SequenceNumber), -1) + 1 FROM History WHERE InstanceID = ?",
+			string(id),
+		).Scan(&nextSequenceNumber); err != nil {
+			return nil, fmt.Errorf("failed to allocate termination history sequence: %w", err)
+		}
+		terminationEvent := helpers.NewExecutionCompletedEvent(
+			-1,
+			api.RUNTIME_STATUS_TERMINATED,
+			wrapperspb.String(string(serializedReason)),
+			nil,
+		)
+		payload, err := backend.MarshalHistoryEvent(terminationEvent)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			"INSERT INTO History (InstanceID, SequenceNumber, EventPayload) VALUES (?, ?, ?)",
+			string(id),
+			nextSequenceNumber,
+			payload,
+		); err != nil {
+			return nil, fmt.Errorf("failed to append immediate termination history: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM NewEvents WHERE InstanceID = ?", string(id)); err != nil {
 			return nil, fmt.Errorf("failed to delete pending orchestration events: %w", err)
@@ -415,6 +479,23 @@ func (be *sqliteBackend) SkipGracefulOrchestrationTerminations(ctx context.Conte
 }
 
 func (be *sqliteBackend) purgeInstance(ctx context.Context, id api.InstanceID, recursive bool) (int, error) {
+	return be.purgeInstanceRecursive(ctx, id, recursive, make(map[api.InstanceID]struct{}), 0)
+}
+
+func (be *sqliteBackend) purgeInstanceRecursive(
+	ctx context.Context,
+	id api.InstanceID,
+	recursive bool,
+	visited map[api.InstanceID]struct{},
+	depth int,
+) (int, error) {
+	if depth > maxRewindDepth {
+		return 0, fmt.Errorf("%w: purge depth exceeds %d", api.ErrInvalidState, maxRewindDepth)
+	}
+	if _, ok := visited[id]; ok {
+		return 0, fmt.Errorf("%w: cycle detected while purging %q", api.ErrInvalidState, id)
+	}
+	visited[id] = struct{}{}
 	deleted := 0
 	if recursive {
 		for {
@@ -430,7 +511,7 @@ func (be *sqliteBackend) purgeInstance(ctx context.Context, id api.InstanceID, r
 			if err != nil {
 				return deleted, fmt.Errorf("failed to query sub-orchestration: %w", err)
 			}
-			count, err := be.purgeInstance(ctx, api.InstanceID(childID), true)
+			count, err := be.purgeInstanceRecursive(ctx, api.InstanceID(childID), true, visited, depth+1)
 			deleted += count
 			if err != nil {
 				return deleted, err
@@ -625,33 +706,38 @@ func (be *sqliteBackend) getExecutionStartedEvent(ctx context.Context, id api.In
 
 func (be *sqliteBackend) getInstanceTags(ctx context.Context, ids []api.InstanceID) (map[api.InstanceID]map[string]string, error) {
 	result := make(map[api.InstanceID]map[string]string, len(ids))
-	if len(ids) == 0 {
-		return result, nil
-	}
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = string(id)
-	}
-	query := "SELECT InstanceID, TagKey, TagValue FROM InstanceTags WHERE InstanceID IN (?" +
-		strings.Repeat(", ?", len(ids)-1) + ") ORDER BY InstanceID, TagKey"
-	rows, err := be.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query instance tags: %w", err)
-	}
-	defer rows.Close() //nolint:errcheck // read-only query cleanup
-	for rows.Next() {
-		var instanceID, key, value string
-		if err := rows.Scan(&instanceID, &key, &value); err != nil {
-			return nil, fmt.Errorf("failed to scan instance tag: %w", err)
+	for start := 0; start < len(ids); start += api.MaxInstanceBatchSize {
+		end := min(start+api.MaxInstanceBatchSize, len(ids))
+		batch := ids[start:end]
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = string(id)
 		}
-		id := api.InstanceID(instanceID)
-		if result[id] == nil {
-			result[id] = make(map[string]string)
+		query := "SELECT InstanceID, TagKey, TagValue FROM InstanceTags WHERE InstanceID IN (?" +
+			strings.Repeat(", ?", len(batch)-1) + ") ORDER BY InstanceID, TagKey"
+		rows, err := be.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query instance tags: %w", err)
 		}
-		result[id][key] = value
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed while reading instance tags: %w", err)
+		for rows.Next() {
+			var instanceID, key, value string
+			if err := rows.Scan(&instanceID, &key, &value); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("failed to scan instance tag: %w", err)
+			}
+			id := api.InstanceID(instanceID)
+			if result[id] == nil {
+				result[id] = make(map[string]string)
+			}
+			result[id][key] = value
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("failed while reading instance tags: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close instance tag query: %w", err)
+		}
 	}
 	return result, nil
 }
@@ -660,13 +746,14 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 	var instanceID, executionID, name, runtimeStatus string
 	var version, parentInstanceID, input, output, customStatus sql.NullString
 	var createdAt, lastUpdatedAt time.Time
-	var completedAt sql.NullTime
+	var scheduledStartAt, completedAt sql.NullTime
 	var failureDetailsPayload []byte
 	if err := scanner.Scan(
 		&instanceID,
 		&executionID,
 		&name,
 		&version,
+		&scheduledStartAt,
 		&parentInstanceID,
 		&runtimeStatus,
 		&createdAt,
@@ -698,6 +785,9 @@ func scanOrchestrationMetadata(scanner interface{ Scan(...any) error }) (*api.Or
 		failureDetails,
 	)
 	metadata.ExecutionID = executionID
+	if scheduledStartAt.Valid {
+		metadata.ScheduledStartAt = scheduledStartAt.Time
+	}
 	if version.Valid {
 		metadata.Version = version.String
 	}

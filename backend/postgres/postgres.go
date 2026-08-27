@@ -15,7 +15,9 @@ import (
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -106,7 +108,7 @@ func (be *postgresBackend) CreateTaskHub(ctx context.Context) error {
 func (be *postgresBackend) DeleteTaskHub(ctx context.Context) error {
 	if be.db == nil {
 		if err := be.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start backend for task hub deletion: %w", err)
+			return fmt.Errorf("failed to connect while deleting task hub: %w", err)
 		}
 	}
 
@@ -538,15 +540,17 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *back
 		`INSERT INTO Instances (
 			Name,
 			Version,
+			ScheduledStartTime,
 			InstanceID,
 			ExecutionID,
 			Input,
 			RuntimeStatus,
 			CreatedTime,
 			ParentInstanceID
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
 		startEvent.Name,
 		startEvent.Version.GetValue(),
+		timestampValue(startEvent.ScheduledStartTimestamp),
 		startEvent.OrchestrationInstance.InstanceId,
 		startEvent.OrchestrationInstance.ExecutionId.GetValue(),
 		startEvent.Input.GetValue(),
@@ -571,7 +575,7 @@ func insertOrIgnoreInstanceTableInternal(ctx context.Context, tx pgx.Tx, e *back
 }
 
 func insertInstanceTags(ctx context.Context, tx pgx.Tx, instanceID string, tags map[string]string) error {
-	for key, value := range tags {
+	for key, value := range tagcodec.DecodeUserTagsOrPlain(tags) {
 		if _, err := tx.Exec(
 			ctx,
 			"INSERT INTO InstanceTags (InstanceID, TagKey, TagValue) VALUES ($1, $2, $3)",
@@ -728,7 +732,7 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 
 	row := be.db.QueryRow(
 		ctx,
-		`SELECT InstanceID, ExecutionID, Name, Version, ParentInstanceID, RuntimeStatus, CreatedTime, LastUpdatedTime, CompletedTime, Input, Output, CustomStatus, FailureDetails
+		`SELECT InstanceID, ExecutionID, Name, Version, ScheduledStartTime, ParentInstanceID, RuntimeStatus, CreatedTime, LastUpdatedTime, CompletedTime, Input, Output, CustomStatus, FailureDetails
 		FROM Instances WHERE InstanceID = $1`,
 		string(iid),
 	)
@@ -737,6 +741,7 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 	var executionID *string
 	var name *string
 	var version *string
+	var scheduledStartAt *time.Time
 	var parentInstanceID *string
 	var runtimeStatus *string
 	var createdAt *time.Time
@@ -748,7 +753,7 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 	var failureDetails *protos.TaskFailureDetails
 
 	var failureDetailsPayload []byte
-	err := row.Scan(&instanceID, &executionID, &name, &version, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
+	err := row.Scan(&instanceID, &executionID, &name, &version, &scheduledStartAt, &parentInstanceID, &runtimeStatus, &createdAt, &lastUpdatedAt, &completedAt, &input, &output, &customStatus, &failureDetailsPayload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, api.ErrInstanceNotFound
 	} else if err != nil {
@@ -790,6 +795,9 @@ func (be *postgresBackend) GetOrchestrationMetadata(ctx context.Context, iid api
 	}
 	if executionID != nil {
 		metadata.ExecutionID = *executionID
+	}
+	if scheduledStartAt != nil {
+		metadata.ScheduledStartAt = *scheduledStartAt
 	}
 	if parentInstanceID != nil {
 		metadata.ParentInstanceID = api.InstanceID(*parentInstanceID)
@@ -1926,4 +1934,11 @@ func (be *postgresBackend) String() string {
 	maskedPassword := strings.Repeat("*", len(be.options.PgOptions.ConnConfig.Password))
 	connectionURI := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s", be.options.PgOptions.ConnConfig.User, maskedPassword, be.options.PgOptions.ConnConfig.Host, be.options.PgOptions.ConnConfig.Port, be.options.PgOptions.ConnConfig.Database)
 	return connectionURI
+}
+
+func timestampValue(timestamp *timestamppb.Timestamp) any {
+	if timestamp == nil {
+		return nil
+	}
+	return timestamp.AsTime()
 }

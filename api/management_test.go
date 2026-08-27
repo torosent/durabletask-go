@@ -5,13 +5,16 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 	"github.com/stretchr/testify/require"
 )
 
 func TestWithTagsMergesAndRejectsReservedKeys(t *testing.T) {
 	req := &protos.CreateInstanceRequest{Tags: map[string]string{"existing": "value"}}
 	require.NoError(t, WithTags(map[string]string{"team": "durable"})(req))
-	require.Equal(t, map[string]string{"existing": "value", "team": "durable"}, req.Tags)
+	require.Equal(t, "value", req.Tags["existing"])
+	require.Equal(t, "durable", req.Tags["team"])
+	require.Equal(t, "1", req.Tags[tagcodec.ContextEncodingTag])
 	require.Error(t, WithTags(map[string]string{ReservedContextFieldPrefix + "name": "invalid"})(req))
 }
 

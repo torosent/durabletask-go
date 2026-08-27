@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS Instances (
     [ExecutionID] TEXT NOT NULL,
     [Name] TEXT NOT NULL, -- the type name of the orchestration or entity
     [Version] TEXT NULL, -- the version of the orchestration (optional)
+    [ScheduledStartTime] DATETIME NULL,
     [RuntimeStatus] TEXT NOT NULL,
     [CreatedTime] DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     [LastUpdatedTime] DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

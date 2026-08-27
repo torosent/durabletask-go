@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS Instances (
     ExecutionID TEXT NOT NULL,
     Name TEXT NOT NULL, -- the type name of the orchestration or entity
     Version TEXT NULL, -- the version of the orchestration (optional)
+    ScheduledStartTime TIMESTAMP NULL,
     RuntimeStatus TEXT NOT NULL,
     CreatedTime TIMESTAMP NOT NULL DEFAULT NOW(),
     LastUpdatedTime TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -17,6 +18,8 @@ CREATE TABLE IF NOT EXISTS Instances (
     FailureDetails BYTEA NULL,
     ParentInstanceID TEXT NULL
 );
+
+ALTER TABLE Instances ADD COLUMN IF NOT EXISTS ScheduledStartTime TIMESTAMP NULL;
 
 -- This index is used to improve queries with ORDER BY Instances.SequenceNumber
 CREATE INDEX IF NOT EXISTS IX_Instances_SequenceNumber ON Instances(SequenceNumber);

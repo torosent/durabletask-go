@@ -260,7 +260,7 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 			return fmt.Errorf("failed to configure signal entity request: %w", err)
 		}
 	}
-	if entityBackend, ok := c.be.(EntitySignalBackend); ok {
+	if entityBackend, ok := GetBackendCapability[EntitySignalBackend](c.be); ok {
 		if err := entityBackend.SignalEntity(ctx, req); err != nil {
 			return fmt.Errorf("failed to signal entity: %w", err)
 		}
@@ -270,15 +270,11 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 }
 
 func (c *backendClient) QueryInstances(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
-	capability, ok := c.be.(OrchestrationQueryBackend)
-	if !ok {
-		return nil, api.ErrFeatureNotSupported
-	}
-	return capability.QueryOrchestrations(ctx, query)
+	return queryOrchestrations(ctx, c.be, query)
 }
 
 func (c *backendClient) ListInstanceIDs(ctx context.Context, query api.InstanceIDQuery) (*api.InstanceIDQueryResult, error) {
-	capability, ok := c.be.(InstanceIDQueryBackend)
+	capability, ok := GetBackendCapability[InstanceIDQueryBackend](c.be)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -292,7 +288,7 @@ func (c *backendClient) RestartInstance(ctx context.Context, id api.InstanceID, 
 			return api.EmptyInstanceID, fmt.Errorf("failed to configure restart request: %w", err)
 		}
 	}
-	capability, ok := c.be.(RestartInstanceBackend)
+	capability, ok := GetBackendCapability[RestartInstanceBackend](c.be)
 	if !ok {
 		return api.EmptyInstanceID, api.ErrFeatureNotSupported
 	}
@@ -306,7 +302,7 @@ func (c *backendClient) RewindInstance(ctx context.Context, id api.InstanceID, o
 			return fmt.Errorf("failed to configure rewind request: %w", err)
 		}
 	}
-	capability, ok := c.be.(RewindInstanceBackend)
+	capability, ok := GetBackendCapability[RewindInstanceBackend](c.be)
 	if !ok {
 		return api.ErrFeatureNotSupported
 	}
@@ -314,7 +310,10 @@ func (c *backendClient) RewindInstance(ctx context.Context, id api.InstanceID, o
 }
 
 func (c *backendClient) PurgeInstances(ctx context.Context, req api.PurgeInstancesRequest) (*api.PurgeInstancesResult, error) {
-	capability, ok := c.be.(PurgeInstancesBackend)
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	capability, ok := GetBackendCapability[PurgeInstancesBackend](c.be)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -325,11 +324,13 @@ func (c *backendClient) PurgeInstances(ctx context.Context, req api.PurgeInstanc
 			batchRequest := req
 			batchRequest.InstanceIDs = append([]api.InstanceID(nil), req.InstanceIDs[start:end]...)
 			partial, err := pollBackendPurge(ctx, capability, batchRequest)
-			if err != nil {
-				return nil, err
+			if partial != nil {
+				result.DeletedInstanceCount += partial.DeletedInstanceCount
+				result.IsComplete = result.IsComplete && partial.IsComplete
 			}
-			result.DeletedInstanceCount += partial.DeletedInstanceCount
-			result.IsComplete = result.IsComplete && partial.IsComplete
+			if err != nil {
+				return result, err
+			}
 		}
 		return result, nil
 	}
@@ -341,6 +342,11 @@ func pollBackendPurge(
 	capability PurgeInstancesBackend,
 	req api.PurgeInstancesRequest,
 ) (*api.PurgeInstancesResult, error) {
+	if req.Filter != nil && req.Filter.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.Filter.Timeout)
+		defer cancel()
+	}
 	pollInterval := req.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = api.DefaultPurgePollInterval
@@ -349,6 +355,11 @@ func pollBackendPurge(
 	for {
 		partial, err := capability.PurgeInstances(ctx, req)
 		if err != nil {
+			if partial != nil {
+				result.DeletedInstanceCount += partial.DeletedInstanceCount
+				result.IsComplete = partial.IsComplete
+				return result, err
+			}
 			return nil, err
 		}
 		result.DeletedInstanceCount += partial.DeletedInstanceCount
@@ -362,14 +373,14 @@ func pollBackendPurge(
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return nil, ctx.Err()
+			return result, ctx.Err()
 		case <-timer.C:
 		}
 	}
 }
 
 func (c *backendClient) SkipGracefulOrchestrationTerminations(ctx context.Context, ids []api.InstanceID, reason string) ([]api.InstanceID, error) {
-	capability, ok := c.be.(SkipGracefulTerminationsBackend)
+	capability, ok := GetBackendCapability[SkipGracefulTerminationsBackend](c.be)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -399,7 +410,7 @@ func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.En
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
 		return nil, err
 	}
-	if entityBackend, ok := c.be.(EntityQueryBackend); ok {
+	if entityBackend, ok := GetBackendCapability[EntityQueryBackend](c.be); ok {
 		return entityBackend.GetEntityMetadata(ctx, entityID, includeState)
 	}
 	return nil, api.ErrFeatureNotSupported
@@ -407,7 +418,7 @@ func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.En
 
 // QueryEntities queries native entity storage.
 func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
-	entityBackend, ok := c.be.(EntityQueryBackend)
+	entityBackend, ok := GetBackendCapability[EntityQueryBackend](c.be)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
@@ -416,7 +427,7 @@ func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery
 
 // CleanEntityStorage removes empty entities and releases orphaned locks.
 func (c *backendClient) CleanEntityStorage(ctx context.Context, req api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
-	entityBackend, ok := c.be.(EntityQueryBackend)
+	entityBackend, ok := GetBackendCapability[EntityQueryBackend](c.be)
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}

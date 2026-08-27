@@ -13,6 +13,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/internal/tagcodec"
 )
 
 var ErrDuplicateEvent = errors.New("duplicate event")
@@ -246,6 +247,7 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 					ParentInstanceID: s.instanceID,
 				},
 				fields,
+				tagcodec.DecodeUserTagsOrPlain(createSO.Tags),
 			)
 			s.pendingMessages = append(s.pendingMessages, OrchestratorMessage{HistoryEvent: startEvent, TargetInstanceID: createSO.InstanceId})
 		} else if sendEvent := action.GetSendEvent(); sendEvent != nil {

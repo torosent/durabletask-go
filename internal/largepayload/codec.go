@@ -25,7 +25,13 @@ type reference struct {
 }
 
 func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
-	if value == nil || options == nil {
+	if value == nil {
+		return value, nil
+	}
+	if options == nil {
+		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+			return nil, fmt.Errorf("%w: large payload reference requires a configured store and resolver", api.ErrFeatureNotSupported)
+		}
 		return value, nil
 	}
 	normalized, err := api.NormalizeLargePayloadOptions(options)
@@ -62,7 +68,13 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 }
 
 func Hydrate(ctx context.Context, options *api.LargePayloadOptions, value *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
-	if value == nil || options == nil {
+	if value == nil {
+		return value, nil
+	}
+	if options == nil {
+		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+			return nil, fmt.Errorf("%w: large payload reference requires a configured resolver", api.ErrFeatureNotSupported)
+		}
 		return value, nil
 	}
 	normalized, err := api.NormalizeLargePayloadOptions(options)
@@ -97,7 +109,7 @@ func TransformHistoryEvent(
 	event *protos.HistoryEvent,
 	externalize bool,
 ) error {
-	if event == nil || options == nil {
+	if event == nil {
 		return nil
 	}
 	transform := Hydrate
@@ -150,7 +162,7 @@ func TransformOrchestratorRequest(
 	options *api.LargePayloadOptions,
 	request *protos.OrchestratorRequest,
 ) error {
-	if request == nil || options == nil {
+	if request == nil {
 		return nil
 	}
 	for _, events := range [][]*protos.HistoryEvent{request.PastEvents, request.NewEvents} {
@@ -168,7 +180,7 @@ func TransformOrchestratorResponse(
 	options *api.LargePayloadOptions,
 	response *protos.OrchestratorResponse,
 ) error {
-	if response == nil || options == nil {
+	if response == nil {
 		return nil
 	}
 	var err error
@@ -222,7 +234,7 @@ func TransformOrchestratorResponse(
 }
 
 func TransformActivityRequest(ctx context.Context, options *api.LargePayloadOptions, request *protos.ActivityRequest) error {
-	if request == nil || options == nil {
+	if request == nil {
 		return nil
 	}
 	var err error
@@ -231,7 +243,7 @@ func TransformActivityRequest(ctx context.Context, options *api.LargePayloadOpti
 }
 
 func TransformActivityResponse(ctx context.Context, options *api.LargePayloadOptions, response *protos.ActivityResponse) error {
-	if response == nil || options == nil {
+	if response == nil {
 		return nil
 	}
 	var err error
@@ -308,7 +320,7 @@ func TransformEntityBatchResult(
 }
 
 func TransformOrchestrationState(ctx context.Context, options *api.LargePayloadOptions, state *protos.OrchestrationState) error {
-	if state == nil || options == nil {
+	if state == nil {
 		return nil
 	}
 	var err error

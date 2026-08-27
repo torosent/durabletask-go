@@ -1552,8 +1552,12 @@ func initTaskHubWorkerWithExecutorOptions(
 	executor := task.NewTaskExecutor(r, executorOpts...)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger, workerOpts...)
 	activityWorker := backend.NewActivityTaskWorker(be, executor, logger, workerOpts...)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+	if !ok {
+		panic("test backend does not support durable entities")
+	}
 	entityWorker := backend.NewEntityWorker(
-		be.(backend.EntityBackend),
+		entityBackend,
 		executor.(backend.EntityExecutor),
 		logger,
 		workerOpts...,

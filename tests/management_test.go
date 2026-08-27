@@ -51,22 +51,32 @@ func TestAdvancedManagementQueriesRestartPurgeAndTermination(t *testing.T) {
 			client := backend.NewTaskHubManagementClient(be)
 
 			completedFrom := time.Now().UTC().Add(-time.Second)
+			scheduledStart := time.Now().UTC().Add(100 * time.Millisecond)
 			for index := range 5 {
 				id := api.InstanceID(fmt.Sprintf("management-%02d", index))
 				group := "odd"
 				if index%2 == 0 {
 					group = "even"
 				}
-				_, err := client.ScheduleNewOrchestration(
-					testCtx,
-					"ManagementComplete",
+				options := []api.NewOrchestrationOptions{
 					api.WithInstanceID(id),
 					api.WithInput(fmt.Sprintf("value-%d", index)),
 					api.WithTags(map[string]string{"group": group}),
+				}
+				if index == 0 {
+					options = append(options, api.WithStartTime(scheduledStart))
+				}
+				_, err := client.ScheduleNewOrchestration(
+					testCtx,
+					"ManagementComplete",
+					options...,
 				)
 				require.NoError(t, err)
-				_, err = client.WaitForOrchestrationCompletion(testCtx, id)
+				completed, err := client.WaitForOrchestrationCompletion(testCtx, id)
 				require.NoError(t, err)
+				if index == 0 {
+					require.WithinDuration(t, scheduledStart, completed.ScheduledStartAt, time.Millisecond)
+				}
 			}
 
 			firstPage, err := client.QueryInstances(testCtx, api.OrchestrationQuery{
@@ -148,6 +158,7 @@ func TestAdvancedManagementQueriesRestartPurgeAndTermination(t *testing.T) {
 			terminated, err := client.FetchOrchestrationMetadata(testCtx, waitID)
 			require.NoError(t, err)
 			require.Equal(t, api.RUNTIME_STATUS_TERMINATED, terminated.RuntimeStatus)
+			require.Equal(t, `"test"`, terminated.SerializedOutput)
 			unterminated, err = client.SkipGracefulOrchestrationTerminations(testCtx, []api.InstanceID{waitID}, "again")
 			require.NoError(t, err)
 			require.Equal(t, []api.InstanceID{waitID}, unterminated)
@@ -318,6 +329,64 @@ func TestTaskHubLifecycleManagement(t *testing.T) {
 	require.NoError(t, client.DeleteTaskHub(testCtx))
 	require.NoError(t, client.CreateTaskHub(testCtx))
 	require.NoError(t, client.DeleteTaskHub(testCtx))
+}
+
+func TestSkipGracefulRejectsActiveSubOrchestration(t *testing.T) {
+	for i, be := range getRunnableBackends() {
+		t.Run(fmt.Sprintf("backend-%d", i), func(t *testing.T) {
+			initTest(t, be, i, false)
+			registry := task.NewTaskRegistry()
+			require.NoError(t, registry.AddOrchestratorN("SkipChild", func(ctx *task.OrchestrationContext) (any, error) {
+				if err := ctx.CreateTimer(time.Hour).Await(nil); err != nil {
+					return nil, err
+				}
+				return nil, nil
+			}))
+			require.NoError(t, registry.AddOrchestratorN("SkipParent", func(ctx *task.OrchestrationContext) (any, error) {
+				return nil, ctx.CallSubOrchestrator(
+					"SkipChild",
+					task.WithSubOrchestrationInstanceID("skip-child"),
+				).Await(nil)
+			}))
+			executor := task.NewTaskExecutor(registry)
+			worker := backend.NewTaskHubWorker(
+				be,
+				backend.NewOrchestrationWorker(be, executor, logger),
+				backend.NewActivityTaskWorker(be, executor, logger),
+				logger,
+			)
+			testCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			require.NoError(t, worker.Start(testCtx))
+			t.Cleanup(func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				require.NoError(t, worker.Shutdown(shutdownCtx))
+			})
+			client := backend.NewTaskHubManagementClient(be)
+			parentID, err := client.ScheduleNewOrchestration(
+				testCtx,
+				"SkipParent",
+				api.WithInstanceID("skip-parent"),
+			)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				metadata, fetchErr := client.FetchOrchestrationMetadata(testCtx, "skip-child")
+				return fetchErr == nil && metadata.RuntimeStatus == api.RUNTIME_STATUS_RUNNING
+			}, 5*time.Second, 10*time.Millisecond)
+
+			unterminated, err := client.SkipGracefulOrchestrationTerminations(
+				testCtx,
+				[]api.InstanceID{"skip-child"},
+				"unsafe",
+			)
+			require.NoError(t, err)
+			require.Equal(t, []api.InstanceID{"skip-child"}, unterminated)
+			require.NoError(t, client.TerminateOrchestration(testCtx, parentID))
+			_, err = client.WaitForOrchestrationCompletion(testCtx, parentID)
+			require.NoError(t, err)
+		})
+	}
 }
 
 func metadataIDs(metadata []*api.OrchestrationMetadata) []api.InstanceID {

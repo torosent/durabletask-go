@@ -19,7 +19,11 @@ func TestTaskHubGrpcManagementOverBufconn(t *testing.T) {
 	listener := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	be := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), backend.DefaultLogger())
-	executor, register := backend.NewGrpcExecutor(be, backend.DefaultLogger())
+	executor, register := backend.NewGrpcExecutor(
+		be,
+		backend.DefaultLogger(),
+		backend.WithTaskHubLifecycleManagement(),
+	)
 	register(grpcServer)
 	go func() {
 		_ = grpcServer.Serve(listener)

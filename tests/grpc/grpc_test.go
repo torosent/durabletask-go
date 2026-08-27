@@ -40,8 +40,12 @@ func TestMain(m *testing.M) {
 	registerFn(grpcServer)
 	orchestrationWorker := backend.NewOrchestrationWorker(be, grpcExecutor, logger)
 	activityWorker := backend.NewActivityTaskWorker(be, grpcExecutor, logger)
+	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
+	if !ok {
+		log.Fatal("sqlite backend does not support durable entities")
+	}
 	entityWorker := backend.NewEntityWorker(
-		be.(backend.EntityBackend),
+		entityBackend,
 		grpcExecutor.(backend.EntityExecutor),
 		logger,
 	)
