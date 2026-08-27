@@ -75,9 +75,13 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
 	taskExecutorOptions         []task.TaskExecutorOption
+	versioning                  *task.VersioningOptions
 	capabilities                []WorkerCapability
 	workItemFilters             *WorkItemFilters
+	workItemFiltersConfigured   bool
+	autoWorkItemFilters         bool
 	largePayloads               *api.LargePayloadOptions
+	converter                   api.DataConverter
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -194,6 +198,18 @@ func WithTaskExecutorOptions(options ...task.TaskExecutorOption) TaskHubGrpcWork
 	}
 }
 
+// WithTaskVersioning configures worker version acceptance and the default
+// version used for sub-orchestrations.
+func WithTaskVersioning(versioning task.VersioningOptions) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if err := versioning.Validate(); err != nil {
+			return err
+		}
+		options.versioning = &versioning
+		return nil
+	}
+}
+
 // WithWorkerCapabilities explicitly configures the capabilities advertised to the sidecar.
 func WithWorkerCapabilities(capabilities ...WorkerCapability) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
@@ -228,6 +244,7 @@ func WithScheduledTaskCapability(enabled bool) TaskHubGrpcWorkerOption {
 // A nil per-kind list means no restriction for that kind. RejectAll* explicitly rejects a kind.
 func WithWorkItemFilters(filters *WorkItemFilters) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
+		options.workItemFiltersConfigured = true
 		if filters == nil {
 			options.workItemFilters = nil
 			return nil
@@ -237,6 +254,15 @@ func WithWorkItemFilters(filters *WorkItemFilters) TaskHubGrpcWorkerOption {
 			return err
 		}
 		options.workItemFilters = clone
+		return nil
+	}
+}
+
+// WithAutoWorkItemFilters derives task-name and task-version filters from the registry.
+// Explicit [WithWorkItemFilters] configuration takes precedence.
+func WithAutoWorkItemFilters() TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		options.autoWorkItemFilters = true
 		return nil
 	}
 }
@@ -254,6 +280,14 @@ func WithWorkerLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcWorker
 			WorkerCapabilityLargePayloads,
 			normalized != nil,
 		)
+		return nil
+	}
+}
+
+// WithWorkerDataConverter configures application payload serialization.
+func WithWorkerDataConverter(converter api.DataConverter) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		options.converter = api.NormalizeDataConverter(converter)
 		return nil
 	}
 }
@@ -380,12 +414,198 @@ func newTaskHubGrpcWorker(
 	if options.largePayloads != nil {
 		options.capabilities = setWorkerCapability(options.capabilities, WorkerCapabilityLargePayloads, true)
 	}
+	snapshot := registry.Snapshot()
+	if options.workItemFiltersConfigured && options.workItemFilters != nil {
+		if err := validateWorkItemFilters(options.workItemFilters, snapshot); err != nil {
+			return nil, err
+		}
+	}
+	if options.autoWorkItemFilters && !options.workItemFiltersConfigured {
+		if err := validateStrictAutoFilters(snapshot, options.versioning); err != nil {
+			return nil, err
+		}
+		options.workItemFilters = workItemFiltersFromRegistry(snapshot, options.versioning)
+	}
 	return &TaskHubGrpcWorker{
 		clientFactory: factory,
-		executor:      task.NewTaskExecutor(registry, options.taskExecutorOptions...),
+		executor:      task.NewTaskExecutor(registry, options.executorOptions()...),
 		logger:        logger,
 		options:       options,
 	}, nil
+}
+
+// executorOptions returns the canonical executor configuration. Dedicated
+// worker options are appended last so they consistently override generic ones.
+func (options taskHubGrpcWorkerOptions) executorOptions() []task.TaskExecutorOption {
+	executorOptions := slices.Clone(options.taskExecutorOptions)
+	if options.versioning != nil {
+		executorOptions = append(executorOptions, task.WithVersioning(*options.versioning))
+	}
+	if options.converter != nil {
+		executorOptions = append(executorOptions, task.WithDataConverter(options.converter))
+	}
+	return executorOptions
+}
+
+func workItemFiltersFromRegistry(
+	snapshot task.TaskRegistrySnapshot,
+	versioning *task.VersioningOptions,
+) *WorkItemFilters {
+	entities := slices.Clone(snapshot.Entities)
+	if slices.Contains(entities, "*") {
+		entities = nil
+	}
+	return &WorkItemFilters{
+		Orchestrations:          taskRegistrationsToFilters(snapshot.Orchestrators, versioning),
+		Activities:              taskRegistrationsToFilters(snapshot.Activities, versioning),
+		Entities:                entities,
+		RejectAllOrchestrations: len(snapshot.Orchestrators) == 0,
+		RejectAllActivities:     len(snapshot.Activities) == 0,
+		RejectAllEntities:       len(snapshot.Entities) == 0,
+	}
+}
+
+func validateStrictAutoFilters(
+	snapshot task.TaskRegistrySnapshot,
+	versioning *task.VersioningOptions,
+) error {
+	if versioning == nil || versioning.MatchStrategy != task.VersionMatchStrict {
+		return nil
+	}
+	if err := validateStrictRegistrations("orchestrator", snapshot.Orchestrators, versioning.Version); err != nil {
+		return err
+	}
+	return validateStrictRegistrations("activity", snapshot.Activities, versioning.Version)
+}
+
+func validateStrictRegistrations(
+	kind string,
+	registrations []task.TaskRegistration,
+	version string,
+) error {
+	type versions struct {
+		hasUnversioned bool
+		versioned      map[string]struct{}
+	}
+	byName := make(map[string]*versions)
+	for _, registration := range registrations {
+		name := strings.ToLower(registration.Name)
+		group := byName[name]
+		if group == nil {
+			group = &versions{versioned: make(map[string]struct{})}
+			byName[name] = group
+		}
+		if registration.Version == "" {
+			group.hasUnversioned = true
+		} else {
+			group.versioned[strings.ToLower(registration.Version)] = struct{}{}
+		}
+	}
+	for name, group := range byName {
+		if len(group.versioned) == 0 && group.hasUnversioned {
+			continue
+		}
+		if _, ok := group.versioned[strings.ToLower(version)]; !ok {
+			return fmt.Errorf("%s %q has no registration for strict worker version %q", kind, name, version)
+		}
+	}
+	return nil
+}
+
+func validateWorkItemFilters(filters *WorkItemFilters, snapshot task.TaskRegistrySnapshot) error {
+	if err := validateTaskFilterNames("orchestration", filters.Orchestrations, snapshot.Orchestrators); err != nil {
+		return err
+	}
+	if err := validateTaskFilterNames("activity", filters.Activities, snapshot.Activities); err != nil {
+		return err
+	}
+	if len(snapshot.Entities) == 0 || slices.Contains(snapshot.Entities, "*") {
+		return nil
+	}
+	entityNames := make(map[string]struct{}, len(snapshot.Entities))
+	for _, name := range snapshot.Entities {
+		entityNames[strings.ToLower(name)] = struct{}{}
+	}
+	for _, name := range filters.Entities {
+		if _, ok := entityNames[strings.ToLower(name)]; !ok {
+			return fmt.Errorf("entity work-item filter %q is not registered", name)
+		}
+	}
+	return nil
+}
+
+func validateTaskFilterNames(
+	kind string,
+	filters []WorkItemFilter,
+	registrations []task.TaskRegistration,
+) error {
+	if len(registrations) == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, len(registrations))
+	for _, registration := range registrations {
+		if registration.Name == "*" {
+			return nil
+		}
+		names[strings.ToLower(registration.Name)] = struct{}{}
+	}
+	for _, filter := range filters {
+		if _, ok := names[strings.ToLower(filter.Name)]; !ok {
+			return fmt.Errorf("%s work-item filter %q is not registered", kind, filter.Name)
+		}
+	}
+	return nil
+}
+
+func taskRegistrationsToFilters(
+	registrations []task.TaskRegistration,
+	versioning *task.VersioningOptions,
+) []WorkItemFilter {
+	type filterGroup struct {
+		name     string
+		versions map[string]string
+	}
+	groups := make(map[string]*filterGroup)
+	for _, registration := range registrations {
+		if registration.Name == "*" {
+			return nil
+		}
+		normalizedName := strings.ToLower(registration.Name)
+		group := groups[normalizedName]
+		if group == nil {
+			group = &filterGroup{name: registration.Name, versions: make(map[string]string)}
+			groups[normalizedName] = group
+		}
+		group.versions[strings.ToLower(registration.Version)] = registration.Version
+	}
+	filters := make([]WorkItemFilter, 0, len(groups))
+	for _, group := range groups {
+		if versioning != nil && versioning.MatchStrategy == task.VersionMatchStrict {
+			filters = append(filters, WorkItemFilter{
+				Name:     group.name,
+				Versions: []string{versioning.Version},
+			})
+			continue
+		}
+		versions := make([]string, 0, len(group.versions))
+		_, hasUnversioned := group.versions[""]
+		for normalized, version := range group.versions {
+			if normalized != "" {
+				versions = append(versions, version)
+			}
+		}
+		slices.SortFunc(versions, func(left, right string) int {
+			return strings.Compare(strings.ToLower(left), strings.ToLower(right))
+		})
+		if hasUnversioned && len(versions) > 0 {
+			versions = append([]string{""}, versions...)
+		}
+		filters = append(filters, WorkItemFilter{Name: group.name, Versions: versions})
+	}
+	slices.SortFunc(filters, func(left, right WorkItemFilter) int {
+		return strings.Compare(strings.ToLower(left.Name), strings.ToLower(right.Name))
+	})
+	return filters
 }
 
 // Start connects to the service, performs the Hello handshake, and starts the

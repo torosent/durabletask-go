@@ -15,7 +15,7 @@ var (
 )
 
 // NewEntityFor creates an entity function that dispatches operations to methods
-// on a JSON-serializable state struct of type S.
+// on a converter-serializable state struct of type S.
 //
 // Supported method parameters are an optional *EntityContext, an optional
 // api.EntityID, and at most one operation input value, in any order. Supported

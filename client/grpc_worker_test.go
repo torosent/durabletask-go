@@ -324,6 +324,101 @@ func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
 	require.Equal(t, helpers.RejectAllWorkItemFilterName, wire.Entities[0].Name)
 }
 
+func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("legacy", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("mixed", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorNVersion("mixed", "v2", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddActivityNVersion("activity", "V1", func(task.ActivityContext) (any, error) {
+		return nil, nil
+	}))
+
+	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil)
+	require.Equal(t, []WorkItemFilter{
+		{Name: "legacy", Versions: []string{}},
+		{Name: "mixed", Versions: []string{"", "v2"}},
+	}, filters.Orchestrations)
+	require.Equal(t, []WorkItemFilter{{Name: "activity", Versions: []string{"V1"}}}, filters.Activities)
+
+	strict := workItemFiltersFromRegistry(registry.Snapshot(), &task.VersioningOptions{
+		Version:       "v3",
+		MatchStrategy: task.VersionMatchStrict,
+	})
+	require.Equal(t, []string{"v3"}, strict.Orchestrations[0].Versions)
+	require.Equal(t, []string{"v3"}, strict.Activities[0].Versions)
+	require.Error(t, validateStrictAutoFilters(registry.Snapshot(), &task.VersioningOptions{
+		Version:       "v3",
+		MatchStrategy: task.VersionMatchStrict,
+	}))
+	require.True(t, filters.RejectAllEntities)
+}
+
+func TestWorkerVersioningOptionOverridesGenericExecutorVersioning(t *testing.T) {
+	worker := newFakeWorker(
+		t,
+		&fakeSidecarClient{},
+		WithTaskVersioning(task.VersioningOptions{
+			Version:         "1.0",
+			MatchStrategy:   task.VersionMatchStrict,
+			FailureStrategy: task.VersionFailureReject,
+		}),
+		WithTaskExecutorOptions(task.WithVersioning(task.VersioningOptions{
+			Version:         "2.0",
+			MatchStrategy:   task.VersionMatchStrict,
+			FailureStrategy: task.VersionFailureReject,
+		})),
+	)
+
+	accepted, err := worker.executor.ExecuteActivity(
+		context.Background(),
+		"instance",
+		helpers.NewTaskScheduledEvent(1, "activity", wrapperspb.String("1.0"), nil, nil),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, accepted.GetTaskFailed(), "v1 should pass version acceptance and reach registry dispatch")
+
+	_, err = worker.executor.ExecuteActivity(
+		context.Background(),
+		"instance",
+		helpers.NewTaskScheduledEvent(1, "activity", wrapperspb.String("2.0"), nil, nil),
+	)
+	var mismatch *task.VersionMismatchError
+	require.ErrorAs(t, err, &mismatch)
+	require.Equal(t, "1.0", mismatch.WorkerVersion)
+}
+
+func TestExplicitWorkItemFiltersValidateRegisteredNames(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("known", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	err := validateWorkItemFilters(
+		&WorkItemFilters{Orchestrations: []WorkItemFilter{{Name: "unknown"}}},
+		registry.Snapshot(),
+	)
+	require.ErrorContains(t, err, "not registered")
+}
+
+func TestStrictAutoFiltersValidateNamedRegistrationsWithWildcard(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorNVersion("known", "v1", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("*", func(*task.OrchestrationContext) (any, error) {
+		return nil, nil
+	}))
+	require.Error(t, validateStrictAutoFilters(registry.Snapshot(), &task.VersioningOptions{
+		Version:       "v2",
+		MatchStrategy: task.VersionMatchStrict,
+	}))
+}
+
 func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
 	client := &fakeSidecarClient{stream: stream}
@@ -742,12 +837,14 @@ func TestTaskHubGrpcWorkerRejectsMismatchedTaskVersion(t *testing.T) {
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	startedAt := time.Now()
 	require.NoError(t, worker.Start(ctx))
 	require.Eventually(t, func() bool {
 		client.mu.Lock()
 		defer client.mu.Unlock()
 		return client.activityAbandons == 1
-	}, time.Second, time.Millisecond)
+	}, 2*time.Second, time.Millisecond)
+	require.GreaterOrEqual(t, time.Since(startedAt), 900*time.Millisecond)
 	client.mu.Lock()
 	require.Empty(t, client.activityCompletions)
 	client.mu.Unlock()

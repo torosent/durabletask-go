@@ -2,7 +2,6 @@ package task
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -28,6 +27,7 @@ type taskExecutor struct {
 	metrics              backend.MetricsHooks
 	contextFields        api.ContextFields
 	errorProperties      api.ErrorPropertiesProvider
+	converter            api.DataConverter
 }
 
 // TaskExecutorOption configures the in-memory task executor.
@@ -54,6 +54,13 @@ func WithVersioning(options VersioningOptions) TaskExecutorOption {
 func WithErrorPropertiesProvider(provider api.ErrorPropertiesProvider) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.errorProperties = provider
+	}
+}
+
+// WithDataConverter configures application payload serialization.
+func WithDataConverter(converter api.DataConverter) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		executor.converter = api.NormalizeDataConverter(converter)
 	}
 }
 
@@ -98,8 +105,9 @@ func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 // NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
 func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
 	executor := &taskExecutor{
-		Registry: registry,
-		logger:   slog.Default(),
+		Registry:  registry,
+		logger:    slog.Default(),
+		converter: api.DefaultDataConverter(),
 	}
 	for _, configure := range opts {
 		configure(executor)
@@ -147,20 +155,16 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		TaskID:     e.EventId,
 	})
 	ctx = withActivityLogger(ctx, te.logger)
-	invoker, ok := te.Registry.activities[ts.Name]
+	invoker, ok := te.Registry.getActivity(ts.Name, ts.GetVersion().GetValue())
 	if !ok {
-		// try the wildcard match
-		invoker, ok = te.Registry.activities["*"]
-		if !ok {
-			notFound := newTaskNotRegisteredError(
-				activityTaskNotFoundErrorType,
-				ts.Name,
-				ts.GetVersion().GetValue(),
-			)
-			return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(notFound, te.errorProperties)), nil
-		}
+		notFound := newTaskNotRegisteredError(
+			activityTaskNotFoundErrorType,
+			ts.Name,
+			ts.GetVersion().GetValue(),
+		)
+		return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(notFound, nil)), nil
 	}
-	activityCtx := newTaskActivityContext(ctx, e.EventId, ts)
+	activityCtx := newTaskActivityContext(ctx, e.EventId, ts, te.converter)
 
 	// convert panics into activity failures
 	defer func() {
@@ -181,7 +185,7 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(err, te.errorProperties)), nil
 	}
 
-	bytes, err := marshalData(result)
+	bytes, err := marshalData(te.converter, result)
 	if err != nil {
 		return helpers.NewTaskFailedEvent(e.EventId, failure.FromError(err, te.errorProperties)), nil
 	}
@@ -217,9 +221,7 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 	}
 	name := started.GetName()
 	if te.orchestratorNotFound == OrchestratorNotFoundReject && name != "" {
-		_, registered := te.Registry.orchestrators[name]
-		_, wildcard := te.Registry.orchestrators["*"]
-		if !registered && !wildcard {
+		if !te.Registry.hasOrchestrator(name, version) {
 			return nil, newTaskNotRegisteredError(
 				orchestratorTaskNotFoundErrorType,
 				name,
@@ -238,6 +240,8 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		te.metrics,
 		te.contextFields,
 		te.errorProperties,
+		te.versioning.defaultVersion(),
+		te.converter,
 	)
 	actions := orchestrationCtx.start()
 	te.reportHistoryMetric(orchestrationCtx)
@@ -261,10 +265,7 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 	if err != nil {
 		return nil, fmt.Errorf("invalid entity instance ID: %w", err)
 	}
-	invoker, ok := te.Registry.entities[entityID.Name]
-	if !ok {
-		invoker, ok = te.Registry.entities["*"]
-	}
+	invoker, ok := te.Registry.getEntity(entityID.Name)
 	if !ok {
 		result := &protos.EntityBatchResult{
 			EntityState: req.EntityState,
@@ -319,7 +320,7 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 
 		var rawResult *wrapperspb.StringValue
 		if operationErr == nil && output != nil {
-			bytes, marshalErr := marshalData(output)
+			bytes, marshalErr := marshalData(te.converter, output)
 			if marshalErr != nil {
 				operationErr = fmt.Errorf("failed to marshal entity result: %w", marshalErr)
 			} else if len(bytes) > 0 {
@@ -394,6 +395,7 @@ func (te *taskExecutor) newEntityContext(
 		currentTime: currentTime,
 		ctx:         ctx,
 		logger:      logger,
+		converter:   te.converter,
 	}
 }
 
@@ -469,20 +471,20 @@ func (te taskExecutor) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func unmarshalData(data []byte, v any) error {
-	switch {
-	case v == nil:
+func unmarshalData(converter api.DataConverter, data []byte, v any) error {
+	if v == nil || len(data) == 0 {
 		return nil
-	case len(data) == 0:
-		return nil
-	default:
-		return json.Unmarshal(data, v)
 	}
+	return api.NormalizeDataConverter(converter).Deserialize(string(data), v)
 }
 
-func marshalData(v any) ([]byte, error) {
+func marshalData(converter api.DataConverter, v any) ([]byte, error) {
 	if v == nil {
 		return nil, nil
 	}
-	return json.Marshal(v)
+	payload, err := api.SerializeData(converter, v)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(payload), nil
 }

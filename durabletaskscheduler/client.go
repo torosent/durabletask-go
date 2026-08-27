@@ -42,13 +42,16 @@ func NewClient(ctx context.Context, options *Options, logger backend.Logger) (*C
 		_ = connection.Close()
 		return nil, fmt.Errorf("DTS client Hello failed: %w", err)
 	}
+	clientOptions := []durabletaskclient.TaskHubGrpcClientOption{
+		durabletaskclient.WithLargePayloads(prepared.LargePayloads),
+		durabletaskclient.WithDataConverter(prepared.DataConverter),
+	}
+	if prepared.Versioning != nil && prepared.Versioning.DefaultVersion != "" {
+		clientOptions = append(clientOptions, durabletaskclient.WithDefaultVersion(prepared.Versioning.DefaultVersion))
+	}
 	return &Client{
-		TaskHubGrpcClient: durabletaskclient.NewTaskHubGrpcClient(
-			connection,
-			logger,
-			durabletaskclient.WithLargePayloads(prepared.LargePayloads),
-		),
-		connection: connection,
+		TaskHubGrpcClient: durabletaskclient.NewTaskHubGrpcClient(connection, logger, clientOptions...),
+		connection:        connection,
 	}, nil
 }
 

@@ -10,7 +10,7 @@ func TestWithContextFieldsRejectsReservedKeys(t *testing.T) {
 	option := WithContextFields(ContextFields{
 		ReservedContextFieldPrefix + "orchestration_version": "spoofed",
 	})
-	if err := option(new(protos.CreateInstanceRequest)); err == nil {
+	if err := option(new(protos.CreateInstanceRequest), DefaultDataConverter()); err == nil {
 		t.Fatal("expected reserved context field to be rejected")
 	}
 }

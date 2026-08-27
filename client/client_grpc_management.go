@@ -61,7 +61,7 @@ func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.Orches
 			if err := largepayload.TransformOrchestrationState(ctx, c.largePayloads, state); err != nil {
 				return nil, fmt.Errorf("failed to hydrate orchestration query result: %w", err)
 			}
-			metadata, err := orchestrationMetadataFromState(state)
+			metadata, err := orchestrationMetadataFromState(state, c.converter)
 			if err != nil {
 				return nil, err
 			}

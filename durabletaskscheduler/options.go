@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/task"
 )
 
 const DefaultResourceID = "https://durabletask.io"
@@ -57,6 +58,13 @@ type Options struct {
 
 	// LargePayloads enables external payload references for clients and workers.
 	LargePayloads *api.LargePayloadOptions
+
+	// Versioning configures worker version acceptance and the default version
+	// applied by both the client and worker.
+	Versioning *task.VersioningOptions
+
+	// DataConverter configures application payload serialization for both clients and workers.
+	DataConverter api.DataConverter
 
 	dialer func(context.Context, string) (net.Conn, error)
 }
@@ -190,6 +198,11 @@ func (o *Options) Validate() error {
 	}
 	if _, err := api.NormalizeLargePayloadOptions(o.LargePayloads); err != nil {
 		return fmt.Errorf("invalid DTS large payload options: %w", err)
+	}
+	if o.Versioning != nil {
+		if err := o.Versioning.Validate(); err != nil {
+			return fmt.Errorf("invalid DTS versioning options: %w", err)
+		}
 	}
 
 	endpoint, err := normalizeEndpoint(o.EndpointAddress)

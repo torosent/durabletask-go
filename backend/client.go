@@ -16,6 +16,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type TaskHubClient interface {
@@ -52,28 +53,55 @@ type TaskHubManagementClient interface {
 }
 
 type backendClient struct {
-	be Backend
+	be             Backend
+	defaultVersion string
+	converter      api.DataConverter
 }
 
-func NewTaskHubClient(be Backend) TaskHubClient {
-	return &backendClient{
-		be: be,
+// TaskHubClientOption configures an embedded task hub client.
+type TaskHubClientOption func(*backendClient)
+
+// WithDefaultVersion configures the version used when a top-level orchestration
+// is scheduled without an explicit [api.WithVersion] option.
+func WithDefaultVersion(version string) TaskHubClientOption {
+	return func(client *backendClient) {
+		client.defaultVersion = version
 	}
 }
 
-func NewTaskHubManagementClient(be Backend) TaskHubManagementClient {
-	return &backendClient{
-		be: be,
+// WithDataConverter configures application payload serialization.
+func WithDataConverter(converter api.DataConverter) TaskHubClientOption {
+	return func(client *backendClient) {
+		client.converter = api.NormalizeDataConverter(converter)
 	}
+}
+
+func NewTaskHubClient(be Backend, opts ...TaskHubClientOption) TaskHubClient {
+	return newBackendClient(be, opts)
+}
+
+func NewTaskHubManagementClient(be Backend, opts ...TaskHubClientOption) TaskHubManagementClient {
+	return newBackendClient(be, opts)
+}
+
+func newBackendClient(be Backend, opts []TaskHubClientOption) *backendClient {
+	client := &backendClient{be: be, converter: api.DefaultDataConverter()}
+	for _, configure := range opts {
+		configure(client)
+	}
+	return client
 }
 
 func (c *backendClient) ScheduleNewOrchestration(ctx context.Context, orchestrator any, opts ...api.NewOrchestrationOptions) (api.InstanceID, error) {
 	name := helpers.GetTaskFunctionName(orchestrator)
 	req := &protos.CreateInstanceRequest{Name: name}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return api.EmptyInstanceID, fmt.Errorf("failed to configure create instance request: %w", err)
 		}
+	}
+	if req.Version == nil && c.defaultVersion != "" {
+		req.Version = wrapperspb.String(c.defaultVersion)
 	}
 	if req.InstanceId == "" {
 		u, err := uuid.NewV7()
@@ -109,6 +137,9 @@ func (c *backendClient) FetchOrchestrationMetadata(ctx context.Context, id api.I
 	metadata, err := c.be.GetOrchestrationMetadata(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch orchestration metadata: %w", err)
+	}
+	if metadata != nil {
+		metadata.Converter = c.converter
 	}
 	return metadata, nil
 }
@@ -170,7 +201,7 @@ func (c *backendClient) waitForOrchestrationCondition(ctx context.Context, id ap
 func (c *backendClient) TerminateOrchestration(ctx context.Context, id api.InstanceID, opts ...api.TerminateOptions) error {
 	req := &protos.TerminateRequest{InstanceId: string(id), Recursive: true}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure termination request: %w", err)
 		}
 	}
@@ -192,7 +223,7 @@ func (c *backendClient) TerminateOrchestration(ctx context.Context, id api.Insta
 func (c *backendClient) RaiseEvent(ctx context.Context, id api.InstanceID, eventName string, opts ...api.RaiseEventOptions) error {
 	req := &protos.RaiseEventRequest{InstanceId: string(id), Name: eventName}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure raise event request: %w", err)
 		}
 	}
@@ -256,7 +287,7 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 		RequestTime: timestamppb.Now(),
 	}
 	for _, configure := range opts {
-		if err := configure(req); err != nil {
+		if err := configure(req, c.converter); err != nil {
 			return fmt.Errorf("failed to configure signal entity request: %w", err)
 		}
 	}
@@ -270,7 +301,14 @@ func (c *backendClient) SignalEntity(ctx context.Context, entityID api.EntityID,
 }
 
 func (c *backendClient) QueryInstances(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
-	return queryOrchestrations(ctx, c.be, query)
+	result, err := queryOrchestrations(ctx, c.be, query)
+	if err != nil {
+		return nil, err
+	}
+	for _, metadata := range result.Orchestrations {
+		metadata.Converter = c.converter
+	}
+	return result, nil
 }
 
 func (c *backendClient) ListInstanceIDs(ctx context.Context, query api.InstanceIDQuery) (*api.InstanceIDQueryResult, error) {
@@ -411,7 +449,11 @@ func (c *backendClient) FetchEntityMetadata(ctx context.Context, entityID api.En
 		return nil, err
 	}
 	if entityBackend, ok := GetBackendCapability[EntityQueryBackend](c.be); ok {
-		return entityBackend.GetEntityMetadata(ctx, entityID, includeState)
+		metadata, err := entityBackend.GetEntityMetadata(ctx, entityID, includeState)
+		if metadata != nil {
+			metadata.Converter = c.converter
+		}
+		return metadata, err
 	}
 	return nil, api.ErrFeatureNotSupported
 }
@@ -422,7 +464,14 @@ func (c *backendClient) QueryEntities(ctx context.Context, query api.EntityQuery
 	if !ok {
 		return nil, api.ErrFeatureNotSupported
 	}
-	return entityBackend.QueryEntities(ctx, query)
+	result, err := entityBackend.QueryEntities(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	for _, metadata := range result.Entities {
+		metadata.Converter = c.converter
+	}
+	return result, nil
 }
 
 // CleanEntityStorage removes empty entities and releases orphaned locks.
