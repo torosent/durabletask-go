@@ -286,6 +286,16 @@ Run tests with the following command.
 go test ./tests/... -coverpkg ./api,./task,./client,./backend/...,./internal/helpers
 ```
 
+### Checking orchestrator goroutines
+
+Orchestrators must use `ctx.Go` instead of raw `go` statements so execution
+remains deterministic. Build and run the vet-compatible analyzer with:
+
+```bash
+go build -o /tmp/orchestratorvet ./cmd/orchestratorvet
+go vet -vettool=/tmp/orchestratorvet ./...
+```
+
 ## Running integration tests
 
 You can run pre-built container images to run full integration tests against the durable task host over gRPC.
