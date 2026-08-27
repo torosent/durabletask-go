@@ -8,11 +8,14 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
 
@@ -269,6 +272,141 @@ func (c *TaskHubGrpcClient) PurgeOrchestrationState(ctx context.Context, id api.
 		return api.ErrInstanceNotFound
 	}
 	return nil
+}
+
+// SignalEntity sends a fire-and-forget operation to an entity.
+func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.EntityID, operationName string, opts ...api.SignalEntityOptions) error {
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return err
+	}
+	if operationName == "" {
+		return fmt.Errorf("entity operation name must not be empty")
+	}
+	req := &protos.SignalEntityRequest{
+		InstanceId:         entityID.String(),
+		Name:               operationName,
+		RequestId:          uuid.NewString(),
+		RequestTime:        timestamppb.Now(),
+		ParentTraceContext: helpers.TraceContextFromSpan(trace.SpanFromContext(ctx)),
+	}
+	for _, configure := range opts {
+		if err := configure(req); err != nil {
+			return fmt.Errorf("failed to configure signal entity request: %w", err)
+		}
+	}
+	if _, err := c.client.SignalEntity(ctx, req); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("failed to signal entity: %w", err)
+	}
+	return nil
+}
+
+// FetchEntityMetadata retrieves metadata for an entity instance.
+func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return nil, err
+	}
+	response, err := c.client.GetEntity(ctx, &protos.GetEntityRequest{
+		InstanceId:   entityID.String(),
+		IncludeState: includeState,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("failed to get entity metadata: %w", err)
+	}
+	if !response.Exists || response.Entity == nil {
+		return nil, nil
+	}
+	return entityMetadataFromProto(response.Entity)
+}
+
+// QueryEntities queries entities matching the supplied filters.
+func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
+	protoQuery := &protos.EntityQuery{
+		IncludeState:     query.IncludeState,
+		IncludeTransient: query.IncludeTransient,
+	}
+	if query.InstanceIDStartsWith != "" {
+		protoQuery.InstanceIdStartsWith = wrapperspb.String(query.InstanceIDStartsWith)
+	}
+	if !query.LastModifiedFrom.IsZero() {
+		protoQuery.LastModifiedFrom = timestamppb.New(query.LastModifiedFrom)
+	}
+	if !query.LastModifiedTo.IsZero() {
+		protoQuery.LastModifiedTo = timestamppb.New(query.LastModifiedTo)
+	}
+	if query.PageSize > 0 {
+		protoQuery.PageSize = wrapperspb.Int32(query.PageSize)
+	}
+	if query.ContinuationToken != "" {
+		protoQuery.ContinuationToken = wrapperspb.String(query.ContinuationToken)
+	}
+	response, err := c.client.QueryEntities(ctx, &protos.QueryEntitiesRequest{Query: protoQuery})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("failed to query entities: %w", err)
+	}
+	result := &api.EntityQueryResults{
+		Entities:          make([]*api.EntityMetadata, 0, len(response.Entities)),
+		ContinuationToken: response.ContinuationToken.GetValue(),
+	}
+	for _, entity := range response.Entities {
+		metadata, err := entityMetadataFromProto(entity)
+		if err != nil {
+			return nil, err
+		}
+		result.Entities = append(result.Entities, metadata)
+	}
+	return result, nil
+}
+
+// CleanEntityStorage removes empty entities and releases orphaned locks.
+func (c *TaskHubGrpcClient) CleanEntityStorage(ctx context.Context, request api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
+	protoRequest := &protos.CleanEntityStorageRequest{
+		RemoveEmptyEntities:  request.RemoveEmptyEntities,
+		ReleaseOrphanedLocks: request.ReleaseOrphanedLocks,
+	}
+	if request.ContinuationToken != "" {
+		protoRequest.ContinuationToken = wrapperspb.String(request.ContinuationToken)
+	}
+	response, err := c.client.CleanEntityStorage(ctx, protoRequest)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("failed to clean entity storage: %w", err)
+	}
+	return &api.CleanEntityStorageResult{
+		ContinuationToken:     response.ContinuationToken.GetValue(),
+		EmptyEntitiesRemoved:  response.EmptyEntitiesRemoved,
+		OrphanedLocksReleased: response.OrphanedLocksReleased,
+	}, nil
+}
+
+func entityMetadataFromProto(entity *protos.EntityMetadata) (*api.EntityMetadata, error) {
+	if entity == nil {
+		return nil, fmt.Errorf("entity metadata must not be nil")
+	}
+	entityID, err := api.EntityIDFromString(entity.InstanceId)
+	if err != nil {
+		return nil, fmt.Errorf("invalid entity metadata instance ID %q: %w", entity.InstanceId, err)
+	}
+	metadata := &api.EntityMetadata{
+		InstanceID:       entityID,
+		BacklogQueueSize: entity.BacklogQueueSize,
+		LockedBy:         entity.LockedBy.GetValue(),
+		SerializedState:  entity.SerializedState.GetValue(),
+	}
+	if entity.LastModifiedTime != nil {
+		metadata.LastModifiedTime = entity.LastModifiedTime.AsTime()
+	}
+	return metadata, nil
 }
 
 func makeGetInstanceRequest(id api.InstanceID, opts []api.FetchOrchestrationMetadataOptions) *protos.GetInstanceRequest {

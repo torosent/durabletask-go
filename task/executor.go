@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -207,6 +209,172 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		},
 	}
 	return results, nil
+}
+
+// ExecuteEntity executes an entity batch in the current goroutine.
+func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+	if req == nil {
+		return nil, fmt.Errorf("entity batch request must not be nil")
+	}
+	entityID, err := api.EntityIDFromString(req.InstanceId)
+	if err != nil {
+		return nil, fmt.Errorf("invalid entity instance ID: %w", err)
+	}
+	invoker, ok := te.Registry.entities[entityID.Name]
+	if !ok {
+		invoker, ok = te.Registry.entities["*"]
+	}
+	if !ok {
+		result := &protos.EntityBatchResult{
+			EntityState: req.EntityState,
+			Results:     make([]*protos.OperationResult, 0, len(req.Operations)),
+		}
+		for range req.Operations {
+			now := time.Now().UTC()
+			failure := entityOperationFailure(
+				"EntityTaskNotFound",
+				fmt.Sprintf("no entity named '%s' was registered", entityID.Name),
+				now,
+				now,
+			)
+			failure.GetFailure().FailureDetails.IsNonRetriable = true
+			result.Results = append(result.Results, failure)
+		}
+		return result, nil
+	}
+	if req.EntityState == nil {
+		if property, exists := req.Properties["entityStateIncluded"]; exists && !property.GetBoolValue() {
+			return &protos.EntityBatchResult{RequiresState: true}, nil
+		}
+	}
+
+	var state entityState
+	if req.EntityState != nil {
+		state = entityState{value: []byte(req.EntityState.Value), hasValue: true}
+	}
+	result := &protos.EntityBatchResult{
+		Results: make([]*protos.OperationResult, 0, len(req.Operations)),
+		Actions: make([]*protos.OperationAction, 0),
+	}
+	nextActionID := int32(0)
+	for _, operation := range req.Operations {
+		if operation == nil {
+			result.Results = append(result.Results, entityOperationFailure(
+				"InvalidEntityOperation",
+				"entity operation request must not be nil",
+				time.Now().UTC(),
+				time.Now().UTC(),
+			))
+			continue
+		}
+		startedAt := time.Now().UTC()
+		isSignal := req.Properties[helpers.EntitySignalProperty(operation.RequestId)].GetBoolValue()
+		operationCtx := te.newEntityContext(ctx, entityID, operation, state, nextActionID, startedAt, isSignal)
+		output, operationErr := invokeEntity(invoker, operationCtx)
+		endedAt := time.Now().UTC()
+
+		var rawResult *wrapperspb.StringValue
+		if operationErr == nil && output != nil {
+			bytes, marshalErr := marshalData(output)
+			if marshalErr != nil {
+				operationErr = fmt.Errorf("failed to marshal entity result: %w", marshalErr)
+			} else if len(bytes) > 0 {
+				rawResult = wrapperspb.String(string(bytes))
+			}
+		}
+
+		if operationErr != nil {
+			result.Results = append(result.Results, entityOperationFailure(
+				fmt.Sprintf("%T", operationErr),
+				fmt.Sprintf("%+v", operationErr),
+				startedAt,
+				endedAt,
+			))
+			continue
+		}
+
+		state = operationCtx.state
+		nextActionID = operationCtx.actionIDSeq
+		result.Actions = append(result.Actions, operationCtx.actions...)
+		result.Results = append(result.Results, &protos.OperationResult{
+			ResultType: &protos.OperationResult_Success{
+				Success: &protos.OperationResultSuccess{
+					Result:       rawResult,
+					StartTimeUtc: timestamppb.New(startedAt),
+					EndTimeUtc:   timestamppb.New(endedAt),
+				},
+			},
+		})
+	}
+
+	if state.hasValue {
+		result.EntityState = wrapperspb.String(string(state.value))
+	}
+	return result, nil
+}
+
+func (te *taskExecutor) newEntityContext(
+	ctx context.Context,
+	entityID api.EntityID,
+	operation *protos.OperationRequest,
+	state entityState,
+	nextActionID int32,
+	currentTime time.Time,
+	isSignal bool,
+) *EntityContext {
+	ctx = api.ContextWithFields(ctx, te.contextFields)
+	ctx = api.WithEntityContextInfo(ctx, api.EntityContextInfo{
+		EntityID:  entityID,
+		Operation: operation.Operation,
+		RequestID: operation.RequestId,
+		IsSignal:  isSignal,
+	})
+	logger := te.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With(
+		slog.String("durabletask.entity.id", entityID.String()),
+		slog.String("durabletask.entity.operation", operation.Operation),
+		slog.String("durabletask.entity.request_id", operation.RequestId),
+	)
+	ctx = context.WithValue(ctx, taskLoggerKey{}, logger)
+	return &EntityContext{
+		ID:          entityID,
+		Operation:   operation.Operation,
+		RequestID:   operation.RequestId,
+		IsSignal:    isSignal,
+		rawInput:    []byte(operation.Input.GetValue()),
+		state:       state,
+		actionIDSeq: nextActionID,
+		currentTime: currentTime,
+		ctx:         ctx,
+		logger:      logger,
+	}
+}
+
+func invokeEntity(invoker Entity, entityCtx *EntityContext) (result any, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("entity operation panic: %v", recovered)
+		}
+	}()
+	return invoker(entityCtx)
+}
+
+func entityOperationFailure(errorType, message string, startedAt, endedAt time.Time) *protos.OperationResult {
+	return &protos.OperationResult{
+		ResultType: &protos.OperationResult_Failure{
+			Failure: &protos.OperationResultFailure{
+				FailureDetails: &protos.TaskFailureDetails{
+					ErrorType:    errorType,
+					ErrorMessage: message,
+				},
+				StartTimeUtc: timestamppb.New(startedAt),
+				EndTimeUtc:   timestamppb.New(endedAt),
+			},
+		},
+	}
 }
 
 func (te *taskExecutor) reportHistoryMetric(ctx *OrchestrationContext) {

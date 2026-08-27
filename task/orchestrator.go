@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -43,6 +44,7 @@ type OrchestrationContext struct {
 	metrics                  backend.MetricsHooks
 	orchestrationOptions     OrchestrationOptions
 	parentInstanceID         api.InstanceID
+	executionID              string
 	registry                 *TaskRegistry
 	rawInput                 []byte
 	oldEvents                []*protos.HistoryEvent
@@ -57,8 +59,10 @@ type OrchestrationContext struct {
 	maxHistoryEventsExceeded bool
 	historyLimitExceeded     bool
 	sequenceNumber           int32
+	newGuidCounter           uint64
 	pendingActions           map[int32]*protos.OrchestratorAction
 	pendingTasks             map[int32]*completableTask
+	pendingEntityTasks       map[string]*completableTask
 	continuedAsNew           bool
 	continuedAsNewInput      any
 	customStatus             string
@@ -72,6 +76,11 @@ type OrchestrationContext struct {
 	eventChannels              map[string]any
 	eventWaiters               map[string]map[*coroutine]struct{}
 	saveBufferedExternalEvents bool
+
+	criticalSectionID        string
+	criticalSectionLocks     []string
+	criticalSectionAvailable map[string]bool
+	lockAcquisitionPending   bool
 }
 
 // callSubOrchestratorOptions is a struct that holds the options for the CallSubOrchestrator orchestrator method.
@@ -216,6 +225,7 @@ func (ctx *OrchestrationContext) syncDerivedContexts() {
 		derived.Version = ctx.Version
 		derived.IsReplaying = ctx.IsReplaying
 		derived.CurrentTimeUtc = ctx.CurrentTimeUtc
+		derived.executionID = ctx.executionID
 		derived.scheduler = ctx.scheduler
 		active = append(active, derived)
 	}
@@ -258,8 +268,14 @@ func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) 
 	ctx.historyIndex = 0
 	ctx.processedEventsThisTurn = 0
 	ctx.sequenceNumber = 0
+	ctx.newGuidCounter = 0
 	ctx.pendingActions = make(map[int32]*protos.OrchestratorAction)
 	ctx.pendingTasks = make(map[int32]*completableTask)
+	ctx.pendingEntityTasks = make(map[string]*completableTask)
+	ctx.criticalSectionID = ""
+	ctx.criticalSectionLocks = nil
+	ctx.criticalSectionAvailable = nil
+	ctx.lockAcquisitionPending = false
 	ctx.scheduler = newCoroutineScheduler(ctx)
 	defer func() {
 		ctx.scheduler.shutdown()
@@ -431,6 +447,20 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 		err = ctx.onTimerFired(tf)
 	} else if es := e.GetEventSent(); es != nil {
 		err = ctx.onEventSent(e.EventId, es)
+	} else if signaled := e.GetEntityOperationSignaled(); signaled != nil {
+		err = ctx.onEntityOperationSent(e.EventId, signaled.RequestId)
+	} else if called := e.GetEntityOperationCalled(); called != nil {
+		err = ctx.onEntityOperationSent(e.EventId, called.RequestId)
+	} else if completed := e.GetEntityOperationCompleted(); completed != nil {
+		err = ctx.onEntityOperationCompleted(completed)
+	} else if failed := e.GetEntityOperationFailed(); failed != nil {
+		err = ctx.onEntityOperationFailed(failed)
+	} else if requested := e.GetEntityLockRequested(); requested != nil {
+		err = ctx.onEntityLockRequested(e.EventId, requested)
+	} else if granted := e.GetEntityLockGranted(); granted != nil {
+		err = ctx.onEntityLockGranted(granted)
+	} else if unlocked := e.GetEntityUnlockSent(); unlocked != nil {
+		err = ctx.onEntityUnlockSent(e.EventId, unlocked)
 	} else if er := e.GetEventRaised(); er != nil {
 		err = ctx.onExternalEventRaised(e)
 	} else if es := e.GetExecutionSuspended(); es != nil {
@@ -449,6 +479,17 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 
 func (octx *OrchestrationContext) SetCustomStatus(cs string) {
 	octx.engineContext().customStatus = cs
+}
+
+var guidNamespace = uuid.MustParse("9e952958-5e33-4daf-827f-2fa12937b875")
+
+// NewGuid returns a deterministic UUID that is stable across orchestration replay.
+func (ctx *OrchestrationContext) NewGuid() string {
+	engine := ctx.engineContext()
+	timestamp := engine.CurrentTimeUtc.UTC().Format("2006-01-02T15:04:05.0000000Z")
+	name := fmt.Sprintf("%s_%s_%d", engine.ID, timestamp, engine.newGuidCounter)
+	engine.newGuidCounter++
+	return uuid.NewSHA1(guidNamespace, []byte(name)).String()
 }
 
 // GetInput unmarshals the serialized orchestration input and stores it in [v].
@@ -546,6 +587,9 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 
 func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...subOrchestratorOption) Task {
 	engine := ctx.engineContext()
+	if engine.criticalSectionID != "" {
+		return ctx.newFailedTask(engine, fmt.Errorf("sub-orchestrations cannot be started while holding entity locks"))
+	}
 	options := new(callSubOrchestratorOptions)
 	for _, configure := range opts {
 		if err := configure(options); err != nil {
@@ -756,6 +800,160 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 	return task
 }
 
+// CallEntity sends an operation request to an entity and waits for its response.
+func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName string, opts ...callEntityOption) Task {
+	engine := ctx.engineContext()
+	if engine.isTerminated || ctx.scope.isCanceled() {
+		return ctx.newFailedTask(engine, ErrTaskCanceled)
+	}
+	options := new(callEntityOptions)
+	for _, configure := range opts {
+		if err := configure(options); err != nil {
+			return ctx.newFailedTask(engine, err)
+		}
+	}
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return ctx.newFailedTask(engine, err)
+	}
+	if operationName == "" {
+		return ctx.newFailedTask(engine, fmt.Errorf("entity operation name must not be empty"))
+	}
+	entityKey := entityID.String()
+	if engine.criticalSectionID != "" {
+		available, locked := engine.criticalSectionAvailable[entityKey]
+		if !locked {
+			return ctx.newFailedTask(engine, fmt.Errorf("entity %s is not part of the current critical section", entityKey))
+		}
+		if !available {
+			return ctx.newFailedTask(engine, fmt.Errorf("entity %s already has an outstanding call in the current critical section", entityKey))
+		}
+		engine.criticalSectionAvailable[entityKey] = false
+	}
+
+	requestID := ctx.NewGuid()
+	action := helpers.NewEntityOperationCalledAction(
+		engine.getNextSequenceNumber(),
+		requestID,
+		entityKey,
+		string(engine.ID),
+		engine.executionID,
+		operationName,
+		options.rawInput,
+		nil,
+	)
+	engine.pendingActions[action.Id] = action
+	task := newTaskInScope(engine, ctx.scope)
+	engine.pendingEntityTasks[requestID] = task
+	if engine.criticalSectionID != "" {
+		task.onCompleted(func() {
+			engine.criticalSectionAvailable[entityKey] = true
+		})
+	}
+	return task
+}
+
+// SignalEntity sends a fire-and-forget entity operation.
+func (ctx *OrchestrationContext) SignalEntity(entityID api.EntityID, operationName string, opts ...signalEntityOption) error {
+	engine := ctx.engineContext()
+	if engine.isTerminated || ctx.scope.isCanceled() {
+		return ErrTaskCanceled
+	}
+	options := new(signalEntityOptions)
+	for _, configure := range opts {
+		if err := configure(options); err != nil {
+			return err
+		}
+	}
+	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+		return err
+	}
+	if operationName == "" {
+		return fmt.Errorf("entity operation name must not be empty")
+	}
+	entityKey := entityID.String()
+	if engine.criticalSectionID != "" && engine.criticalSectionAvailable != nil {
+		if _, locked := engine.criticalSectionAvailable[entityKey]; locked {
+			return fmt.Errorf("signals to locked entity %s are not allowed inside a critical section", entityKey)
+		}
+	}
+
+	action := helpers.NewEntityOperationSignaledAction(
+		engine.getNextSequenceNumber(),
+		ctx.NewGuid(),
+		entityKey,
+		operationName,
+		options.rawInput,
+		options.scheduledTime,
+	)
+	engine.pendingActions[action.Id] = action
+	return nil
+}
+
+// LockEntities acquires an ordered critical section over a set of entities.
+func (ctx *OrchestrationContext) LockEntities(entityIDs ...api.EntityID) (func(), error) {
+	engine := ctx.engineContext()
+	if engine.criticalSectionID != "" {
+		return nil, fmt.Errorf("nested entity critical sections are not supported")
+	}
+	if len(entityIDs) == 0 {
+		return nil, fmt.Errorf("at least one entity is required for a critical section")
+	}
+	lockSet := make([]string, 0, len(entityIDs))
+	seen := make(map[string]struct{}, len(entityIDs))
+	for _, entityID := range entityIDs {
+		if err := helpers.ValidateEntityName(entityID.Name); err != nil {
+			return nil, err
+		}
+		key := entityID.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		lockSet = append(lockSet, key)
+	}
+	sort.Strings(lockSet)
+
+	criticalSectionID := ctx.NewGuid()
+	action := helpers.NewEntityLockRequestedAction(
+		engine.getNextSequenceNumber(),
+		criticalSectionID,
+		string(engine.ID),
+		lockSet,
+	)
+	engine.pendingActions[action.Id] = action
+	engine.criticalSectionID = criticalSectionID
+	engine.criticalSectionLocks = append([]string(nil), lockSet...)
+	engine.lockAcquisitionPending = true
+	lockTask := newTaskInScope(engine, ctx.scope)
+	engine.pendingEntityTasks[criticalSectionID] = lockTask
+	if err := lockTask.Await(nil); err != nil {
+		engine.clearCriticalSection()
+		return nil, err
+	}
+	engine.lockAcquisitionPending = false
+	engine.criticalSectionAvailable = make(map[string]bool, len(lockSet))
+	for _, entity := range lockSet {
+		engine.criticalSectionAvailable[entity] = true
+	}
+
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		if engine.scheduler != nil && engine.scheduler.isStopping() {
+			return
+		}
+		released = true
+		engine.releaseCriticalSection(criticalSectionID)
+	}, nil
+}
+
+// IsInCriticalSection reports whether the orchestration currently holds entity locks.
+func (ctx *OrchestrationContext) IsInCriticalSection() bool {
+	return ctx.engineContext().criticalSectionID != ""
+}
+
 func (ctx *OrchestrationContext) ContinueAsNew(newInput any, options ...ContinueAsNewOption) {
 	engine := ctx.engineContext()
 	engine.continuedAsNew = true
@@ -793,6 +991,7 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 	}
 	ctx.Name = es.Name
 	ctx.Version = es.GetVersion().GetValue()
+	ctx.executionID = es.GetOrchestrationInstance().GetExecutionId().GetValue()
 	_, fields := contextprop.Decode(es.GetTags())
 	ctx.contextFields = mergeContextFields(ctx.contextFields, fields)
 	if parent := es.GetParentInstance(); parent != nil {
@@ -1049,6 +1248,86 @@ func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTermi
 	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 
+func (ctx *OrchestrationContext) onEntityOperationSent(eventID int32, requestID string) error {
+	action, ok := ctx.pendingActions[eventID]
+	if !ok {
+		return fmt.Errorf("entity operation %q does not match pending action %d", requestID, eventID)
+	}
+	message := action.GetSendEntityMessage()
+	if message == nil {
+		return fmt.Errorf("entity operation %q does not match pending action %d", requestID, eventID)
+	}
+	sentRequestID := ""
+	if called := message.GetEntityOperationCalled(); called != nil {
+		sentRequestID = called.RequestId
+	} else if signaled := message.GetEntityOperationSignaled(); signaled != nil {
+		sentRequestID = signaled.RequestId
+	}
+	if sentRequestID != requestID {
+		return fmt.Errorf("entity operation request ID changed from %q to %q", sentRequestID, requestID)
+	}
+	delete(ctx.pendingActions, eventID)
+	return nil
+}
+
+func (ctx *OrchestrationContext) onEntityOperationCompleted(event *protos.EntityOperationCompletedEvent) error {
+	task, ok := ctx.pendingEntityTasks[event.RequestId]
+	if !ok {
+		return nil
+	}
+	delete(ctx.pendingEntityTasks, event.RequestId)
+	task.complete([]byte(event.Output.GetValue()))
+	return nil
+}
+
+func (ctx *OrchestrationContext) onEntityOperationFailed(event *protos.EntityOperationFailedEvent) error {
+	task, ok := ctx.pendingEntityTasks[event.RequestId]
+	if !ok {
+		return nil
+	}
+	delete(ctx.pendingEntityTasks, event.RequestId)
+	task.fail(event.FailureDetails)
+	return nil
+}
+
+func (ctx *OrchestrationContext) onEntityLockRequested(eventID int32, event *protos.EntityLockRequestedEvent) error {
+	action, ok := ctx.pendingActions[eventID]
+	if !ok {
+		return fmt.Errorf("entity lock request %q does not match pending action %d", event.CriticalSectionId, eventID)
+	}
+	message := action.GetSendEntityMessage()
+	if message == nil || message.GetEntityLockRequested() == nil ||
+		message.GetEntityLockRequested().CriticalSectionId != event.CriticalSectionId {
+		return fmt.Errorf("entity lock request %q does not match pending action %d", event.CriticalSectionId, eventID)
+	}
+	delete(ctx.pendingActions, eventID)
+	return nil
+}
+
+func (ctx *OrchestrationContext) onEntityLockGranted(event *protos.EntityLockGrantedEvent) error {
+	task, ok := ctx.pendingEntityTasks[event.CriticalSectionId]
+	if !ok {
+		return nil
+	}
+	delete(ctx.pendingEntityTasks, event.CriticalSectionId)
+	task.complete(nil)
+	return nil
+}
+
+func (ctx *OrchestrationContext) onEntityUnlockSent(eventID int32, event *protos.EntityUnlockSentEvent) error {
+	action, ok := ctx.pendingActions[eventID]
+	if !ok {
+		return fmt.Errorf("entity unlock %q does not match pending action %d", event.CriticalSectionId, eventID)
+	}
+	message := action.GetSendEntityMessage()
+	if message == nil || message.GetEntityUnlockSent() == nil ||
+		message.GetEntityUnlockSent().CriticalSectionId != event.CriticalSectionId {
+		return fmt.Errorf("entity unlock %q does not match pending action %d", event.CriticalSectionId, eventID)
+	}
+	delete(ctx.pendingActions, eventID)
+	return nil
+}
+
 func (ctx *OrchestrationContext) setComplete(output any) error {
 	var rawOutput *wrapperspb.StringValue
 	if output != nil {
@@ -1186,6 +1465,7 @@ func (ctx *OrchestrationContext) setCompleteInternal(
 	status protos.OrchestrationStatus,
 	failureDetails *protos.TaskFailureDetails,
 ) error {
+	ctx.releaseCriticalSection(ctx.criticalSectionID)
 	sequenceNumber := ctx.getNextSequenceNumber()
 	completedAction := helpers.NewCompleteOrchestrationAction(
 		sequenceNumber,
@@ -1196,6 +1476,29 @@ func (ctx *OrchestrationContext) setCompleteInternal(
 	)
 	ctx.pendingActions[sequenceNumber] = completedAction
 	return nil
+}
+
+func (ctx *OrchestrationContext) releaseCriticalSection(criticalSectionID string) {
+	if criticalSectionID == "" || ctx.criticalSectionID != criticalSectionID {
+		return
+	}
+	for _, entityID := range ctx.criticalSectionLocks {
+		action := helpers.NewEntityUnlockSentAction(
+			ctx.getNextSequenceNumber(),
+			criticalSectionID,
+			string(ctx.ID),
+			entityID,
+		)
+		ctx.pendingActions[action.Id] = action
+	}
+	ctx.clearCriticalSection()
+}
+
+func (ctx *OrchestrationContext) clearCriticalSection() {
+	ctx.criticalSectionID = ""
+	ctx.criticalSectionLocks = nil
+	ctx.criticalSectionAvailable = nil
+	ctx.lockAcquisitionPending = false
 }
 
 func (ctx *OrchestrationContext) getNextSequenceNumber() int32 {

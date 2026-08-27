@@ -18,16 +18,21 @@ type taskHubWorker struct {
 	backend             Backend
 	orchestrationWorker TaskWorker
 	activityWorker      TaskWorker
+	entityWorker        TaskWorker
 	logger              Logger
 }
 
-func NewTaskHubWorker(be Backend, orchestrationWorker TaskWorker, activityWorker TaskWorker, logger Logger) TaskHubWorker {
-	return &taskHubWorker{
+func NewTaskHubWorker(be Backend, orchestrationWorker TaskWorker, activityWorker TaskWorker, logger Logger, entityWorkers ...TaskWorker) TaskHubWorker {
+	worker := &taskHubWorker{
 		backend:             be,
 		orchestrationWorker: orchestrationWorker,
 		activityWorker:      activityWorker,
 		logger:              logger,
 	}
+	if len(entityWorkers) > 0 {
+		worker.entityWorker = entityWorkers[0]
+	}
+	return worker
 }
 
 func (w *taskHubWorker) Start(ctx context.Context) error {
@@ -42,6 +47,9 @@ func (w *taskHubWorker) Start(ctx context.Context) error {
 
 	w.orchestrationWorker.Start(ctx)
 	w.activityWorker.Start(ctx)
+	if w.entityWorker != nil {
+		w.entityWorker.Start(ctx)
+	}
 	return nil
 }
 
@@ -54,6 +62,14 @@ func (w *taskHubWorker) Shutdown(ctx context.Context) error {
 		defer wg.Done()
 		w.orchestrationWorker.StopAndDrain()
 	}()
+
+	if w.entityWorker != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.entityWorker.StopAndDrain()
+		}()
+	}
 
 	wg.Add(1)
 	go func() {

@@ -13,6 +13,7 @@ type WorkItemKind string
 const (
 	WorkItemKindOrchestration WorkItemKind = "orchestration"
 	WorkItemKindActivity      WorkItemKind = "activity"
+	WorkItemKindEntity        WorkItemKind = "entity"
 )
 
 // WorkerActivityState describes a worker lifecycle transition.

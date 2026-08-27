@@ -27,8 +27,17 @@ type ActivityContextInfo struct {
 	TaskID     int32
 }
 
+// EntityContextInfo identifies the entity operation associated with a task context.
+type EntityContextInfo struct {
+	EntityID  EntityID
+	Operation string
+	RequestID string
+	IsSignal  bool
+}
+
 type orchestrationContextInfoKey struct{}
 type activityContextInfoKey struct{}
+type entityContextInfoKey struct{}
 type contextFieldsKey struct{}
 
 // WithOrchestrationContextInfo returns a context containing orchestration identity.
@@ -50,6 +59,17 @@ func WithActivityContextInfo(ctx context.Context, info ActivityContextInfo) cont
 // ActivityContextInfoFromContext returns activity identity from ctx.
 func ActivityContextInfoFromContext(ctx context.Context) (ActivityContextInfo, bool) {
 	info, ok := ctx.Value(activityContextInfoKey{}).(ActivityContextInfo)
+	return info, ok
+}
+
+// WithEntityContextInfo returns a context containing entity operation identity.
+func WithEntityContextInfo(ctx context.Context, info EntityContextInfo) context.Context {
+	return context.WithValue(ctx, entityContextInfoKey{}, info)
+}
+
+// EntityContextInfoFromContext returns entity operation identity from ctx.
+func EntityContextInfoFromContext(ctx context.Context) (EntityContextInfo, bool) {
+	info, ok := ctx.Value(entityContextInfoKey{}).(EntityContextInfo)
 	return info, ok
 }
 

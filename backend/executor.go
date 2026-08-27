@@ -2,6 +2,7 @@ package backend
 
 import (
 	context "context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,10 +11,12 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -40,6 +43,13 @@ type activityExecutionResult struct {
 	pending  chan string
 }
 
+type entityExecutionResult struct {
+	instanceID string
+	response   *protos.EntityBatchResult
+	complete   chan struct{}
+	pending    chan string
+}
+
 type Executor interface {
 	ExecuteOrchestrator(ctx context.Context, iid api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*ExecutionResults, error)
 	ExecuteActivity(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error)
@@ -51,6 +61,8 @@ type grpcExecutor struct {
 	workItemQueue              chan *protos.WorkItem
 	pendingOrchestrators       *sync.Map // map[api.InstanceID]*ExecutionResults
 	pendingActivities          *sync.Map // map[string]*activityExecutionResult
+	pendingEntities            *sync.Map // map[completionToken]*entityExecutionResult
+	pendingEntityInstances     *sync.Map // map[instanceID]completionToken
 	backend                    Backend
 	logger                     Logger
 	onWorkItemConnection       func(context.Context) error
@@ -93,11 +105,13 @@ func WithCurrentOrchestrationIDReusePolicyWire() grpcExecutorOptions {
 // NewGrpcExecutor returns the Executor object and a method to invoke to register the gRPC server in the executor.
 func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (executor Executor, registerServerFn func(grpcServer grpc.ServiceRegistrar)) {
 	grpcExecutor := &grpcExecutor{
-		workItemQueue:        make(chan *protos.WorkItem),
-		backend:              be,
-		logger:               logger,
-		pendingOrchestrators: &sync.Map{},
-		pendingActivities:    &sync.Map{},
+		workItemQueue:          make(chan *protos.WorkItem),
+		backend:                be,
+		logger:                 logger,
+		pendingOrchestrators:   &sync.Map{},
+		pendingActivities:      &sync.Map{},
+		pendingEntities:        &sync.Map{},
+		pendingEntityInstances: &sync.Map{},
 	}
 
 	for _, opt := range opts {
@@ -121,6 +135,9 @@ func (executor *grpcExecutor) ExecuteOrchestrator(ctx context.Context, iid api.I
 				ExecutionId: nil,
 				PastEvents:  oldEvents,
 				NewEvents:   newEvents,
+				EntityParameters: &protos.OrchestratorEntityParameters{
+					EntityMessageReorderWindow: durationpb.New(0),
+				},
 			},
 		},
 	}
@@ -200,6 +217,48 @@ func (executor *grpcExecutor) ExecuteActivity(ctx context.Context, iid api.Insta
 	return responseEvent, nil
 }
 
+// ExecuteEntity dispatches a legacy entity batch to a connected gRPC worker.
+func (executor *grpcExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+	if req == nil {
+		return nil, fmt.Errorf("entity batch request must not be nil")
+	}
+	completionToken := uuid.NewString()
+	if _, loaded := executor.pendingEntityInstances.LoadOrStore(req.InstanceId, completionToken); loaded {
+		return nil, fmt.Errorf("entity batch for instance %q is already pending", req.InstanceId)
+	}
+	result := &entityExecutionResult{
+		instanceID: req.InstanceId,
+		complete:   make(chan struct{}),
+	}
+	executor.pendingEntities.Store(completionToken, result)
+	cleanup := func() {
+		executor.pendingEntities.Delete(completionToken)
+		executor.pendingEntityInstances.Delete(req.InstanceId)
+	}
+
+	workItem := &protos.WorkItem{
+		Request:         &protos.WorkItem_EntityRequest{EntityRequest: req},
+		CompletionToken: completionToken,
+	}
+	select {
+	case <-ctx.Done():
+		cleanup()
+		return nil, ctx.Err()
+	case executor.workItemQueue <- workItem:
+	}
+
+	select {
+	case <-ctx.Done():
+		cleanup()
+		return nil, ctx.Err()
+	case <-result.complete:
+		if result.response == nil {
+			return nil, ErrOperationAborted
+		}
+		return result.response, nil
+	}
+}
+
 // Shutdown implements Executor
 func (g *grpcExecutor) Shutdown(ctx context.Context) error {
 	// closing the work item queue is a signal for shutdown
@@ -217,6 +276,12 @@ func (g *grpcExecutor) Shutdown(ctx context.Context) error {
 		p, ok := value.(*ExecutionResults)
 		if ok {
 			close(p.complete)
+		}
+		return true
+	})
+	g.pendingEntities.Range(func(_, value any) bool {
+		if pending, ok := value.(*entityExecutionResult); ok {
+			close(pending.complete)
 		}
 		return true
 	})
@@ -252,6 +317,8 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 	pendingActivityCh := make(chan string, 1)
 	pendingOrchestrators := make(map[string]struct{})
 	pendingOrchestratorCh := make(chan string, 1)
+	pendingEntities := make(map[string]struct{})
+	pendingEntityCh := make(chan string, 1)
 	defer func() {
 		// If there's any pending activity left, remove them
 		for key := range pendingActivities {
@@ -267,6 +334,13 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 			p, ok := g.pendingOrchestrators.LoadAndDelete(api.InstanceID(key))
 			if ok {
 				pending := p.(*ExecutionResults)
+				close(pending.complete)
+			}
+		}
+		for token := range pendingEntities {
+			if value, ok := g.pendingEntities.LoadAndDelete(token); ok {
+				pending := value.(*entityExecutionResult)
+				g.pendingEntityInstances.Delete(pending.instanceID)
 				close(pending.complete)
 			}
 		}
@@ -297,6 +371,12 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 				if ok {
 					p.(*activityExecutionResult).pending = pendingActivityCh
 				}
+			case *protos.WorkItem_EntityRequest, *protos.WorkItem_EntityRequestV2:
+				token := wi.GetCompletionToken()
+				pendingEntities[token] = struct{}{}
+				if pending, ok := g.pendingEntities.Load(token); ok {
+					pending.(*entityExecutionResult).pending = pendingEntityCh
+				}
 			}
 
 			if err := stream.Send(wi); err != nil {
@@ -307,6 +387,8 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 			delete(pendingActivities, key)
 		case key := <-pendingOrchestratorCh:
 			delete(pendingOrchestrators, key)
+		case token := <-pendingEntityCh:
+			delete(pendingEntities, token)
 		case <-g.streamShutdownChan:
 			return errShuttingDown
 		}
@@ -369,6 +451,55 @@ func getActivityExecutionKey(iid string, taskID int32) string {
 	return iid + "/" + strconv.FormatInt(int64(taskID), 10)
 }
 
+// CompleteEntityTask implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) CompleteEntityTask(ctx context.Context, response *protos.EntityBatchResult) (*protos.CompleteTaskResponse, error) {
+	if response == nil {
+		return nil, status.Error(codes.InvalidArgument, "entity response must not be nil")
+	}
+	token := response.CompletionToken
+	if token == "" {
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			values := md.Get("entity-completion-token")
+			if len(values) > 0 {
+				token = values[0]
+			}
+		}
+	}
+	if token == "" {
+		return nil, status.Error(codes.InvalidArgument, "entity completion token is required")
+	}
+	value, ok := g.pendingEntities.LoadAndDelete(token)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "unknown entity completion token %q", token)
+	}
+	pending := value.(*entityExecutionResult)
+	g.pendingEntityInstances.Delete(pending.instanceID)
+	pending.response = response
+	if pending.pending != nil {
+		pending.pending <- token
+	}
+	close(pending.complete)
+	return emptyCompleteTaskResponse, nil
+}
+
+// AbandonTaskEntityWorkItem implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) AbandonTaskEntityWorkItem(_ context.Context, request *protos.AbandonEntityTaskRequest) (*protos.AbandonEntityTaskResponse, error) {
+	if request.GetCompletionToken() == "" {
+		return nil, status.Error(codes.InvalidArgument, "entity completion token is required")
+	}
+	value, ok := g.pendingEntities.LoadAndDelete(request.CompletionToken)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "unknown entity completion token %q", request.CompletionToken)
+	}
+	pending := value.(*entityExecutionResult)
+	g.pendingEntityInstances.Delete(pending.instanceID)
+	if pending.pending != nil {
+		pending.pending <- request.CompletionToken
+	}
+	close(pending.complete)
+	return &protos.AbandonEntityTaskResponse{}, nil
+}
+
 // CreateTaskHub implements protos.TaskHubSidecarServiceServer
 func (grpcExecutor) CreateTaskHub(context.Context, *protos.CreateTaskHubRequest) (*protos.CreateTaskHubResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "CreateTaskHub is not implemented")
@@ -416,6 +547,29 @@ func (grpcExecutor) QueryInstances(context.Context, *protos.QueryInstancesReques
 
 // RaiseEvent implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) RaiseEvent(ctx context.Context, req *protos.RaiseEventRequest) (*protos.RaiseEventResponse, error) {
+	if entityBackend, ok := g.backend.(EntitySignalBackend); ok && helpers.IsEntityInstanceID(req.InstanceId) &&
+		strings.EqualFold(req.Name, helpers.EntityRequestEventName) {
+		var message helpers.EntityRequestMessage
+		if err := json.Unmarshal([]byte(req.Input.GetValue()), &message); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid entity request payload: %v", err)
+		}
+		if !message.IsSignal {
+			return nil, status.Error(codes.InvalidArgument, "RaiseEvent supports entity signals only")
+		}
+		signal := &protos.SignalEntityRequest{
+			InstanceId:  req.InstanceId,
+			Name:        message.Operation,
+			RequestId:   message.ID,
+			RequestTime: timestamppb.Now(),
+		}
+		if message.Input != "" {
+			signal.Input = wrapperspb.String(message.Input)
+		}
+		if err := entityBackend.SignalEntity(ctx, signal); err != nil {
+			return nil, err
+		}
+		return &protos.RaiseEventResponse{}, nil
+	}
 	e := helpers.NewEventRaisedEvent(req.Name, req.Input)
 	if err := g.backend.AddNewOrchestrationEvent(ctx, api.InstanceID(req.InstanceId), e); err != nil {
 		return nil, err
@@ -427,6 +581,9 @@ func (g *grpcExecutor) RaiseEvent(ctx context.Context, req *protos.RaiseEventReq
 // StartInstance implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInstanceRequest) (*protos.CreateInstanceResponse, error) {
 	instanceID := req.InstanceId
+	if err := helpers.ValidateOrchestrationInstanceID(instanceID); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	ctx, span := helpers.StartNewCreateOrchestrationSpan(ctx, req.Name, req.Version.GetValue(), instanceID)
 	defer span.End()
 
@@ -444,6 +601,126 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 	}
 
 	return &protos.CreateInstanceResponse{InstanceId: instanceID}, nil
+}
+
+// SignalEntity implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) SignalEntity(ctx context.Context, req *protos.SignalEntityRequest) (*protos.SignalEntityResponse, error) {
+	entityBackend, ok := g.backend.(EntitySignalBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	}
+	if _, err := api.EntityIDFromString(req.InstanceId); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid entity instance ID: %v", err)
+	}
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "entity operation name must not be empty")
+	}
+	if req.RequestId == "" {
+		req.RequestId = uuid.NewString()
+	}
+	if req.RequestTime == nil {
+		req.RequestTime = timestamppb.Now()
+	}
+	if err := entityBackend.SignalEntity(ctx, req); err != nil {
+		return nil, err
+	}
+	return &protos.SignalEntityResponse{}, nil
+}
+
+// GetEntity implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) GetEntity(ctx context.Context, req *protos.GetEntityRequest) (*protos.GetEntityResponse, error) {
+	entityBackend, ok := g.backend.(EntityQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	}
+	entityID, err := api.EntityIDFromString(req.InstanceId)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid entity instance ID: %v", err)
+	}
+	entity, err := entityBackend.GetEntityMetadata(ctx, entityID, req.IncludeState)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		return &protos.GetEntityResponse{Exists: false}, nil
+	}
+	return &protos.GetEntityResponse{Exists: true, Entity: entityMetadataToProto(entity)}, nil
+}
+
+// QueryEntities implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) QueryEntities(ctx context.Context, req *protos.QueryEntitiesRequest) (*protos.QueryEntitiesResponse, error) {
+	entityBackend, ok := g.backend.(EntityQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	}
+	query := api.EntityQuery{}
+	if req.Query != nil {
+		query.InstanceIDStartsWith = req.Query.InstanceIdStartsWith.GetValue()
+		query.IncludeState = req.Query.IncludeState
+		query.IncludeTransient = req.Query.IncludeTransient
+		query.PageSize = req.Query.PageSize.GetValue()
+		query.ContinuationToken = req.Query.ContinuationToken.GetValue()
+		if req.Query.LastModifiedFrom != nil {
+			query.LastModifiedFrom = req.Query.LastModifiedFrom.AsTime()
+		}
+		if req.Query.LastModifiedTo != nil {
+			query.LastModifiedTo = req.Query.LastModifiedTo.AsTime()
+		}
+	}
+	result, err := entityBackend.QueryEntities(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	response := &protos.QueryEntitiesResponse{}
+	if result != nil {
+		response.ContinuationToken = wrapperspb.String(result.ContinuationToken)
+		response.Entities = make([]*protos.EntityMetadata, 0, len(result.Entities))
+		for _, entity := range result.Entities {
+			if entity != nil {
+				response.Entities = append(response.Entities, entityMetadataToProto(entity))
+			}
+		}
+	}
+	return response, nil
+}
+
+// CleanEntityStorage implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) CleanEntityStorage(ctx context.Context, req *protos.CleanEntityStorageRequest) (*protos.CleanEntityStorageResponse, error) {
+	entityBackend, ok := g.backend.(EntityQueryBackend)
+	if !ok {
+		return nil, status.Error(codes.Unimplemented, "backend does not support durable entities")
+	}
+	result, err := entityBackend.CleanEntityStorage(ctx, api.CleanEntityStorageRequest{
+		ContinuationToken:    req.ContinuationToken.GetValue(),
+		RemoveEmptyEntities:  req.RemoveEmptyEntities,
+		ReleaseOrphanedLocks: req.ReleaseOrphanedLocks,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return &protos.CleanEntityStorageResponse{}, nil
+	}
+	return &protos.CleanEntityStorageResponse{
+		ContinuationToken:     wrapperspb.String(result.ContinuationToken),
+		EmptyEntitiesRemoved:  result.EmptyEntitiesRemoved,
+		OrphanedLocksReleased: result.OrphanedLocksReleased,
+	}, nil
+}
+
+func entityMetadataToProto(entity *api.EntityMetadata) *protos.EntityMetadata {
+	metadata := &protos.EntityMetadata{
+		InstanceId:       entity.InstanceID.String(),
+		LastModifiedTime: timestamppb.New(entity.LastModifiedTime),
+		BacklogQueueSize: entity.BacklogQueueSize,
+	}
+	if entity.LockedBy != "" {
+		metadata.LockedBy = wrapperspb.String(entity.LockedBy)
+	}
+	if entity.SerializedState != "" {
+		metadata.SerializedState = wrapperspb.String(entity.SerializedState)
+	}
+	return metadata
 }
 
 // TerminateInstance implements protos.TaskHubSidecarServiceServer

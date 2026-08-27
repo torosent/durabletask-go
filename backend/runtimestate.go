@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -17,12 +18,13 @@ import (
 var ErrDuplicateEvent = errors.New("duplicate event")
 
 type OrchestrationRuntimeState struct {
-	instanceID      api.InstanceID
-	newEvents       []*protos.HistoryEvent
-	oldEvents       []*protos.HistoryEvent
-	pendingTasks    []*protos.HistoryEvent
-	pendingTimers   []*protos.HistoryEvent
-	pendingMessages []OrchestratorMessage
+	instanceID            api.InstanceID
+	newEvents             []*protos.HistoryEvent
+	oldEvents             []*protos.HistoryEvent
+	pendingTasks          []*protos.HistoryEvent
+	pendingTimers         []*protos.HistoryEvent
+	pendingMessages       []OrchestratorMessage
+	pendingEntityMessages []EntityMessage
 
 	startEvent      *protos.ExecutionStartedEvent
 	completedEvent  *protos.ExecutionCompletedEvent
@@ -36,6 +38,11 @@ type OrchestrationRuntimeState struct {
 }
 
 type OrchestratorMessage struct {
+	HistoryEvent     *HistoryEvent
+	TargetInstanceID string
+}
+
+type EntityMessage struct {
 	HistoryEvent     *HistoryEvent
 	TargetInstanceID string
 }
@@ -150,6 +157,10 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 						return false, fmt.Errorf("failed to add carryover event: %w", err)
 					}
 				}
+				newState.pendingTasks = append(newState.pendingTasks, s.pendingTasks...)
+				newState.pendingTimers = append(newState.pendingTimers, s.pendingTimers...)
+				newState.pendingMessages = append(newState.pendingMessages, s.pendingMessages...)
+				newState.pendingEntityMessages = append(newState.pendingEntityMessages, s.pendingEntityMessages...)
 
 				// Overwrite the current state object with a new one
 				*s = *newState
@@ -246,6 +257,15 @@ func (s *OrchestrationRuntimeState) ApplyActions(actions []*protos.OrchestratorA
 				HistoryEvent:     helpers.NewEventRaisedEvent(sendEvent.Name, sendEvent.Data),
 				TargetInstanceID: sendEvent.Instance.InstanceId,
 			})
+		} else if sendEntityMessage := action.GetSendEntityMessage(); sendEntityMessage != nil {
+			historyEvent, message, err := s.buildEntityMessage(action.Id, sendEntityMessage)
+			if err != nil {
+				return false, err
+			}
+			if err := s.AddEvent(historyEvent); err != nil {
+				return false, fmt.Errorf("failed to add entity message history: %w", err)
+			}
+			s.pendingEntityMessages = append(s.pendingEntityMessages, message)
 		} else if terminate := action.GetTerminateOrchestration(); terminate != nil {
 			// Send a message to terminate the target orchestration
 			msg := OrchestratorMessage{
@@ -411,12 +431,93 @@ func (s *OrchestrationRuntimeState) PendingMessages() []OrchestratorMessage {
 	return s.pendingMessages
 }
 
+func (s *OrchestrationRuntimeState) PendingEntityMessages() []EntityMessage {
+	return s.pendingEntityMessages
+}
+
 func (s *OrchestrationRuntimeState) ContinuedAsNew() bool {
 	return s.continuedAsNew
 }
 
 func (s *OrchestrationRuntimeState) String() string {
 	return fmt.Sprintf("%v:%v", s.instanceID, helpers.ToRuntimeStatusString(s.RuntimeStatus()))
+}
+
+func (s *OrchestrationRuntimeState) buildEntityMessage(
+	eventID int32,
+	action *protos.SendEntityMessageAction,
+) (*HistoryEvent, EntityMessage, error) {
+	timestamp := timestamppb.Now()
+	message := EntityMessage{}
+	history := &protos.HistoryEvent{EventId: eventID, Timestamp: timestamp}
+	parentInstanceID := wrapperspb.String(string(s.instanceID))
+	var parentExecutionID *wrapperspb.StringValue
+	if s.startEvent != nil && s.startEvent.OrchestrationInstance != nil {
+		parentExecutionID = s.startEvent.OrchestrationInstance.ExecutionId
+	}
+
+	switch {
+	case action.GetEntityOperationSignaled() != nil:
+		historyValue := proto.Clone(action.GetEntityOperationSignaled()).(*protos.EntityOperationSignaledEvent)
+		message.TargetInstanceID = historyValue.TargetInstanceId.GetValue()
+		messageValue := proto.Clone(historyValue).(*protos.EntityOperationSignaledEvent)
+		messageValue.TargetInstanceId = nil
+		history.EventType = &protos.HistoryEvent_EntityOperationSignaled{EntityOperationSignaled: historyValue}
+		message.HistoryEvent = &protos.HistoryEvent{
+			EventId:   -1,
+			Timestamp: timestamp,
+			EventType: &protos.HistoryEvent_EntityOperationSignaled{EntityOperationSignaled: messageValue},
+		}
+	case action.GetEntityOperationCalled() != nil:
+		historyValue := proto.Clone(action.GetEntityOperationCalled()).(*protos.EntityOperationCalledEvent)
+		message.TargetInstanceID = historyValue.TargetInstanceId.GetValue()
+		historyValue.ParentInstanceId = nil
+		historyValue.ParentExecutionId = nil
+		messageValue := proto.Clone(historyValue).(*protos.EntityOperationCalledEvent)
+		messageValue.TargetInstanceId = nil
+		messageValue.ParentInstanceId = parentInstanceID
+		messageValue.ParentExecutionId = parentExecutionID
+		history.EventType = &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: historyValue}
+		message.HistoryEvent = &protos.HistoryEvent{
+			EventId:   -1,
+			Timestamp: timestamp,
+			EventType: &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: messageValue},
+		}
+	case action.GetEntityLockRequested() != nil:
+		historyValue := proto.Clone(action.GetEntityLockRequested()).(*protos.EntityLockRequestedEvent)
+		if historyValue.Position < 0 || int(historyValue.Position) >= len(historyValue.LockSet) {
+			return nil, EntityMessage{}, fmt.Errorf("invalid entity lock position %d", historyValue.Position)
+		}
+		message.TargetInstanceID = historyValue.LockSet[historyValue.Position]
+		historyValue.ParentInstanceId = nil
+		messageValue := proto.Clone(historyValue).(*protos.EntityLockRequestedEvent)
+		messageValue.ParentInstanceId = parentInstanceID
+		history.EventType = &protos.HistoryEvent_EntityLockRequested{EntityLockRequested: historyValue}
+		message.HistoryEvent = &protos.HistoryEvent{
+			EventId:   -1,
+			Timestamp: timestamp,
+			EventType: &protos.HistoryEvent_EntityLockRequested{EntityLockRequested: messageValue},
+		}
+	case action.GetEntityUnlockSent() != nil:
+		historyValue := proto.Clone(action.GetEntityUnlockSent()).(*protos.EntityUnlockSentEvent)
+		message.TargetInstanceID = historyValue.TargetInstanceId.GetValue()
+		historyValue.ParentInstanceId = nil
+		messageValue := proto.Clone(historyValue).(*protos.EntityUnlockSentEvent)
+		messageValue.TargetInstanceId = nil
+		messageValue.ParentInstanceId = parentInstanceID
+		history.EventType = &protos.HistoryEvent_EntityUnlockSent{EntityUnlockSent: historyValue}
+		message.HistoryEvent = &protos.HistoryEvent{
+			EventId:   -1,
+			Timestamp: timestamp,
+			EventType: &protos.HistoryEvent_EntityUnlockSent{EntityUnlockSent: messageValue},
+		}
+	default:
+		return nil, EntityMessage{}, fmt.Errorf("unknown entity message action: %v", action)
+	}
+	if message.TargetInstanceID == "" {
+		return nil, EntityMessage{}, fmt.Errorf("entity message action is missing a target instance ID")
+	}
+	return history, message, nil
 }
 
 func (s *OrchestrationRuntimeState) getStartedTime() time.Time {
