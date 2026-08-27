@@ -229,7 +229,7 @@ func (w *worker) ProcessNext(ctx context.Context) (bool, error) {
 	default:
 		activitySemaphore := w.activitySemaphore(wi)
 		if activitySemaphore != nil && !activitySemaphore.TryAcquire(1) {
-			setActivityAbandonDelay(wi, activityConcurrencyRetryDelay)
+			setWorkItemAbandonDelay(wi, activityConcurrencyRetryDelay)
 			if err := w.processor.AbandonWorkItem(ctx, wi); err != nil {
 				return false, fmt.Errorf("%v: failed to defer activity work item at its concurrency limit: %w", w.Name(), err)
 			}
@@ -269,7 +269,7 @@ func (w *worker) processWorkItem(ctx context.Context, wi WorkItem, activitySemap
 	if activitySemaphore != nil {
 		defer activitySemaphore.Release(1)
 	}
-	setActivityAbandonDelay(wi, 0)
+	setWorkItemAbandonDelay(wi, 0)
 
 	startedAt := time.Now()
 	w.inFlight.Add(1)
@@ -445,16 +445,18 @@ func (w *worker) reportWorkerActivity(wi WorkItem, state WorkerActivityState, st
 	w.options.Metrics.WorkerActivity(metric)
 }
 
-func setActivityAbandonDelay(wi WorkItem, delay time.Duration) {
+func setWorkItemAbandonDelay(wi WorkItem, delay time.Duration) {
 	if activity := asActivityWorkItem(wi); activity != nil {
 		activity.AbandonDelay = delay
+	} else if entity := asEntityWorkItem(wi); entity != nil {
+		entity.AbandonDelay = delay
 	}
 }
 
 func applyErrorAbandonDelay(wi WorkItem, err error) {
 	var delayed WorkItemAbandonDelayError
 	if errors.As(err, &delayed) {
-		setActivityAbandonDelay(wi, delayed.WorkItemAbandonDelay())
+		setWorkItemAbandonDelay(wi, delayed.WorkItemAbandonDelay())
 	}
 }
 

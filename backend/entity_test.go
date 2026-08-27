@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEntityBatchFromRequestV2AllowsMissingParentMetadata(t *testing.T) {
+func TestEntityBatchFromRequestV2OmitsMissingParentDestination(t *testing.T) {
 	requestID := uuid.NewString()
 	batch, infos, err := EntityBatchFromRequestV2(&protos.EntityRequest{
 		InstanceId: "@counter@key",
@@ -24,6 +24,14 @@ func TestEntityBatchFromRequestV2AllowsMissingParentMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batch.Operations, 1)
 	require.Len(t, infos, 1)
-	require.NotNil(t, infos[0].ResponseDestination)
-	require.Empty(t, infos[0].ResponseDestination.InstanceId)
+	require.Nil(t, infos[0].ResponseDestination)
+}
+
+func TestNewEntitySignalEventRejectsInvalidRequestID(t *testing.T) {
+	_, err := NewEntitySignalEvent(&protos.SignalEntityRequest{
+		InstanceId: "@counter@key",
+		RequestId:  "not-a-guid",
+		Name:       "get",
+	})
+	require.Error(t, err)
 }

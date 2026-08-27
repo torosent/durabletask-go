@@ -251,7 +251,7 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 		WithMaxConcurrentEntityWorkItems(4),
 		WithWorkItemFilters(&WorkItemFilters{
 			Activities: []WorkItemFilter{{Name: "activity"}},
-			Entities:   []string{"counter"},
+			Entities:   []string{"Counter"},
 		}),
 	)
 	worker.executor = &recordingExecutor{

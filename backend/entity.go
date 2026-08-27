@@ -42,15 +42,16 @@ type EntityBackend interface {
 
 // EntityWorkItem contains one serialized entity batch locked by a local backend.
 type EntityWorkItem struct {
-	InstanceID  api.EntityID
-	ExecutionID string
-	State       *string
-	Operations  []*protos.HistoryEvent
-	MessageIDs  []int64
-	LockedBy    string
-	RetryCount  int32
-	EnqueuedAt  time.Time
-	Result      *protos.EntityBatchResult
+	InstanceID   api.EntityID
+	ExecutionID  string
+	State        *string
+	Operations   []*protos.HistoryEvent
+	MessageIDs   []int64
+	LockedBy     string
+	RetryCount   int32
+	EnqueuedAt   time.Time
+	AbandonDelay time.Duration
+	Result       *protos.EntityBatchResult
 }
 
 func (wi EntityWorkItem) String() string {
@@ -59,6 +60,23 @@ func (wi EntityWorkItem) String() string {
 
 func (wi EntityWorkItem) IsWorkItem() bool {
 	return true
+}
+
+func (wi *EntityWorkItem) GetAbandonDelay() time.Duration {
+	if wi == nil {
+		return 0
+	}
+	if wi.AbandonDelay > 0 {
+		return wi.AbandonDelay
+	}
+	switch {
+	case wi.RetryCount == 0:
+		return 0
+	case wi.RetryCount > 100:
+		return 5 * time.Minute
+	default:
+		return time.Duration(wi.RetryCount) * time.Second
+	}
 }
 
 // EntityBatchFromRequestV2 converts a backend-scheduled V2 entity request into
@@ -104,13 +122,14 @@ func EntityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatc
 				RequestId: event.RequestId,
 				Input:     event.Input,
 			})
-			operationInfos = append(operationInfos, &protos.OperationInfo{
-				RequestId: event.RequestId,
-				ResponseDestination: &protos.OrchestrationInstance{
+			info := &protos.OperationInfo{RequestId: event.RequestId}
+			if event.ParentInstanceId.GetValue() != "" {
+				info.ResponseDestination = &protos.OrchestrationInstance{
 					InstanceId:  event.ParentInstanceId.GetValue(),
 					ExecutionId: event.ParentExecutionId,
-				},
-			})
+				}
+			}
+			operationInfos = append(operationInfos, info)
 		}
 	}
 	if len(batch.Properties) == 0 {
@@ -171,6 +190,9 @@ func NewEntitySignalEvent(request *protos.SignalEntityRequest) (*protos.HistoryE
 	}
 	if request.RequestId == "" {
 		request.RequestId = uuid.NewString()
+	}
+	if _, err := uuid.Parse(request.RequestId); err != nil {
+		return nil, fmt.Errorf("invalid entity request ID %q: %w", request.RequestId, err)
 	}
 	timestamp := request.RequestTime
 	if timestamp == nil {

@@ -86,6 +86,15 @@ func TestTransformOrchestratorResponsePayloadFields(t *testing.T) {
 					CompleteOrchestration: &protos.CompleteOrchestrationAction{Result: wrapperspb.String("result")},
 				},
 			},
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_SendEntityMessage{
+					SendEntityMessage: &protos.SendEntityMessageAction{
+						EntityMessageType: &protos.SendEntityMessageAction_EntityOperationCalled{
+							EntityOperationCalled: &protos.EntityOperationCalledEvent{Input: wrapperspb.String("entity")},
+						},
+					},
+				},
+			},
 		},
 	}
 	require.NoError(t, TransformOrchestratorResponse(context.Background(), options, response))
@@ -95,6 +104,7 @@ func TestTransformOrchestratorResponsePayloadFields(t *testing.T) {
 		response.Actions[0].GetScheduleTask().Input,
 		response.Actions[1].GetCreateSubOrchestration().Input,
 		response.Actions[2].GetCompleteOrchestration().Result,
+		response.Actions[3].GetSendEntityMessage().GetEntityOperationCalled().Input,
 	} {
 		hydrated, err := Hydrate(context.Background(), options, value)
 		require.NoError(t, err)
@@ -160,6 +170,33 @@ func TestTransformHistoryEventPayloadFields(t *testing.T) {
 				return event.GetExecutionRewound().Input
 			},
 		},
+		{
+			name: "entity signal",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EntityOperationSignaled{
+				EntityOperationSignaled: &protos.EntityOperationSignaledEvent{Input: wrapperspb.String("signal")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetEntityOperationSignaled().Input
+			},
+		},
+		{
+			name: "entity call",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EntityOperationCalled{
+				EntityOperationCalled: &protos.EntityOperationCalledEvent{Input: wrapperspb.String("call")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetEntityOperationCalled().Input
+			},
+		},
+		{
+			name: "entity result",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EntityOperationCompleted{
+				EntityOperationCompleted: &protos.EntityOperationCompletedEvent{Output: wrapperspb.String("result")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetEntityOperationCompleted().Output
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -169,6 +206,62 @@ func TestTransformHistoryEventPayloadFields(t *testing.T) {
 			require.NoError(t, TransformHistoryEvent(context.Background(), options, test.event, false))
 			require.Equal(t, original, test.value(test.event).GetValue())
 		})
+	}
+}
+
+func TestTransformEntityBatchPayloadFields(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	request := &protos.EntityBatchRequest{
+		EntityState: wrapperspb.String("state"),
+		Operations: []*protos.OperationRequest{{
+			Input: wrapperspb.String("input"),
+		}},
+	}
+	for _, target := range []*wrapperspb.StringValue{request.EntityState, request.Operations[0].Input} {
+		externalized, err := Externalize(context.Background(), options, target)
+		require.NoError(t, err)
+		*target = *externalized
+	}
+	require.NoError(t, TransformEntityBatchRequest(context.Background(), options, request))
+	require.Equal(t, "state", request.EntityState.GetValue())
+	require.Equal(t, "input", request.Operations[0].Input.GetValue())
+
+	result := &protos.EntityBatchResult{
+		EntityState: wrapperspb.String("next-state"),
+		Results: []*protos.OperationResult{{
+			ResultType: &protos.OperationResult_Success{
+				Success: &protos.OperationResultSuccess{Result: wrapperspb.String("output")},
+			},
+		}},
+		Actions: []*protos.OperationAction{
+			{
+				OperationActionType: &protos.OperationAction_SendSignal{
+					SendSignal: &protos.SendSignalAction{Input: wrapperspb.String("signal")},
+				},
+			},
+			{
+				OperationActionType: &protos.OperationAction_StartNewOrchestration{
+					StartNewOrchestration: &protos.StartNewOrchestrationAction{Input: wrapperspb.String("start")},
+				},
+			},
+		},
+	}
+	require.NoError(t, TransformEntityBatchResult(context.Background(), options, result))
+	for _, value := range []*wrapperspb.StringValue{
+		result.EntityState,
+		result.Results[0].GetSuccess().Result,
+		result.Actions[0].GetSendSignal().Input,
+		result.Actions[1].GetStartNewOrchestration().Input,
+	} {
+		hydrated, err := Hydrate(context.Background(), options, value)
+		require.NoError(t, err)
+		require.NotEqual(t, value.GetValue(), hydrated.GetValue())
 	}
 }
 

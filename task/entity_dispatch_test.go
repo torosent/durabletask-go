@@ -592,3 +592,14 @@ func Test_EntityDispatcher_InvalidReflectionNeverLeaksPanic(t *testing.T) {
 		})
 	}
 }
+
+type caseCollisionEntity struct{}
+
+func (*caseCollisionEntity) Operation() {}
+func (*caseCollisionEntity) OPERATION() {}
+
+func Test_EntityDispatcher_RejectsCaseInsensitiveOperationCollisions(t *testing.T) {
+	assert.PanicsWithValue(t, "NewEntityFor found case-insensitive operation collision between OPERATION and Operation", func() {
+		_ = NewEntityFor[caseCollisionEntity]()
+	})
+}

@@ -324,6 +324,11 @@ func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.Entit
 			return fmt.Errorf("failed to configure signal entity request: %w", err)
 		}
 	}
+	var err error
+	req.Input, err = largepayload.Externalize(ctx, c.largePayloads, req.Input)
+	if err != nil {
+		return fmt.Errorf("failed to externalize entity signal input: %w", err)
+	}
 	if _, err := c.client.SignalEntity(ctx, req); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -351,7 +356,7 @@ func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID ap
 	if !response.Exists || response.Entity == nil {
 		return nil, nil
 	}
-	return entityMetadataFromProto(response.Entity)
+	return entityMetadataFromProto(ctx, c.largePayloads, response.Entity)
 }
 
 // QueryEntities queries entities matching the supplied filters.
@@ -387,7 +392,7 @@ func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQ
 		ContinuationToken: response.ContinuationToken.GetValue(),
 	}
 	for _, entity := range response.Entities {
-		metadata, err := entityMetadataFromProto(entity)
+		metadata, err := entityMetadataFromProto(ctx, c.largePayloads, entity)
 		if err != nil {
 			return nil, err
 		}
@@ -419,7 +424,11 @@ func (c *TaskHubGrpcClient) CleanEntityStorage(ctx context.Context, request api.
 	}, nil
 }
 
-func entityMetadataFromProto(entity *protos.EntityMetadata) (*api.EntityMetadata, error) {
+func entityMetadataFromProto(
+	ctx context.Context,
+	options *api.LargePayloadOptions,
+	entity *protos.EntityMetadata,
+) (*api.EntityMetadata, error) {
 	if entity == nil {
 		return nil, fmt.Errorf("entity metadata must not be nil")
 	}
@@ -436,6 +445,11 @@ func entityMetadataFromProto(entity *protos.EntityMetadata) (*api.EntityMetadata
 	if entity.LastModifiedTime != nil {
 		metadata.LastModifiedTime = entity.LastModifiedTime.AsTime()
 	}
+	state, err := largepayload.Hydrate(ctx, options, entity.SerializedState)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hydrate entity state: %w", err)
+	}
+	metadata.SerializedState = state.GetValue()
 	return metadata, nil
 }
 

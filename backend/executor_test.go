@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/assert"
@@ -92,18 +93,33 @@ func Test_GrpcExecutor_SignalEntity_PreservesScheduledTimeAndRequestID(t *testin
 	g := executor.(*grpcExecutor)
 
 	scheduledTime := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Millisecond)
+	requestID := uuid.NewString()
 	_, err := g.SignalEntity(context.Background(), &protos.SignalEntityRequest{
 		InstanceId:    "@counter@key",
 		Name:          "increment",
-		RequestId:     "request-123",
+		RequestId:     requestID,
 		ScheduledTime: timestamppb.New(scheduledTime),
 	})
 	require.NoError(t, err)
 
 	require.Len(t, be.signals, 1)
-	require.Equal(t, "request-123", be.signals[0].RequestId)
+	require.Equal(t, requestID, be.signals[0].RequestId)
 	require.Equal(t, "increment", be.signals[0].Name)
 	require.WithinDuration(t, scheduledTime, be.signals[0].ScheduledTime.AsTime(), time.Millisecond)
+}
+
+func Test_GrpcExecutor_SignalEntity_RejectsInvalidRequestID(t *testing.T) {
+	be := &capturingBackend{}
+	executor, _ := NewGrpcExecutor(be, DefaultLogger())
+	g := executor.(*grpcExecutor)
+
+	_, err := g.SignalEntity(context.Background(), &protos.SignalEntityRequest{
+		InstanceId: "@counter@key",
+		Name:       "increment",
+		RequestId:  "not-a-guid",
+	})
+	require.Error(t, err)
+	require.Empty(t, be.signals)
 }
 
 func Test_GrpcExecutor_CompleteEntityTask_UsesCompletionToken(t *testing.T) {
@@ -128,4 +144,21 @@ func Test_GrpcExecutor_CompleteEntityTask_UsesCompletionToken(t *testing.T) {
 	default:
 		t.Fatal("entity completion did not unblock pending execution")
 	}
+}
+
+func Test_GrpcExecutor_StaleEntityCompletionPreservesNewInstanceGuard(t *testing.T) {
+	executor, _ := NewGrpcExecutor(nil, DefaultLogger())
+	g := executor.(*grpcExecutor)
+	const instanceID = "@counter@one"
+	pending := &entityExecutionResult{instanceID: instanceID, complete: make(chan struct{})}
+	g.pendingEntities.Store("old-token", pending)
+	g.pendingEntityInstances.Store(instanceID, "new-token")
+
+	_, err := g.CompleteEntityTask(context.Background(), &protos.EntityBatchResult{
+		CompletionToken: "old-token",
+	})
+	require.NoError(t, err)
+	value, ok := g.pendingEntityInstances.Load(instanceID)
+	require.True(t, ok)
+	require.Equal(t, "new-token", value)
 }

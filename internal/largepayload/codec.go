@@ -128,6 +128,12 @@ func TransformHistoryEvent(
 		target = &event.GetContinueAsNew().Input
 	case event.GetExecutionRewound() != nil:
 		target = &event.GetExecutionRewound().Input
+	case event.GetEntityOperationSignaled() != nil:
+		target = &event.GetEntityOperationSignaled().Input
+	case event.GetEntityOperationCalled() != nil:
+		target = &event.GetEntityOperationCalled().Input
+	case event.GetEntityOperationCompleted() != nil:
+		target = &event.GetEntityOperationCompleted().Output
 	default:
 		return nil
 	}
@@ -185,6 +191,22 @@ func TransformOrchestratorResponse(
 			action.GetCompleteOrchestration().Result, err = Externalize(ctx, options, action.GetCompleteOrchestration().Result)
 		case action.GetTerminateOrchestration() != nil:
 			action.GetTerminateOrchestration().Reason, err = Externalize(ctx, options, action.GetTerminateOrchestration().Reason)
+		case action.GetSendEntityMessage() != nil:
+			message := action.GetSendEntityMessage()
+			switch {
+			case message.GetEntityOperationSignaled() != nil:
+				message.GetEntityOperationSignaled().Input, err = Externalize(
+					ctx,
+					options,
+					message.GetEntityOperationSignaled().Input,
+				)
+			case message.GetEntityOperationCalled() != nil:
+				message.GetEntityOperationCalled().Input, err = Externalize(
+					ctx,
+					options,
+					message.GetEntityOperationCalled().Input,
+				)
+			}
 		case action.GetRewindOrchestration() != nil:
 			for _, event := range action.GetRewindOrchestration().NewHistory {
 				if transformErr := TransformHistoryEvent(ctx, options, event, true); transformErr != nil {
@@ -215,6 +237,74 @@ func TransformActivityResponse(ctx context.Context, options *api.LargePayloadOpt
 	var err error
 	response.Result, err = Externalize(ctx, options, response.Result)
 	return err
+}
+
+func TransformEntityBatchRequest(
+	ctx context.Context,
+	options *api.LargePayloadOptions,
+	request *protos.EntityBatchRequest,
+) error {
+	if request == nil || options == nil {
+		return nil
+	}
+	var err error
+	if request.EntityState, err = Hydrate(ctx, options, request.EntityState); err != nil {
+		return err
+	}
+	for _, operation := range request.Operations {
+		if operation == nil {
+			continue
+		}
+		if operation.Input, err = Hydrate(ctx, options, operation.Input); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TransformEntityBatchResult(
+	ctx context.Context,
+	options *api.LargePayloadOptions,
+	result *protos.EntityBatchResult,
+) error {
+	if result == nil || options == nil {
+		return nil
+	}
+	var err error
+	if result.EntityState, err = Externalize(ctx, options, result.EntityState); err != nil {
+		return err
+	}
+	for _, operationResult := range result.Results {
+		if operationResult == nil || operationResult.GetSuccess() == nil {
+			continue
+		}
+		if operationResult.GetSuccess().Result, err = Externalize(
+			ctx,
+			options,
+			operationResult.GetSuccess().Result,
+		); err != nil {
+			return err
+		}
+	}
+	for _, action := range result.Actions {
+		if action == nil {
+			continue
+		}
+		switch {
+		case action.GetSendSignal() != nil:
+			action.GetSendSignal().Input, err = Externalize(ctx, options, action.GetSendSignal().Input)
+		case action.GetStartNewOrchestration() != nil:
+			action.GetStartNewOrchestration().Input, err = Externalize(
+				ctx,
+				options,
+				action.GetStartNewOrchestration().Input,
+			)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func TransformOrchestrationState(ctx context.Context, options *api.LargePayloadOptions, state *protos.OrchestrationState) error {

@@ -633,9 +633,13 @@ func cloneWorkItemFilters(filters *WorkItemFilters) (*WorkItemFilters, error) {
 		result.Activities[i] = WorkItemFilter{Name: filter.Name, Versions: slices.Clone(filter.Versions)}
 	}
 	for _, name := range result.Entities {
-		if strings.TrimSpace(name) == "" {
+		name = strings.TrimSpace(name)
+		if name == "" {
 			return nil, errors.New("entity filter name cannot be empty")
 		}
+	}
+	for i, name := range result.Entities {
+		result.Entities[i] = strings.ToLower(strings.TrimSpace(name))
 	}
 	slices.SortFunc(result.Orchestrations, func(left, right WorkItemFilter) int {
 		return strings.Compare(left.Name, right.Name)

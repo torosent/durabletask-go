@@ -233,7 +233,7 @@ func (executor *grpcExecutor) ExecuteEntity(ctx context.Context, req *protos.Ent
 	executor.pendingEntities.Store(completionToken, result)
 	cleanup := func() {
 		executor.pendingEntities.Delete(completionToken)
-		executor.pendingEntityInstances.Delete(req.InstanceId)
+		executor.pendingEntityInstances.CompareAndDelete(req.InstanceId, completionToken)
 	}
 
 	workItem := &protos.WorkItem{
@@ -340,7 +340,7 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 		for token := range pendingEntities {
 			if value, ok := g.pendingEntities.LoadAndDelete(token); ok {
 				pending := value.(*entityExecutionResult)
-				g.pendingEntityInstances.Delete(pending.instanceID)
+				g.pendingEntityInstances.CompareAndDelete(pending.instanceID, token)
 				close(pending.complete)
 			}
 		}
@@ -494,7 +494,7 @@ func (g *grpcExecutor) resolveEntityTask(completionToken string, response *proto
 		return status.Errorf(codes.NotFound, "unknown entity completion token %q", completionToken)
 	}
 	pending := value.(*entityExecutionResult)
-	g.pendingEntityInstances.Delete(pending.instanceID)
+	g.pendingEntityInstances.CompareAndDelete(pending.instanceID, completionToken)
 	pending.response = response
 	if pending.pending != nil {
 		pending.pending <- completionToken
@@ -798,6 +798,9 @@ func (g *grpcExecutor) SignalEntity(ctx context.Context, req *protos.SignalEntit
 	}
 	if req.RequestId == "" {
 		req.RequestId = uuid.NewString()
+	}
+	if _, err := uuid.Parse(req.RequestId); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid entity request ID: %v", err)
 	}
 	if req.RequestTime == nil {
 		req.RequestTime = timestamppb.Now()

@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -108,4 +109,89 @@ func TestLargePayloadBackendRoundTripAcrossOrchestrationSurfaces(t *testing.T) {
 		require.Equal(t, "durable", item.Tags["team"])
 		require.NotContains(t, item.SerializedInput, "durabletask-payload:v1:")
 	}
+}
+
+func TestLargePayloadBackendRoundTripAcrossEntitySurfaces(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddEntityN("payload", func(ctx *task.EntityContext) (any, error) {
+		switch ctx.Operation {
+		case "set":
+			var value string
+			if err := ctx.GetInput(&value); err != nil {
+				return nil, err
+			}
+			return value, ctx.SetState(value)
+		case "get":
+			var value string
+			if err := ctx.GetState(&value); err != nil {
+				return nil, err
+			}
+			return value, nil
+		default:
+			return nil, fmt.Errorf("unknown operation %q", ctx.Operation)
+		}
+	}))
+	entityID := api.NewEntityID("payload", "large")
+	require.NoError(t, registry.AddOrchestratorN("LargeEntityRead", func(ctx *task.OrchestrationContext) (any, error) {
+		var value string
+		if err := ctx.CallEntity(entityID, "get").Await(&value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}))
+
+	store := payload.NewMemoryStore()
+	payloadOptions := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  8,
+		MaxPayloadBytes: 1024 * 1024,
+	}
+	rawBackend := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), backend.DefaultLogger())
+	wrappedBackend, err := backend.NewLargePayloadBackend(rawBackend, payloadOptions)
+	require.NoError(t, err)
+	entityBackend := wrappedBackend.(backend.EntityBackend)
+	executor := task.NewTaskExecutor(registry)
+	worker := backend.NewTaskHubWorker(
+		wrappedBackend,
+		backend.NewOrchestrationWorker(wrappedBackend, executor, backend.DefaultLogger()),
+		backend.NewActivityTaskWorker(wrappedBackend, executor, backend.DefaultLogger()),
+		backend.DefaultLogger(),
+		backend.NewEntityWorker(entityBackend, executor.(backend.EntityExecutor), backend.DefaultLogger()),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, worker.Start(ctx))
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+	})
+
+	client := backend.NewTaskHubClient(wrappedBackend).(backend.EntityTaskHubClient)
+	input := strings.Repeat("entity-payload-", 64)
+	require.NoError(t, client.SignalEntity(ctx, entityID, "set", api.WithSignalInput(input)))
+	require.Eventually(t, func() bool {
+		metadata, err := client.FetchEntityMetadata(ctx, entityID, true)
+		return err == nil && metadata != nil && metadata.SerializedState == `"`+input+`"`
+	}, 10*time.Second, 50*time.Millisecond)
+
+	rawEntityBackend := rawBackend.(backend.EntityQueryBackend)
+	rawMetadata, err := rawEntityBackend.GetEntityMetadata(ctx, entityID, true)
+	require.NoError(t, err)
+	require.Contains(t, rawMetadata.SerializedState, "durabletask-payload:v1:")
+
+	instanceID, err := client.ScheduleNewOrchestration(ctx, "LargeEntityRead")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, `"`+input+`"`, metadata.SerializedOutput)
+
+	query, err := client.QueryEntities(ctx, api.EntityQuery{
+		InstanceIDStartsWith: entityID.String(),
+		IncludeState:         true,
+	})
+	require.NoError(t, err)
+	require.Len(t, query.Entities, 1)
+	require.Equal(t, `"`+input+`"`, query.Entities[0].SerializedState)
 }

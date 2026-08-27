@@ -820,6 +820,9 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 	}
 	entityKey := entityID.String()
 	if engine.criticalSectionID != "" {
+		if engine.criticalSectionAvailable == nil {
+			return ctx.newFailedTask(engine, fmt.Errorf("entity lock acquisition is still pending"))
+		}
 		available, locked := engine.criticalSectionAvailable[entityKey]
 		if !locked {
 			return ctx.newFailedTask(engine, fmt.Errorf("entity %s is not part of the current critical section", entityKey))

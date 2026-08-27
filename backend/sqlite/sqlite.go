@@ -1485,10 +1485,16 @@ func (be *sqliteBackend) AbandonEntityWorkItem(ctx context.Context, wi *backend.
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	var visibleTime *time.Time
+	if delay := wi.GetAbandonDelay(); delay > 0 {
+		value := time.Now().UTC().Add(delay)
+		visibleTime = &value
+	}
 	for _, messageID := range wi.MessageIDs {
 		if _, err := tx.ExecContext(
 			ctx,
-			"UPDATE EntityMessages SET [LockedBy] = NULL WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+			"UPDATE EntityMessages SET [LockedBy] = NULL, [VisibleTime] = ? WHERE [SequenceNumber] = ? AND [LockedBy] = ?",
+			visibleTime,
 			messageID,
 			wi.LockedBy,
 		); err != nil {

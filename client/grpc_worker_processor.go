@@ -424,6 +424,11 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		w.abandonEntity(ctx, client, completionToken)
 		return
 	}
+	if err := largepayload.TransformEntityBatchRequest(ctx, w.options.largePayloads, request); err != nil {
+		w.logger.Errorf("%s: failed to hydrate entity batch payloads: %v", request.GetInstanceId(), err)
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
 	executor, ok := w.executor.(backend.EntityExecutor)
 	if !ok {
 		w.logger.Error("task executor does not support entity work items")
@@ -447,6 +452,11 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		operationInfos = operationInfos[:len(result.Results)]
 	}
 	result.OperationInfos = append([]*protos.OperationInfo(nil), operationInfos...)
+	if err := largepayload.TransformEntityBatchResult(ctx, w.options.largePayloads, result); err != nil {
+		w.logger.Errorf("%s: failed to externalize entity batch payloads: %v", request.GetInstanceId(), err)
+		w.abandonEntity(ctx, client, completionToken)
+		return
+	}
 
 	err = w.executeRPCWithRetry(ctx, "complete entity task", func(callCtx context.Context) error {
 		_, callErr := client.CompleteEntityTask(callCtx, result)
