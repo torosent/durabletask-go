@@ -98,8 +98,10 @@ func TestCanceledExternalEventWaiterDoesNotPoisonDelivery(t *testing.T) {
 		child, cancel := ctx.WithCancel()
 		canceled := child.WaitForSingleEvent("signal", -1)
 		cancel()
-		if err := canceled.Await(nil); !errors.Is(err, ErrTaskCanceled) {
-			return nil, fmt.Errorf("canceled waiter returned %v", err)
+		if err := canceled.Await(nil); err == nil {
+			return nil, errors.New("canceled waiter returned no error")
+		} else if !errors.Is(err, ErrTaskCanceled) {
+			return nil, fmt.Errorf("canceled waiter returned unexpected error: %w", err)
 		}
 		var value string
 		if err := active.Await(&value); err != nil {

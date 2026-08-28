@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
@@ -41,6 +42,7 @@ func TestRedundantSuspendIsDroppedNotBuffered(t *testing.T) {
 			for range suspendCount {
 				events = append(events, helpers.NewSuspendOrchestrationEvent("hold"))
 			}
+
 			events = append(
 				events,
 				helpers.NewEventRaisedEvent("release", wrapperspb.String(`"payload"`)),
@@ -62,6 +64,56 @@ func TestRedundantSuspendIsDroppedNotBuffered(t *testing.T) {
 			)
 			require.Equal(t, `"payload"`, completed.GetResult().GetValue())
 		})
+	}
+}
+
+func TestTerminationReplacesNaturalCompletionInTheSameTurn(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("complete-on-event", func(ctx *OrchestrationContext) (any, error) {
+		if err := ctx.WaitForSingleEvent("finish", -1).Await(nil); err != nil {
+			return nil, err
+		}
+		return "natural", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("terminate-completion-race")
+	result := executeOrchestrationTurn(
+		t,
+		registry,
+		instanceID,
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent(
+				"complete-on-event",
+				string(instanceID),
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+		},
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewEventRaisedEvent("finish", nil),
+			helpers.NewExecutionTerminatedEvent(wrapperspb.String(`"terminated"`), true),
+		},
+	)
+	var completions []*protos.CompleteOrchestrationAction
+	for _, action := range result.Actions {
+		if completion := action.GetCompleteOrchestration(); completion != nil {
+			completions = append(completions, completion)
+		}
+	}
+	if len(completions) != 1 {
+		t.Fatalf("completion actions = %d, want 1: %v", len(completions), result.Actions)
+	}
+	if got, want := completions[0].GetOrchestrationStatus(),
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED; got != want {
+		t.Fatalf("completion status = %v, want %v", got, want)
+	}
+	if got, want := completions[0].GetResult().GetValue(), `"terminated"`; got != want {
+		t.Fatalf("completion result = %q, want %q", got, want)
 	}
 }
 

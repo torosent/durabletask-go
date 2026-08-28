@@ -24,6 +24,11 @@ func TestExportModeAndStatusStrings(t *testing.T) {
 	assert.Equal(t, "Failed", ExportJobStatusFailed.String())
 	assert.Equal(t, "Completed", ExportJobStatusCompleted.String())
 	assert.Equal(t, "ExportJobStatus(9)", ExportJobStatus(9).String())
+	assert.True(t, ExportJobStatusPending.IsValid())
+	assert.True(t, ExportJobStatusActive.IsValid())
+	assert.True(t, ExportJobStatusFailed.IsValid())
+	assert.True(t, ExportJobStatusCompleted.IsValid())
+	assert.False(t, ExportJobStatus(9).IsValid())
 
 	// The persisted numeric values are part of the wire contract with .NET.
 	assert.Equal(t, 0, int(ExportJobStatusPending))

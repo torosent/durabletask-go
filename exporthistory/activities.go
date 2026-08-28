@@ -56,21 +56,21 @@ func (r *exportRuntime) listTerminalInstancesActivity(ctx task.ActivityContext) 
 	if len(statuses) == 0 {
 		statuses = TerminalStatuses()
 	}
-	for _, status := range statuses {
-		if !isTerminalStatus(status) {
-			return nil, &ValidationError{
-				Message: terminalStatusesValidationMessage,
-			}
-		}
+	if err := validateTerminalStatuses(statuses); err != nil {
+		return nil, err
 	}
 	pageSize := input.MaxInstancesPerBatch
 	if pageSize <= 0 {
 		pageSize = DefaultMaxInstancesPerBatch
 	}
+	var completedTimeTo time.Time
+	if input.CompletedTimeTo != nil {
+		completedTimeTo = *input.CompletedTimeTo
+	}
 	page, err := r.source.ListInstanceIDs(ctx.Context(), api.InstanceIDQuery{
 		RuntimeStatus:     statuses,
 		CompletedTimeFrom: input.CompletedTimeFrom,
-		CompletedTimeTo:   input.CompletedTimeTo,
+		CompletedTimeTo:   completedTimeTo,
 		PageSize:          pageSize,
 		ContinuationToken: input.LastInstanceKey,
 	})
@@ -82,9 +82,9 @@ func (r *exportRuntime) listTerminalInstancesActivity(ctx task.ActivityContext) 
 	}
 	result := InstancePage{InstanceIDs: make([]string, 0, len(page.InstanceIDs))}
 	// A task hub reports the end of the stream by omitting the continuation
-	// token. Leaving the checkpoint nil keeps the caller from committing an
-	// empty cursor, which would restart the scan from the beginning of the
-	// window and re-export the same instances forever.
+	// token. Leaving the checkpoint nil preserves the last opaque backend cursor;
+	// a continuous job may re-scan that final page, but deterministic blob names
+	// make the repeated writes idempotent.
 	if page.ContinuationToken != "" {
 		result.NextCheckpoint = &ExportCheckpoint{LastInstanceKey: page.ContinuationToken}
 	}

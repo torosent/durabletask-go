@@ -11,6 +11,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestLongTimerSplitsIntoDeterministicSequentialChunks(t *testing.T) {
@@ -62,6 +63,64 @@ func TestLongTimerSplitsIntoDeterministicSequentialChunks(t *testing.T) {
 	}
 	if got, want := completionResult(t, response), `"done"`; got != want {
 		t.Fatalf("result = %s, want %s", got, want)
+	}
+}
+
+func TestLongTimerReplaysHistoryCreatedBeforeTimerSplitting(t *testing.T) {
+	const delay = 7 * time.Hour
+	registry := NewTaskRegistry()
+	if err := registry.AddActivityN("after-timer", func(ActivityContext) (any, error) {
+		return "done", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.AddOrchestratorN("legacy-long-timer", func(ctx *OrchestrationContext) (any, error) {
+		if err := ctx.CreateTimer(delay).Await(nil); err != nil {
+			return nil, err
+		}
+		var result string
+		if err := ctx.CallActivity("after-timer").Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	instanceID := api.InstanceID("legacy-long-timer-instance")
+	startTime := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(delay)
+	history := []*protos.HistoryEvent{
+		timerOrchestratorStartedAt(startTime),
+		helpers.NewExecutionStartedEvent(
+			"legacy-long-timer",
+			string(instanceID),
+			nil,
+			nil,
+			nil,
+			nil,
+		),
+		helpers.NewTimerCreatedEvent(0, timestamppb.New(deadline)),
+		timerOrchestratorStartedAt(deadline.Add(-time.Second)),
+		helpers.NewTimerFiredEvent(0, timestamppb.New(deadline), nil),
+		helpers.NewTaskScheduledEvent(1, "after-timer", nil, nil, nil),
+		timerOrchestratorStartedAt(deadline),
+		helpers.NewTaskCompletedEvent(1, wrapperspb.String(`"done"`)),
+	}
+	response := executeTimerTurn(
+		t,
+		NewTaskExecutor(registry, WithMaximumTimerInterval(3*time.Hour)),
+		instanceID,
+		history,
+		nil,
+	)
+	if got, want := completionResult(t, response), `"done"`; got != want {
+		t.Fatalf("result = %s, want %s", got, want)
+	}
+	for _, action := range response.Actions {
+		if action.GetCreateTimer() != nil || action.GetScheduleTask() != nil {
+			t.Fatalf("legacy timer replay produced unexpected action: %v", action)
+		}
 	}
 }
 

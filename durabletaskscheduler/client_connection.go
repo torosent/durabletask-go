@@ -92,15 +92,17 @@ func (c *recreatingClientConn) NewStream(
 	if err != nil {
 		return nil, err
 	}
-	release := sync.OnceFunc(func() {
-		c.release(transport)
-	})
-	opts = append(opts, grpc.OnFinish(func(error) {
-		release()
-	}))
+	var finishOnce sync.Once
+	finish := func(callErr error) {
+		finishOnce.Do(func() {
+			c.release(transport)
+			c.recordOutcome(ctx, method, transport, callErr)
+		})
+	}
+	opts = append(opts, grpc.OnFinish(finish))
 	stream, err := transport.connection.NewStream(ctx, desc, method, opts...)
 	if err != nil {
-		release()
+		finish(err)
 	}
 	return stream, err
 }
@@ -164,7 +166,16 @@ func (c *recreatingClientConn) recordOutcome(
 		c.mu.Unlock()
 		return
 	}
-	if err == nil || !countsTowardChannelRecreation(ctx, method, err) {
+	if err == nil {
+		c.consecutiveFailures = 0
+		c.mu.Unlock()
+		return
+	}
+	if isNeutralChannelOutcome(ctx, method, err) {
+		c.mu.Unlock()
+		return
+	}
+	if !countsTowardChannelRecreation(err) {
 		c.consecutiveFailures = 0
 		c.mu.Unlock()
 		return
@@ -275,17 +286,16 @@ func closeClientTransports(transports []*clientTransport) error {
 	return errors.Join(errs...)
 }
 
-func countsTowardChannelRecreation(ctx context.Context, method string, err error) bool {
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return false
-	}
-	switch status.Code(err) {
-	case codes.Unavailable:
+func isNeutralChannelOutcome(ctx context.Context, method string, err error) bool {
+	if ctx.Err() != nil {
 		return true
-	case codes.DeadlineExceeded:
-		return method != protos.TaskHubSidecarService_WaitForInstanceStart_FullMethodName &&
-			method != protos.TaskHubSidecarService_WaitForInstanceCompletion_FullMethodName
-	default:
-		return false
 	}
+	return status.Code(err) == codes.DeadlineExceeded &&
+		(method == protos.TaskHubSidecarService_WaitForInstanceStart_FullMethodName ||
+			method == protos.TaskHubSidecarService_WaitForInstanceCompletion_FullMethodName)
+}
+
+func countsTowardChannelRecreation(err error) bool {
+	code := status.Code(err)
+	return code == codes.Unavailable || code == codes.DeadlineExceeded
 }

@@ -17,8 +17,9 @@
 // never runs two orchestrations concurrently. The orchestration repeatedly lists
 // terminal orchestration instances that match the job's filter, exports each
 // instance's history, and commits a checkpoint back to the entity. A batch job
-// completes when a listing page comes back empty; a continuous job idles and
-// polls again.
+// completes when the task hub reports no further pages; an empty page with a
+// continuation cursor advances the cursor and keeps going. A continuous job
+// idles and lists again.
 //
 // # Usage
 //

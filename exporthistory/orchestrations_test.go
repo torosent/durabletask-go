@@ -362,7 +362,7 @@ func TestExportJobOrchestratorCompletesOnTheFinalPage(t *testing.T) {
 	driver.entityCallInput(commitCheckpointOperation, &commit)
 	assert.Equal(t, int64(1), commit.ScannedInstances)
 	assert.Equal(t, int64(1), commit.ExportedInstances)
-	assert.Nil(t, commit.Checkpoint, "the committed cursor must not be reset to empty")
+	assert.Nil(t, commit.Checkpoint, "the backend cursor must remain opaque")
 	assert.Empty(t, commit.Failures)
 	driver.completeEntityCall(commitCheckpointOperation, nil)
 

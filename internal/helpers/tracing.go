@@ -151,7 +151,7 @@ func SpanContextFromTraceContext(tc *protos.TraceContext) (trace.SpanContext, er
 		// backwards compatibility with older versions of the protobuf
 		traceID = tc.GetTraceParent()
 		spanID = tc.GetSpanID() //nolint:staticcheck // backwards compatibility with older versions of the protobuf
-		traceFlags = "01" // sampled
+		traceFlags = "01"       // sampled
 	}
 
 	decodedTraceID, err = trace.TraceIDFromHex(traceID)

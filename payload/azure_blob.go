@@ -454,10 +454,7 @@ func (s *AzureBlobStore) createContainerWithRetry(ctx context.Context) error {
 		if waitErr := s.waitForRetry(ctx, backoff); waitErr != nil {
 			return waitErr
 		}
-		backoff *= 2
-		if backoff > containerBeingDeletedMaxBackoff {
-			backoff = containerBeingDeletedMaxBackoff
-		}
+		backoff = min(backoff*2, containerBeingDeletedMaxBackoff)
 	}
 }
 

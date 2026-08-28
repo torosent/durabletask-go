@@ -6,6 +6,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 func TestNewOptionsFromConnectionString(t *testing.T) {
@@ -579,4 +580,14 @@ func TestOptionsValidateRejectsNegativeChannelRecreateInterval(t *testing.T) {
 	options := NewOptions("scheduler.example.com", "hub")
 	options.ChannelRecreateMinInterval = -time.Second
 	require.ErrorContains(t, options.Validate(), "channel recreate minimum interval")
+}
+
+func TestOptionsValidateRejectsNilInterceptors(t *testing.T) {
+	options := NewOptions("scheduler.example.com", "hub")
+	options.UnaryInterceptors = []grpc.UnaryClientInterceptor{nil}
+	require.ErrorContains(t, options.Validate(), "unary interceptors")
+
+	options.UnaryInterceptors = nil
+	options.StreamInterceptors = []grpc.StreamClientInterceptor{nil}
+	require.ErrorContains(t, options.Validate(), "stream interceptors")
 }

@@ -118,6 +118,11 @@ func (s ExportJobStatus) String() string {
 	}
 }
 
+// IsValid reports whether s is a persisted export job status.
+func (s ExportJobStatus) IsValid() bool {
+	return s >= ExportJobStatusPending && s <= ExportJobStatusCompleted
+}
+
 // ExportFormatKind selects the serialization of an exported history.
 type ExportFormatKind int
 
@@ -450,7 +455,7 @@ type ExportJobRunRequest struct {
 // A zero CompletedTimeTo means the window has no upper bound.
 type ListTerminalInstancesRequest struct {
 	CompletedTimeFrom    time.Time                 `json:"CompletedTimeFrom"`
-	CompletedTimeTo      time.Time                 `json:"CompletedTimeTo,omitempty"`
+	CompletedTimeTo      *time.Time                `json:"CompletedTimeTo"`
 	RuntimeStatus        []api.OrchestrationStatus `json:"RuntimeStatus,omitempty"`
 	LastInstanceKey      string                    `json:"LastInstanceKey,omitempty"`
 	MaxInstancesPerBatch int                       `json:"MaxInstancesPerBatch"`
@@ -497,6 +502,18 @@ func isTerminalStatus(status api.OrchestrationStatus) bool {
 	default:
 		return false
 	}
+}
+
+// validateTerminalStatuses rejects a filter that names any status an export job
+// cannot read. It is shared by client-side normalization and the listing
+// activity so both reject the same set with the same message.
+func validateTerminalStatuses(statuses []api.OrchestrationStatus) error {
+	for _, status := range statuses {
+		if !isTerminalStatus(status) {
+			return &ValidationError{Message: terminalStatusesValidationMessage}
+		}
+	}
+	return nil
 }
 
 func (state *ExportJobState) description(jobID string) *ExportJobDescription {

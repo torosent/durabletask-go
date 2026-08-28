@@ -20,9 +20,10 @@ const maxConcurrentPayloadOperations = 8
 //   - An empty operation list does no work and never reports cancellation.
 //   - The failure of the earliest operation in message order is returned even
 //     when a later operation fails first or cancellation follows.
-//   - No operation starts after a failure is recorded, and every operation that
-//     did start always finishes before runBounded returns, so no operation
-//     mutates its target after the caller regains control.
+//   - No operation is dispatched after a failure is recorded. An operation
+//     already dispatched may begin afterwards, but every dispatched operation
+//     finishes before runBounded returns, so no operation mutates its target
+//     after the caller regains control.
 //   - Cancellation is reported only when it actually stopped an operation from
 //     starting, so already-completed work is never turned into an error.
 func runBounded(ctx context.Context, operations []func(context.Context) error) error {

@@ -111,7 +111,8 @@ func WithOrchestratorNotFoundStrategy(strategy OrchestratorNotFoundStrategy) Tas
 	}
 }
 
-// WithOrchestrationOptions configures deterministic orchestration engine policies.
+// WithOrchestrationOptions configures deterministic orchestration engine
+// policies. It panics when MaximumTimerInterval is negative.
 func WithOrchestrationOptions(options OrchestrationOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.orchestrationOptions = normalizeOrchestrationOptions(options)

@@ -73,14 +73,16 @@ initial backoff, 250 ms cap, and multiplier 2. Worker channels do not, because
 the worker owns its own reconnect loop.
 
 `NewClient` creates and owns a management connection; call `Close` when done.
-After five consecutive `Unavailable` responses (or unexpected unary
-`DeadlineExceeded` responses), it recreates the channel with a 30-second
-minimum interval. Successful and application-level responses reset the
-counter, while expected deadlines from instance start/completion long polls do
-not count. Configure the thresholds with
+Options created with `NewOptions`, `NewOptionsFromConnectionString`, or
+`NewOptionsWithCredential` recreate the channel after five consecutive
+`Unavailable` responses (or unexpected `DeadlineExceeded` responses), with a
+30-second minimum interval. Successful and application-level responses reset
+the counter, while caller cancellation/deadlines and expected deadlines from
+instance start/completion long polls do not count. Configure the thresholds with
 `Options.ChannelRecreateFailureThreshold` and
 `Options.ChannelRecreateMinInterval`. Authentication, interceptors, large
 payload settings, and data conversion are preserved across replacements.
+A hand-built `Options` value with a zero failure threshold disables recreation.
 
 `client.NewTaskHubGrpcClient`, `client.NewTaskHubGrpcWorker`, and
 `TaskHubGrpcClient.StartWorkItemListener` are lower-level APIs that borrow the
@@ -102,8 +104,9 @@ message is treated as poisoned and keeps escalating.
 are split into deterministic sequential timer actions that retain the original
 deadline. Generic gRPC and embedded workers can configure the same behavior
 with `client.WithMaximumTimerInterval` and `task.WithMaximumTimerInterval`.
-Changing the interval is replay-breaking for in-flight orchestrations with
-affected timers.
+Histories written before splitting remain compatible once the original logical
+timer deadline fires. Changing the interval between two splitting
+configurations is replay-breaking for affected in-flight orchestrations.
 
 ### Advanced management
 
