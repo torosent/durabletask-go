@@ -33,31 +33,14 @@ jobs:
             test-kind: coverage
             test-command: >-
               go test ./... -count=1 -timeout=20m
-              -coverpkg=./api,./task,./client,./backend/...,./durabletaskscheduler,./payload,./internal/analysis/orchestratorgo,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
+              -coverpkg=./api,./task,./client,./durabletaskscheduler,./exporthistory,./payload,./backend,./internal/analysis/orchestratorgo,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
           - go-version: '1.24.x'
             test-kind: race
             test-command: go test -race ./... -count=1 -timeout=30m
 
-    # Boot up a local, clean postgres instance for the postgres tests
+    # Boot up the local Durable Task Scheduler emulator and Azurite, which back
+    # the end-to-end and blob storage tests.
     services:
-      # Label used to access the service container
-      postgres:
-        # Docker Hub image
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        # Set health checks to wait until postgres has started
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          # Maps tcp port 5432 on service container to the host
-          - 5432:5432
-
       dts:
         image: mcr.microsoft.com/dts/dts-emulator:latest
         env:
@@ -82,8 +65,8 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
           
-      - name: Install dependencies
-        run: go get .
+      - name: Download module dependencies
+        run: go mod download
       
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
@@ -101,7 +84,7 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Check orchestrator goroutines
+      - name: Check orchestrators for replay hazards
         run: |
           go build -o "$RUNNER_TEMP/orchestratorvet" ./cmd/orchestratorvet
           go vet -vettool="$RUNNER_TEMP/orchestratorvet" ./...
@@ -119,7 +102,6 @@ jobs:
       # the minimum supported Go version needs a separate non-race execution.
       - name: Run full repository ${{ matrix.test-kind }} tests
         env:
-          POSTGRES_ENABLED: "true"
           DTS_EMULATOR_ENDPOINT: "http://127.0.0.1:8080"
           DTS_TASK_HUB: "default"
           AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"

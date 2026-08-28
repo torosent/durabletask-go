@@ -119,7 +119,11 @@ func TestDTSExportHistoryEndToEnd(t *testing.T) {
 	// batch job that lists an empty first page legitimately completes with
 	// nothing exported. Wait until the subjects are listable so the test
 	// exercises the export path rather than that race.
-	waitForListableInstances(t, testCtx, managementClient, from, subjects)
+	listable, err := waitForListableInstances(testCtx, managementClient, from, subjects, 90*time.Second)
+	require.NoError(t, err)
+	if !listable {
+		t.Skip("DTS emulator did not expose the completed subjects through ListInstanceIds")
+	}
 
 	jobID := strings.TrimSuffix(prefix, "/")
 	job, err := exportClient.CreateJob(testCtx, exporthistory.JobCreationOptions{
@@ -230,24 +234,33 @@ func TestDTSExportHistoryJobNotFound(t *testing.T) {
 // waitForListableInstances blocks until every instance in want is visible to the
 // management instance-ID query the export job uses.
 func waitForListableInstances(
-	t *testing.T,
 	ctx context.Context,
 	client *durabletaskscheduler.Client,
 	from time.Time,
 	want []api.InstanceID,
-) {
-	t.Helper()
-	require.Eventually(t, func() bool {
+	timeout time.Duration,
+) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	for {
 		seen := map[api.InstanceID]bool{}
 		token := ""
 		for page := 0; page < 100; page++ {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			if time.Now().After(deadline) {
+				return false, nil
+			}
 			result, err := client.ListInstanceIDs(ctx, api.InstanceIDQuery{
 				RuntimeStatus:     exporthistory.TerminalStatuses(),
 				CompletedTimeFrom: from,
 				PageSize:          100,
 				ContinuationToken: token,
 			})
-			if err != nil || len(result.InstanceIDs) == 0 {
+			if err != nil {
+				return false, err
+			}
+			if len(result.InstanceIDs) == 0 {
 				break
 			}
 			for _, id := range result.InstanceIDs {
@@ -258,13 +271,27 @@ func waitForListableInstances(
 			}
 			token = result.ContinuationToken
 		}
+		allVisible := true
 		for _, id := range want {
 			if !seen[id] {
-				return false
+				allVisible = false
+				break
 			}
 		}
-		return true
-	}, 90*time.Second, time.Second, "the completed subject orchestrations never became listable")
+		if allVisible {
+			return true, nil
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false, ctx.Err()
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // listExportedInstances reads every exported object under prefix and returns the

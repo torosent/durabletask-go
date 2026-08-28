@@ -139,7 +139,7 @@ func WithLogger(logger *slog.Logger) TaskExecutorOption {
 	}
 }
 
-// WithMetricsHooks configures optional backend-neutral metric callbacks.
+// WithMetricsHooks configures optional transport-neutral metric callbacks.
 func WithMetricsHooks(hooks backend.MetricsHooks) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.metrics = hooks

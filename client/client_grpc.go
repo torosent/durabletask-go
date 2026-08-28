@@ -22,16 +22,13 @@ import (
 	"github.com/microsoft/durabletask-go/internal/tagcodec"
 )
 
-// REVIEW: Can this be merged with backend/client.go somehow?
-
 type TaskHubGrpcClient struct {
-	client                       protos.TaskHubSidecarServiceClient
-	connection                   grpc.ClientConnInterface
-	logger                       backend.Logger
-	allowLegacyIDReusePolicyWire bool
-	largePayloads                *api.LargePayloadOptions
-	defaultVersion               string
-	converter                    api.DataConverter
+	client         protos.TaskHubSidecarServiceClient
+	connection     grpc.ClientConnInterface
+	logger         backend.Logger
+	largePayloads  *api.LargePayloadOptions
+	defaultVersion string
+	converter      api.DataConverter
 
 	listenerMu sync.Mutex
 	listener   *TaskHubGrpcWorker
@@ -40,15 +37,6 @@ type TaskHubGrpcClient struct {
 type TaskHubGrpcClientOption func(*TaskHubGrpcClient)
 
 var ErrUnsupportedOrchestrationIDReusePolicy = errors.New("orchestration ID reuse policy is not supported by the current gRPC wire contract")
-
-// WithLegacyOrchestrationIDReusePolicyWire allows the client to send the legacy
-// IGNORE action to a known-compatible sidecar. Do not use this option with DTS:
-// current DTS servers interpret the shared status field as a replacement policy.
-func WithLegacyOrchestrationIDReusePolicyWire() TaskHubGrpcClientOption {
-	return func(c *TaskHubGrpcClient) {
-		c.allowLegacyIDReusePolicyWire = true
-	}
-}
 
 // WithLargePayloads configures externalization and hydration for management payloads.
 func WithLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcClientOption {
@@ -124,7 +112,7 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		return api.EmptyInstanceID, fmt.Errorf("failed to externalize orchestration input: %w", err)
 	}
 
-	// Propagate the caller's distributed trace context so the backend can parent the
+	// Propagate the caller's distributed trace context so the service can parent the
 	// orchestration's trace to the code that scheduled it. Without this, every
 	// orchestration starts a brand new, disconnected trace.
 	if req.ParentTraceContext == nil {
@@ -155,10 +143,7 @@ func (c *TaskHubGrpcClient) prepareOrchestrationIDReusePolicy(req *protos.Create
 		req.OrchestrationIdReusePolicy = nil
 		return nil
 	case api.REUSE_ID_ACTION_IGNORE:
-		if c.allowLegacyIDReusePolicyWire {
-			return nil
-		}
-		return fmt.Errorf("%w: IGNORE cannot be distinguished from TERMINATE by current DTS servers", ErrUnsupportedOrchestrationIDReusePolicy)
+		return fmt.Errorf("%w: IGNORE cannot be distinguished from TERMINATE by DTS servers", ErrUnsupportedOrchestrationIDReusePolicy)
 	default:
 		return fmt.Errorf("invalid orchestration ID reuse action: %d", action)
 	}

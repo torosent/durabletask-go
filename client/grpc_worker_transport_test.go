@@ -135,7 +135,7 @@ func TestWorkerTransientRPCRetryFollowsTheDeterministicSchedule(t *testing.T) {
 	waits := &recordedWaits{}
 	worker := newFakeWorker(
 		t,
-		&fakeSidecarClient{stream: newFakeWorkItemStream(0)},
+		&fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
 		WithWorkerTransientRetryPolicy(4, 10*time.Millisecond, 40*time.Millisecond),
 		withRecordedWaits(waits),
 	)
@@ -170,13 +170,13 @@ func (s *replayStream) Recv() (*protos.WorkItem, error) {
 	return nil, errSilentDisconnect
 }
 
-// replaySidecarClient hands out a fresh replayStream per stream generation.
-type replaySidecarClient struct {
-	*fakeSidecarClient
+// replaySchedulerClient hands out a fresh replayStream per stream generation.
+type replaySchedulerClient struct {
+	*fakeSchedulerClient
 	messages int
 }
 
-func (c *replaySidecarClient) GetWorkItems(
+func (c *replaySchedulerClient) GetWorkItems(
 	context.Context,
 	*protos.GetWorkItemsRequest,
 	...grpc.CallOption,
@@ -263,14 +263,14 @@ func TestPoisonedSilenceEscalatesWhileDrainAfterFirstMessageResets(t *testing.T)
 			waits := &recordedWaits{}
 			worker := newFakeWorker(
 				t,
-				&fakeSidecarClient{stream: newFakeWorkItemStream(0)},
+				&fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
 				WithWorkerReconnectBackoff(10*time.Millisecond, 80*time.Millisecond),
 				withRecordedWaits(waits),
 			)
 			worker.clientFactory = func(context.Context) (protos.TaskHubSidecarServiceClient, io.Closer, error) {
-				return &replaySidecarClient{
-					fakeSidecarClient: &fakeSidecarClient{stream: newFakeWorkItemStream(0)},
-					messages:          testCase.messages,
+				return &replaySchedulerClient{
+					fakeSchedulerClient: &fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
+					messages:            testCase.messages,
 				}, nil, nil
 			}
 
@@ -293,7 +293,7 @@ func TestTransientConnectFailuresEscalateWithinTheReconnectLoop(t *testing.T) {
 	waits := &recordedWaits{}
 	worker := newFakeWorker(
 		t,
-		&fakeSidecarClient{stream: newFakeWorkItemStream(0)},
+		&fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
 		WithWorkerReconnectBackoff(10*time.Millisecond, 40*time.Millisecond),
 		withRecordedWaits(waits),
 	)
@@ -327,12 +327,12 @@ func (s *racingStream) Recv() (*protos.WorkItem, error) {
 	return s.item, nil
 }
 
-type racingSidecarClient struct {
-	*fakeSidecarClient
+type racingSchedulerClient struct {
+	*fakeSchedulerClient
 	racing *racingStream
 }
 
-func (c *racingSidecarClient) GetWorkItems(
+func (c *racingSchedulerClient) GetWorkItems(
 	ctx context.Context,
 	_ *protos.GetWorkItemsRequest,
 	_ ...grpc.CallOption,
@@ -342,9 +342,9 @@ func (c *racingSidecarClient) GetWorkItems(
 }
 
 func TestSilenceTimeoutDoesNotDropAConcurrentlyDeliveredWorkItem(t *testing.T) {
-	inner := &fakeSidecarClient{stream: newFakeWorkItemStream(0)}
-	client := &racingSidecarClient{
-		fakeSidecarClient: inner,
+	inner := &fakeSchedulerClient{stream: newFakeWorkItemStream(0)}
+	client := &racingSchedulerClient{
+		fakeSchedulerClient: inner,
 		racing: &racingStream{item: &protos.WorkItem{
 			Request: &protos.WorkItem_ActivityRequest{ActivityRequest: &protos.ActivityRequest{
 				Name:                  "activity",
@@ -442,7 +442,7 @@ func TestSilenceTimeoutRacingNonRetryableStatusStopsTheWorker(t *testing.T) {
 
 	worker := newFakeWorker(
 		t,
-		&fakeSidecarClient{stream: newFakeWorkItemStream(0)},
+		&fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
 		WithWorkerSilentDisconnectTimeout(time.Millisecond),
 		withRecordedWaits(&recordedWaits{}),
 	)
@@ -482,7 +482,7 @@ func TestStreamHistoryHandlesManySingleEventChunksWithoutQuadraticCopying(t *tes
 			Events: []*protos.HistoryEvent{{EventId: int32(i)}},
 		})
 	}
-	client := &fakeSidecarClient{stream: newFakeWorkItemStream(0), history: history}
+	client := &fakeSchedulerClient{stream: newFakeWorkItemStream(0), history: history}
 	worker := newFakeWorker(t, client, WithWorkerSilentDisconnectTimeout(time.Minute))
 
 	runtime.GC()
@@ -685,7 +685,7 @@ func TestOwnedConnectionFactoryRecreatesAndClosesRetiredConnections(t *testing.T
 	secondStream.results <- fakeWorkItemResult{item: &protos.WorkItem{
 		Request: &protos.WorkItem_HealthPing{HealthPing: &protos.HealthPing{}},
 	}}
-	clients := []*fakeSidecarClient{{stream: firstStream}, {stream: secondStream}}
+	clients := []*fakeSchedulerClient{{stream: firstStream}, {stream: secondStream}}
 	closers := []*countingCloser{{}, {}}
 
 	var generations atomic.Int32

@@ -1,6 +1,6 @@
 // Package failurechain provides a shared, table-driven assertion for durable
-// failure chains so the embedded, gRPC, and service surfaces all validate the
-// same cross-language contract.
+// failure chains, so the Durable Task Scheduler tests validate the same
+// cross-language contract the other language SDKs do.
 package failurechain
 
 import (
@@ -12,8 +12,8 @@ import (
 
 // LeafError is an application error that opts into every durable failure
 // enrichment hook: a stable cross-language error type, a stack trace, custom
-// properties, and the non-retriable marker. Surfaces reuse it so the same leaf
-// contract is exercised embedded, over gRPC, and against a live service.
+// properties, and the non-retriable marker. Tests reuse it so the same leaf
+// contract is exercised against a live service.
 type LeafError struct {
 	Message    string
 	ErrorType  api.ErrorType

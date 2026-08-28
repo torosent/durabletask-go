@@ -1,8 +1,7 @@
-# Durable Task Scheduler transport
+# Durable Task Scheduler SDK
 
-The `durabletaskscheduler` package connects Go orchestrations and activities to
-Durable Task Scheduler (DTS). It is a transport/configuration package, not a
-storage `backend.Backend`.
+The `durabletaskscheduler` package is the primary SDK surface for connecting Go
+management clients and workers to Durable Task Scheduler (DTS).
 
 ## Configuration
 
@@ -102,10 +101,8 @@ message is treated as poisoned and keeps escalating.
 
 `Options.MaximumTimerInterval` defaults to three days. Longer durable timers
 are split into deterministic sequential timer actions that retain the original
-deadline. Generic gRPC and embedded workers can configure the same behavior
-with `client.WithMaximumTimerInterval` and `task.WithMaximumTimerInterval`.
-Histories written before splitting remain compatible once the original logical
-timer deadline fires. Changing the interval between two splitting
+deadline. Histories written before splitting remain compatible once the original
+logical timer deadline fires. Changing the interval between two splitting
 configurations is replay-breaking for affected in-flight orchestrations.
 
 ### Advanced management
@@ -124,16 +121,12 @@ timestamps, failures, tags, context fields, rewind markers, and native entity
 events. Serialized payloads remain raw until a `ReadInput`, `ReadResult`, or
 `ReadData` helper applies the configured data converter.
 
-The embedded sqlite and Postgres sidecar implementations support these
-operations directly. The current DTS emulator supports query, restart, and
-batch purge, but has known service limitations: `SkipGracefulOrchestrationTerminations`
+The current DTS emulator supports query, restart, and batch purge, but has known
+service limitations: `SkipGracefulOrchestrationTerminations`
 is unimplemented, rewind can return success without transitioning the failed
 instance, filtered purge can complete without deleting matches, and
 `ListInstanceIds` can omit matching IDs. The emulator integration tests record
 these limitations explicitly.
-
-Embedded gRPC hosts must opt in to destructive task-hub create/delete RPCs with
-`backend.WithTaskHubLifecycleManagement()`. They remain disabled by default.
 
 ### Worker routing and capabilities
 
@@ -151,15 +144,15 @@ unversioned `""` override. ContinueAsNew can migrate with
 `task.UnversionedTaskVersion`.
 
 The current DTS service accepts numeric versions in
-`Major[.Minor[.Patch]]` form. The Go registry and embedded backends also support
-case-insensitive opaque version strings, but DTS applications should use numeric
-versions such as `"1.0"` and `"2.0"`.
+`Major[.Minor[.Patch]]` form. The Go registry also supports case-insensitive
+opaque version strings, but DTS applications should use numeric versions such as
+`"1.0"` and `"2.0"`.
 
 Use `client.WithAutoWorkItemFilters()` to derive filters from the registry, or
 `client.WithWorkItemFilters` for an explicit override. Local enforcement is a
-fallback for services that ignore the filter request; the embedded sidecar
-routes work using the same filters. `CurrentOrOlder` ranges cannot be represented
-by the protocol filter and are therefore enforced by the worker. Service-side
+fallback for services that ignore the filter request. `CurrentOrOlder` ranges
+cannot be represented by the protocol filter and are therefore enforced by the
+worker. Service-side
 filters can leave a task pending indefinitely when no worker advertises it,
 whereas unfiltered delivery produces a deterministic task-not-found failure.
 Auto-generated filters reject task kinds with no registrations and validate
@@ -271,10 +264,9 @@ unapproved hosts, malformed paths, oversized downloads, and invalid integrity
 metadata are rejected. Go-written blobs include size, SHA-256, and content-MD5
 integrity data; .NET blobs without that metadata remain readable.
 
-Workers advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured. The same
-abstraction can be used with embedded backends through
-`backend.NewLargePayloadBackend`. Resolver implementations must treat reference
-locations as untrusted and enforce their own scheme/account/path allow lists.
+Workers advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured.
+Resolver implementations must treat reference locations as untrusted and enforce
+their own scheme/account/path allow lists.
 
 ## Worker lifecycle
 
@@ -289,9 +281,9 @@ cancels them only if the shutdown context expires.
 | Schedule, bounded query/list, and wait for orchestrations | Supported |
 | Tags on schedule, metadata, query, sub-orchestration, continue-as-new, restart, and rewind | Supported; distinct from immutable context fields |
 | Restart and batch/filter purge | Supported; see emulator limitations above |
-| Rewind | Supported by embedded sqlite/Postgres; current emulator does not transition instances |
-| Skip-graceful termination | Supported by embedded sqlite/Postgres; current emulator returns `Unimplemented` |
-| Task-hub create/delete | Embedded sidecars require `backend.WithTaskHubLifecycleManagement`; remote-service behavior is provider-specific |
+| Rewind | Client and wire support are complete; current emulator does not transition instances |
+| Skip-graceful termination | Client and wire support are complete; current emulator returns `Unimplemented` |
+| Task-hub create/delete | Client and wire support are complete; remote-service behavior is provider-specific |
 | Raise events, suspend/resume, terminate, and single-instance purge | Supported |
 | Orchestration and activity execution | Supported |
 | Bounded orchestration/activity/entity concurrency | Supported |
@@ -300,7 +292,7 @@ cancels them only if the shutdown context expires.
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
 | Public orchestration history | Supported through buffered and callback-streaming API-owned records |
 | Version-aware registry dispatch and controlled unversioned fallback | Supported |
-| Default versions, activity inheritance, and ContinueAsNew migration | Supported; backend/service must honor `newVersion` |
+| Default versions, activity inheritance, and ContinueAsNew migration | Supported; DTS must honor `newVersion` |
 | Name/version work-item filters | Supported, auto-generated or explicit, advertised, and locally enforced |
 | Pluggable application data conversion | Supported with shared client/worker configuration; default is JSON |
 | Recurring interval schedules | Supported: create/get/list/describe/update/pause/resume/delete, start/end times, versions, tags/context, and retries |
@@ -309,12 +301,12 @@ cancels them only if the shutdown context expires.
 | Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
-| Legacy instance-ID `IGNORE` | Known-compatible local sidecars only, with `client.WithLegacyOrchestrationIDReusePolicyWire`; rejected for DTS because the current wire format is ambiguous |
+| Legacy instance-ID `IGNORE` | Unsupported by DTS because the current wire format is ambiguous |
 | History export jobs (preview) | Supported through the top-level [`exporthistory`](../exporthistory) package; register the system tasks and opt in with `exporthistory.WithExportHistory()` |
 
 The current V2 protobuf cannot carry per-operation trace context or request time
 to an entity worker, and it has no properties map for legacy extended-session
-state elision. V2 backends therefore send entity state on every work item; causal
+state elision. DTS therefore sends entity state on every V2 work item; causal
 trace metadata on entity-emitted actions is best-effort.
 
 ## Emulator tests

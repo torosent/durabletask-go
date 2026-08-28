@@ -21,8 +21,8 @@ type ClientOptions struct {
 	Prefix string
 }
 
-// clientBackend is the narrow task hub surface the export client uses.
-type clientBackend interface {
+// taskHubClient is the narrow task hub surface the export client uses.
+type taskHubClient interface {
 	ScheduleNewOrchestration(
 		ctx context.Context,
 		orchestrator string,
@@ -41,7 +41,7 @@ type clientBackend interface {
 
 // Client creates and inspects export jobs in a task hub.
 type Client struct {
-	backend   clientBackend
+	hub       taskHubClient
 	container string
 	prefix    string
 }
@@ -54,10 +54,10 @@ func NewClient(client *durabletaskclient.TaskHubGrpcClient, options ClientOption
 	return newClient(client, options)
 }
 
-// newClient builds a client over the narrow backend so tests and alternative
-// transports can supply their own implementation.
-func newClient(backend clientBackend, options ClientOptions) (*Client, error) {
-	if backend == nil {
+// newClient builds a client over the narrow task hub surface so tests can
+// supply their own implementation.
+func newClient(hub taskHubClient, options ClientOptions) (*Client, error) {
+	if hub == nil {
 		return nil, &ValidationError{Message: "task hub client is required"}
 	}
 	container := strings.TrimSpace(options.ContainerName)
@@ -70,7 +70,7 @@ func newClient(backend clientBackend, options ClientOptions) (*Client, error) {
 		return nil, err
 	}
 	return &Client{
-		backend:   backend,
+		hub:       hub,
 		container: container,
 		prefix:    options.Prefix,
 	}, nil
@@ -78,14 +78,14 @@ func newClient(backend clientBackend, options ClientOptions) (*Client, error) {
 
 // JobClient returns a handle for jobID without contacting the service.
 func (c *Client) JobClient(jobID string) (*JobClient, error) {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return nil, &ValidationError{Message: "export history client is required"}
 	}
 	if err := validateJobID(jobID); err != nil {
 		return nil, err
 	}
 	return &JobClient{
-		backend:   c.backend,
+		hub:       c.hub,
 		container: c.container,
 		prefix:    c.prefix,
 		jobID:     jobID,
@@ -95,7 +95,7 @@ func (c *Client) JobClient(jobID string) (*JobClient, error) {
 // CreateJob normalizes options, resolves the destination, creates the job, and
 // returns a handle for it.
 func (c *Client) CreateJob(ctx context.Context, options JobCreationOptions) (*JobClient, error) {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return nil, &ValidationError{Message: "export history client is required"}
 	}
 	normalized, err := options.Normalize()
@@ -127,7 +127,7 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*ExportJobDescriptio
 // so a page can contain fewer than PageSize items and an empty page can still
 // carry a continuation token.
 func (c *Client) ListJobs(ctx context.Context, query ExportJobQuery) (*ExportJobQueryResult, error) {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return nil, &ValidationError{Message: "export history client is required"}
 	}
 	pageSize := query.PageSize
@@ -149,7 +149,7 @@ func (c *Client) ListJobs(ctx context.Context, query ExportJobQuery) (*ExportJob
 			Message: fmt.Sprintf("invalid export job status %d", int(*query.Status)),
 		}
 	}
-	entities, err := c.backend.QueryEntities(ctx, api.EntityQuery{
+	entities, err := c.hub.QueryEntities(ctx, api.EntityQuery{
 		InstanceIDStartsWith: strings.ToLower("@"+ExportJobEntityName+"@") + query.JobIDPrefix,
 		IncludeState:         true,
 		PageSize:             pageSize,
@@ -177,7 +177,7 @@ func (c *Client) ListJobs(ctx context.Context, query ExportJobQuery) (*ExportJob
 
 // JobClient manages one export job.
 type JobClient struct {
-	backend   clientBackend
+	hub       taskHubClient
 	container string
 	prefix    string
 	jobID     string
@@ -201,7 +201,7 @@ func (c *JobClient) ID() string {
 // silently drop the new run, leaving the job Active but idle. That cleanup is
 // skipped for a job that is not terminal, whose run must not be disturbed.
 func (c *JobClient) Create(ctx context.Context, options JobCreationOptions) error {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return &ValidationError{Message: "export job client is required"}
 	}
 	if options.JobID != "" && options.JobID != c.jobID {
@@ -252,14 +252,14 @@ func (c *JobClient) clearPreviousRun(ctx context.Context) error {
 	}
 
 	instanceID := GetOrchestratorInstanceID(c.jobID)
-	if err := c.backend.TerminateOrchestration(ctx, instanceID, api.WithOutput("Export job recreated")); err == nil {
-		if _, err := c.backend.WaitForOrchestrationCompletion(ctx, instanceID); err != nil && ctx.Err() != nil {
+	if err := c.hub.TerminateOrchestration(ctx, instanceID, api.WithOutput("Export job recreated")); err == nil {
+		if _, err := c.hub.WaitForOrchestrationCompletion(ctx, instanceID); err != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
 	} else if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err := c.backend.PurgeOrchestrationState(ctx, instanceID); err != nil {
+	if err := c.hub.PurgeOrchestrationState(ctx, instanceID); err != nil {
 		if isInstanceMissing(err) {
 			return nil
 		}
@@ -299,10 +299,10 @@ func (c *JobClient) resolveDestination(options JobCreationOptions) (*ExportDesti
 
 // Describe returns the job's current description, or a [NotFoundError].
 func (c *JobClient) Describe(ctx context.Context) (*ExportJobDescription, error) {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return nil, &ValidationError{Message: "export job client is required"}
 	}
-	entity, err := c.backend.FetchEntityMetadata(ctx, EntityID(c.jobID), true)
+	entity, err := c.hub.FetchEntityMetadata(ctx, EntityID(c.jobID), true)
 	if errors.Is(err, api.ErrInstanceNotFound) {
 		return nil, &NotFoundError{JobID: c.jobID}
 	}
@@ -327,7 +327,7 @@ func (c *JobClient) Describe(ctx context.Context) (*ExportJobDescription, error)
 // terminating or purging the orchestration fails. A missing orchestration is
 // not an error.
 func (c *JobClient) Delete(ctx context.Context) error {
-	if c == nil || c.backend == nil {
+	if c == nil || c.hub == nil {
 		return &ValidationError{Message: "export job client is required"}
 	}
 	if err := c.operate(ctx, deleteOperation, nil); err != nil {
@@ -338,20 +338,20 @@ func (c *JobClient) Delete(ctx context.Context) error {
 
 func (c *JobClient) terminateAndPurgeOrchestration(ctx context.Context) error {
 	instanceID := GetOrchestratorInstanceID(c.jobID)
-	err := c.backend.TerminateOrchestration(ctx, instanceID, api.WithOutput("Export job deleted"))
+	err := c.hub.TerminateOrchestration(ctx, instanceID, api.WithOutput("Export job deleted"))
 	if err != nil {
 		if isInstanceMissing(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to terminate export orchestration %s: %w", instanceID, err)
 	}
-	if _, err := c.backend.WaitForOrchestrationCompletion(ctx, instanceID); err != nil {
+	if _, err := c.hub.WaitForOrchestrationCompletion(ctx, instanceID); err != nil {
 		if isInstanceMissing(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to wait for export orchestration %s to terminate: %w", instanceID, err)
 	}
-	if err := c.backend.PurgeOrchestrationState(ctx, instanceID); err != nil {
+	if err := c.hub.PurgeOrchestrationState(ctx, instanceID); err != nil {
 		if isInstanceMissing(err) {
 			return nil
 		}
@@ -363,7 +363,7 @@ func (c *JobClient) terminateAndPurgeOrchestration(ctx context.Context) error {
 // operate runs one entity operation through the system operation orchestrator
 // and translates a failed orchestration back into a typed error.
 func (c *JobClient) operate(ctx context.Context, operation string, input any) error {
-	instanceID, err := c.backend.ScheduleNewOrchestration(
+	instanceID, err := c.hub.ScheduleNewOrchestration(
 		ctx,
 		ExecuteExportJobOperationOrchestratorName,
 		api.WithInput(ExportJobOperationRequest{
@@ -377,7 +377,7 @@ func (c *JobClient) operate(ctx context.Context, operation string, input any) er
 	if err != nil {
 		return err
 	}
-	metadata, err := c.backend.WaitForOrchestrationCompletion(ctx, instanceID)
+	metadata, err := c.hub.WaitForOrchestrationCompletion(ctx, instanceID)
 	if err != nil {
 		return err
 	}

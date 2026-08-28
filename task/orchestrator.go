@@ -559,7 +559,7 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	} else if oc := e.GetOrchestratorCompleted(); oc != nil {
 		// Nothing to do
 	} else if e.GetGenericEvent() != nil || e.GetExecutionRewound() != nil {
-		// Backend control markers are replay no-ops.
+		// Service control markers are replay no-ops.
 	} else {
 		err = fmt.Errorf("don't know how to handle event: %v", e)
 	}

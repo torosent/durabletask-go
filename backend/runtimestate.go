@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,13 @@ import (
 
 var ErrDuplicateEvent = errors.New("duplicate event")
 
+// OrchestrationRuntimeState accumulates an orchestration's history and folds the
+// actions an orchestrator turn produced back into it, yielding the new history
+// events plus the outbound orchestrator and entity messages.
+//
+// DTS applies actions service-side, so the SDK does not drive this type at
+// runtime. It is the transport-neutral model of that fold, and tests use it to
+// build realistic histories to replay through the task executor.
 type OrchestrationRuntimeState struct {
 	instanceID            api.InstanceID
 	newEvents             []*protos.HistoryEvent
@@ -536,12 +544,21 @@ func (s *OrchestrationRuntimeState) buildEntityMessage(
 	return history, message, nil
 }
 
-func (s *OrchestrationRuntimeState) getStartedTime() time.Time {
-	var startTime time.Time
-	if len(s.oldEvents) > 0 {
-		startTime = s.oldEvents[0].Timestamp.AsTime()
-	} else if len(s.newEvents) > 0 {
-		startTime = s.newEvents[0].Timestamp.AsTime()
+// getSubOrchestrationInstances returns the sorted, de-duplicated instance IDs of
+// all sub-orchestrations created in the specified events.
+func getSubOrchestrationInstances(oldEvents []*HistoryEvent, newEvents []*HistoryEvent) []api.InstanceID {
+	seen := make(map[api.InstanceID]struct{}, len(oldEvents)+len(newEvents))
+	for _, events := range [][]*HistoryEvent{oldEvents, newEvents} {
+		for _, e := range events {
+			if created := e.GetSubOrchestrationInstanceCreated(); created != nil {
+				seen[api.InstanceID(created.InstanceId)] = struct{}{}
+			}
+		}
 	}
-	return startTime
+	instances := make([]api.InstanceID, 0, len(seen))
+	for id := range seen {
+		instances = append(instances, id)
+	}
+	sort.Slice(instances, func(i, j int) bool { return instances[i] < instances[j] })
+	return instances
 }

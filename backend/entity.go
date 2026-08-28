@@ -3,14 +3,12 @@ package backend
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/structpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // EntityExecutor is an optional extension implemented by executors that can
@@ -19,61 +17,8 @@ type EntityExecutor interface {
 	ExecuteEntity(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
 }
 
-type EntitySignalBackend interface {
-	SignalEntity(context.Context, *protos.SignalEntityRequest) error
-}
-
-type EntityQueryBackend interface {
-	// GetEntityMetadata returns nil, nil when the entity does not exist.
-	GetEntityMetadata(ctx context.Context, id api.EntityID, includeState bool) (*api.EntityMetadata, error)
-	QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error)
-	CleanEntityStorage(ctx context.Context, request api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error)
-}
-
-// EntityBackend is an optional backend extension for native durable entity
-// persistence and work-item scheduling.
-type EntityBackend interface {
-	EntitySignalBackend
-	EntityQueryBackend
-	GetEntityWorkItem(context.Context) (*EntityWorkItem, error)
-	CompleteEntityWorkItem(context.Context, *EntityWorkItem) error
-	AbandonEntityWorkItem(context.Context, *EntityWorkItem) error
-}
-
-// EntityWorkItem contains one serialized entity batch locked by a local backend.
-type EntityWorkItem struct {
-	InstanceID   api.EntityID
-	ExecutionID  string
-	State        *string
-	Operations   []*HistoryEvent
-	MessageIDs   []int64
-	LockedBy     string
-	RetryCount   int32
-	EnqueuedAt   time.Time
-	AbandonDelay time.Duration
-	Result       *protos.EntityBatchResult
-}
-
-func (wi EntityWorkItem) String() string {
-	return wi.InstanceID.String()
-}
-
-func (wi EntityWorkItem) IsWorkItem() bool {
-	return true
-}
-
-func (wi *EntityWorkItem) GetAbandonDelay() time.Duration {
-	if wi == nil {
-		return 0
-	}
-	if wi.AbandonDelay > 0 {
-		return wi.AbandonDelay
-	}
-	return abandonDelayForRetry(wi.RetryCount)
-}
-
-// EntityBatchFromRequestV2 converts a backend-scheduled V2 entity request into
-// the worker-facing batch model and response routing metadata.
+// EntityBatchFromRequestV2 converts a scheduler-dispatched V2 entity request
+// into the worker-facing batch model and response routing metadata.
 func EntityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatchRequest, []*protos.OperationInfo, error) {
 	if request == nil {
 		return nil, nil, fmt.Errorf("entity request must not be nil")
@@ -129,159 +74,4 @@ func EntityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatc
 		batch.Properties = nil
 	}
 	return batch, operationInfos, nil
-}
-
-type EntityMessageDescriptor struct {
-	RequestID        string
-	Kind             string
-	ParentInstanceID string
-	VisibleTime      *time.Time
-}
-
-func DescribeEntityMessage(event *protos.HistoryEvent) (EntityMessageDescriptor, error) {
-	if event == nil {
-		return EntityMessageDescriptor{}, ErrNilHistoryEvent
-	}
-	descriptor := EntityMessageDescriptor{}
-	switch {
-	case event.GetEntityOperationSignaled() != nil:
-		value := event.GetEntityOperationSignaled()
-		descriptor.RequestID = value.RequestId
-		descriptor.Kind = "signal"
-		descriptor.VisibleTime = timestampTime(value.ScheduledTime)
-	case event.GetEntityOperationCalled() != nil:
-		value := event.GetEntityOperationCalled()
-		descriptor.RequestID = value.RequestId
-		descriptor.Kind = "call"
-		descriptor.ParentInstanceID = value.ParentInstanceId.GetValue()
-		descriptor.VisibleTime = timestampTime(value.ScheduledTime)
-	case event.GetEntityLockRequested() != nil:
-		value := event.GetEntityLockRequested()
-		descriptor.RequestID = value.CriticalSectionId
-		descriptor.Kind = "lock"
-		descriptor.ParentInstanceID = value.ParentInstanceId.GetValue()
-	case event.GetEntityUnlockSent() != nil:
-		value := event.GetEntityUnlockSent()
-		descriptor.RequestID = value.CriticalSectionId
-		descriptor.Kind = "unlock"
-		descriptor.ParentInstanceID = value.ParentInstanceId.GetValue()
-	default:
-		return EntityMessageDescriptor{}, fmt.Errorf("unsupported entity message event")
-	}
-	if descriptor.RequestID == "" {
-		return EntityMessageDescriptor{}, fmt.Errorf("entity message request ID must not be empty")
-	}
-	return descriptor, nil
-}
-
-func NewEntitySignalEvent(request *protos.SignalEntityRequest) (*protos.HistoryEvent, error) {
-	if request == nil {
-		return nil, fmt.Errorf("signal entity request must not be nil")
-	}
-	if _, err := api.EntityIDFromString(request.InstanceId); err != nil {
-		return nil, err
-	}
-	if request.RequestId == "" {
-		request.RequestId = uuid.NewString()
-	}
-	if _, err := uuid.Parse(request.RequestId); err != nil {
-		return nil, fmt.Errorf("invalid entity request ID %q: %w", request.RequestId, err)
-	}
-	timestamp := request.RequestTime
-	if timestamp == nil {
-		timestamp = timestamppb.Now()
-	}
-	return &protos.HistoryEvent{
-		EventId:   -1,
-		Timestamp: timestamp,
-		EventType: &protos.HistoryEvent_EntityOperationSignaled{
-			EntityOperationSignaled: &protos.EntityOperationSignaledEvent{
-				RequestId:     request.RequestId,
-				Operation:     request.Name,
-				ScheduledTime: request.ScheduledTime,
-				Input:         request.Input,
-			},
-		},
-	}, nil
-}
-
-var entityRequestNamespace = uuid.MustParse("ea25d996-980f-59f4-a15d-24eaa7d445f0")
-
-func DeterministicEntityRequestID(instanceID, executionID string, actionIndex int) string {
-	return uuid.NewSHA1(
-		entityRequestNamespace,
-		[]byte(fmt.Sprintf("%s|%s|%d", instanceID, executionID, actionIndex)),
-	).String()
-}
-
-func timestampTime(timestamp *timestamppb.Timestamp) *time.Time {
-	if timestamp == nil {
-		return nil
-	}
-	value := timestamp.AsTime()
-	return &value
-}
-
-func NewEntityOperationResponseEvent(info *protos.OperationInfo, result *protos.OperationResult) (*protos.HistoryEvent, string, error) {
-	if info == nil || info.ResponseDestination == nil {
-		return nil, "", nil
-	}
-	if result == nil {
-		return nil, "", fmt.Errorf("entity operation result must not be nil")
-	}
-	event := &protos.HistoryEvent{EventId: -1, Timestamp: timestamppb.Now()}
-	switch {
-	case result.GetSuccess() != nil:
-		event.EventType = &protos.HistoryEvent_EntityOperationCompleted{
-			EntityOperationCompleted: &protos.EntityOperationCompletedEvent{
-				RequestId: info.RequestId,
-				Output:    result.GetSuccess().Result,
-			},
-		}
-	case result.GetFailure() != nil:
-		event.EventType = &protos.HistoryEvent_EntityOperationFailed{
-			EntityOperationFailed: &protos.EntityOperationFailedEvent{
-				RequestId:      info.RequestId,
-				FailureDetails: result.GetFailure().FailureDetails,
-			},
-		}
-	default:
-		return nil, "", fmt.Errorf("entity operation result has no success or failure payload")
-	}
-	return event, info.ResponseDestination.InstanceId, nil
-}
-
-func NewEntityLockGrantedEvent(criticalSectionID string) *protos.HistoryEvent {
-	return &protos.HistoryEvent{
-		EventId:   -1,
-		Timestamp: timestamppb.Now(),
-		EventType: &protos.HistoryEvent_EntityLockGranted{
-			EntityLockGranted: &protos.EntityLockGrantedEvent{CriticalSectionId: criticalSectionID},
-		},
-	}
-}
-
-func NewEntitySignalMessage(
-	sourceInstanceID string,
-	sourceExecutionID string,
-	actionIndex int,
-	action *protos.SendSignalAction,
-) *protos.HistoryEvent {
-	requestID := DeterministicEntityRequestID(sourceInstanceID, sourceExecutionID, actionIndex)
-	timestamp := action.RequestTime
-	if timestamp == nil {
-		timestamp = timestamppb.Now()
-	}
-	return &protos.HistoryEvent{
-		EventId:   -1,
-		Timestamp: timestamp,
-		EventType: &protos.HistoryEvent_EntityOperationSignaled{
-			EntityOperationSignaled: &protos.EntityOperationSignaledEvent{
-				RequestId:     requestID,
-				Operation:     action.Name,
-				ScheduledTime: action.ScheduledTime,
-				Input:         action.Input,
-			},
-		},
-	}
 }

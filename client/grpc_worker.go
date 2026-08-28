@@ -267,7 +267,7 @@ func WithTaskVersioning(versioning task.VersioningOptions) TaskHubGrpcWorkerOpti
 	}
 }
 
-// WithWorkerCapabilities explicitly configures the capabilities advertised to the sidecar.
+// WithWorkerCapabilities explicitly configures the capabilities advertised to DTS.
 func WithWorkerCapabilities(capabilities ...WorkerCapability) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		seen := make(map[WorkerCapability]struct{}, len(capabilities))
@@ -400,8 +400,8 @@ func WithWorkerDataConverter(converter api.DataConverter) TaskHubGrpcWorkerOptio
 	}
 }
 
-// TaskHubGrpcWorker executes orchestration and activity work received from a
-// TaskHubSidecarService work-item stream.
+// TaskHubGrpcWorker executes orchestration, activity, and entity work received from a
+// DTS gRPC work-item stream (named TaskHubSidecarService in the wire contract).
 type TaskHubGrpcWorker struct {
 	clientFactory grpcWorkerClientFactory
 	executor      backend.Executor
