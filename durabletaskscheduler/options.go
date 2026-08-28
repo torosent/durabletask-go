@@ -34,14 +34,37 @@ const (
 
 // Options configures connections to a Durable Task Scheduler endpoint.
 type Options struct {
-	EndpointAddress            string
-	TaskHubName                string
-	Authentication             AuthenticationType
-	Credential                 azcore.TokenCredential
-	ResourceID                 string
-	ClientID                   string
-	TenantID                   string
-	TokenFilePath              string
+	EndpointAddress string
+	TaskHubName     string
+	Authentication  AuthenticationType
+
+	// Credential is required by, and valid only for, AuthenticationTokenCredential.
+	Credential azcore.TokenCredential
+
+	// ResourceID is the DTS resource the access token is requested for. The
+	// requested scope is the resource ID without surrounding whitespace or
+	// trailing slashes plus "/.default". Exactly empty uses DefaultResourceID;
+	// a whitespace-only value is rejected.
+	ResourceID string
+
+	// ClientID is used by ManagedIdentity, WorkloadIdentity, and
+	// InteractiveBrowser. Other modes ignore it, except None and TokenCredential,
+	// which reject it.
+	ClientID string
+
+	// TenantID is used by DefaultAzure, WorkloadIdentity, AzureCLI,
+	// AzurePowerShell, and InteractiveBrowser. Environment and ManagedIdentity
+	// ignore it; None and TokenCredential reject it.
+	TenantID string
+
+	// TokenFilePath is used only by WorkloadIdentity. Other modes ignore it,
+	// except None and TokenCredential, which reject it.
+	TokenFilePath string
+
+	// AdditionallyAllowedTenants is used by DefaultAzure, WorkloadIdentity,
+	// AzureCLI, AzurePowerShell, and InteractiveBrowser. Environment reads
+	// AZURE_ADDITIONALLY_ALLOWED_TENANTS instead and ManagedIdentity ignores it;
+	// None and TokenCredential reject it. Empty entries are dropped.
 	AdditionallyAllowedTenants []string
 
 	// AllowInsecureConnection must be true to use an http:// endpoint. Plaintext
@@ -111,6 +134,11 @@ func NewOptionsWithCredential(endpointAddress, taskHubName string, credential az
 // NewOptionsFromConnectionString parses the DTS connection-string form:
 //
 //	Endpoint=<url>;TaskHub=<name>;Authentication=<type>
+//
+// Keys and Authentication values are case-insensitive, surrounding whitespace is
+// trimmed, empty segments are skipped, and a repeated key uses its last value.
+// Supported optional keys are ClientID, TenantID, TokenFilePath, and the
+// comma-separated AdditionallyAllowedTenants.
 func NewOptionsFromConnectionString(connectionString string) (*Options, error) {
 	values := make(map[string]string)
 	for _, segment := range strings.Split(connectionString, ";") {
@@ -154,13 +182,9 @@ func NewOptionsFromConnectionString(connectionString string) (*Options, error) {
 	options.ClientID = values["clientid"]
 	options.TenantID = values["tenantid"]
 	options.TokenFilePath = values["tokenfilepath"]
-	if tenants := values["additionallyallowedtenants"]; tenants != "" {
-		for _, tenant := range strings.Split(tenants, ",") {
-			if tenant = strings.TrimSpace(tenant); tenant != "" {
-				options.AdditionallyAllowedTenants = append(options.AdditionallyAllowedTenants, tenant)
-			}
-		}
-	}
+	options.AdditionallyAllowedTenants = normalizeAdditionallyAllowedTenants(
+		strings.Split(values["additionallyallowedtenants"], ","),
+	)
 	if options.Authentication == AuthenticationNone {
 		options.AllowInsecureConnection = true
 	}
@@ -186,6 +210,11 @@ func parseAuthenticationType(value string) (AuthenticationType, error) {
 		}
 	}
 	switch {
+	case strings.EqualFold(value, string(AuthenticationTokenCredential)):
+		return "", fmt.Errorf(
+			"authentication %q cannot be set from a connection string; use NewOptionsWithCredential",
+			value,
+		)
 	case strings.EqualFold(value, "VisualStudio"), strings.EqualFold(value, "VisualStudioCode"):
 		return "", fmt.Errorf(
 			"authentication %q has no Azure Identity for Go equivalent; provide an explicit TokenCredential",
@@ -224,6 +253,12 @@ func (o *Options) Validate() error {
 	if o.ChannelRecreateMinInterval < 0 {
 		return fmt.Errorf("DTS channel recreate minimum interval cannot be negative")
 	}
+	if strings.ContainsAny(o.ResourceID, "\r\n") {
+		return fmt.Errorf("DTS resource ID cannot contain newlines")
+	}
+	if o.ResourceID != "" && strings.TrimSpace(o.ResourceID) == "" {
+		return fmt.Errorf("DTS resource ID cannot be blank")
+	}
 	if _, err := api.NormalizeLargePayloadOptions(o.LargePayloads); err != nil {
 		return fmt.Errorf("invalid DTS large payload options: %w", err)
 	}
@@ -246,6 +281,12 @@ func (o *Options) Validate() error {
 		if o.Credential != nil {
 			return fmt.Errorf("DTS credential must be nil when Authentication is None")
 		}
+		if fields := o.identityFieldsInUse(); len(fields) > 0 {
+			return fmt.Errorf(
+				"DTS Authentication None does not use %s",
+				strings.Join(fields, ", "),
+			)
+		}
 	case AuthenticationDefaultAzure:
 		if o.Credential != nil {
 			return fmt.Errorf("use Authentication TokenCredential for an explicit DTS credential")
@@ -263,6 +304,12 @@ func (o *Options) Validate() error {
 		if o.Credential == nil {
 			return fmt.Errorf("DTS TokenCredential authentication requires a credential")
 		}
+		if fields := o.identityFieldsInUse(); len(fields) > 0 {
+			return fmt.Errorf(
+				"DTS Authentication TokenCredential does not use %s; configure them on the credential itself",
+				strings.Join(fields, ", "),
+			)
+		}
 	default:
 		return fmt.Errorf("unsupported DTS authentication type %q", o.Authentication)
 	}
@@ -275,6 +322,26 @@ func (o *Options) Validate() error {
 		}
 	}
 	return nil
+}
+
+// identityFieldsInUse lists the Azure Identity configuration fields that carry a
+// value. It is used to reject configuration that the selected authentication
+// mode can never consume.
+func (o *Options) identityFieldsInUse() []string {
+	var fields []string
+	if strings.TrimSpace(o.ClientID) != "" {
+		fields = append(fields, "ClientID")
+	}
+	if strings.TrimSpace(o.TenantID) != "" {
+		fields = append(fields, "TenantID")
+	}
+	if strings.TrimSpace(o.TokenFilePath) != "" {
+		fields = append(fields, "TokenFilePath")
+	}
+	if len(normalizeAdditionallyAllowedTenants(o.AdditionallyAllowedTenants)) > 0 {
+		fields = append(fields, "AdditionallyAllowedTenants")
+	}
+	return fields
 }
 
 func normalizeEndpoint(endpointAddress string) (*url.URL, error) {

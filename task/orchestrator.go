@@ -498,6 +498,11 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	defer ctx.syncDerivedContexts()
 	// Buffer certain events if we're in a suspended state
 	if ctx.isSuspended && (e.GetExecutionResumed() == nil && e.GetExecutionTerminated() == nil) {
+		if e.GetExecutionSuspended() != nil {
+			// A redundant suspend is a no-op. Buffering it would re-suspend the
+			// orchestration when the matching resume drains the buffer.
+			return nil
+		}
 		ctx.suspendedEvents = append(ctx.suspendedEvents, replayEvent{
 			event:       e,
 			isReplaying: ctx.IsReplaying,
@@ -1454,6 +1459,10 @@ func (ctx *OrchestrationContext) onExecutionResumed(er *protos.ExecutionResumedE
 
 func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTerminatedEvent) error {
 	ctx.isTerminated = true
+	// Termination wins over suspension: clearing the flag lets the completion
+	// action be emitted and discards events that can no longer be processed.
+	ctx.isSuspended = false
+	ctx.suspendedEvents = nil
 	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/gob"
-	"net"
 	"testing"
 	"time"
 
@@ -16,8 +15,6 @@ import (
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
 )
 
 type grpcGobConverter struct{}
@@ -61,18 +58,7 @@ func Test_Bufconn_CustomConverterAndVersioningEndToEnd(t *testing.T) {
 	)
 	require.NoError(t, hubWorker.Start(testCtx))
 
-	listener := bufconn.Listen(1024 * 1024)
-	go func() {
-		_ = server.Serve(listener)
-	}()
-	connection, err := grpc.NewClient(
-		"passthrough:///converter-bufconn",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-	)
-	require.NoError(t, err)
+	connection := serveBufconn(t, server, "converter-bufconn")
 
 	converter := grpcGobConverter{}
 	grpcClient := client.NewTaskHubGrpcClient(
@@ -143,7 +129,6 @@ func Test_Bufconn_CustomConverterAndVersioningEndToEnd(t *testing.T) {
 		require.NoError(t, hubWorker.Shutdown(shutdownCtx))
 		require.NoError(t, connection.Close())
 		server.Stop()
-		require.NoError(t, listener.Close())
 	})
 
 	instanceID, err := grpcClient.ScheduleNewOrchestration(

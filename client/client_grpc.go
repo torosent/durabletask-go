@@ -124,6 +124,13 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		return api.EmptyInstanceID, fmt.Errorf("failed to externalize orchestration input: %w", err)
 	}
 
+	// Propagate the caller's distributed trace context so the backend can parent the
+	// orchestration's trace to the code that scheduled it. Without this, every
+	// orchestration starts a brand new, disconnected trace.
+	if req.ParentTraceContext == nil {
+		req.ParentTraceContext = helpers.TraceContextFromSpan(trace.SpanFromContext(ctx))
+	}
+
 	resp, err := c.client.StartInstance(ctx, req)
 	if err != nil {
 		return api.EmptyInstanceID, clientRPCError(ctx, "failed to start orchestration", err)

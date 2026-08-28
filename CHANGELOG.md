@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added failure-threshold-based gRPC channel recreation for the owned DTS management client, with long-poll deadline exemptions and in-flight protection.
 - Expanded scheduled-task parity across boundary times, missed intervals, lifecycle transitions, stale tokens, no-op updates, typed client errors, and arbitrary text inputs.
 - Hardened Azure Blob container initialization and deletion recovery under concurrency, and added bounded concurrent payload transformation with deterministic failure ordering.
+- Added shared distributed-tracing tree assertions (`tests/tracingtree`) and end-to-end span-tree coverage over the gRPC and live Durable Task Scheduler emulator surfaces for activity failure, sub-orchestration success and failure, orchestration-sent events, durable timers, client-raised events, version migration via ContinueAsNew, and scheduled tasks.
 
 ### Changed
 
@@ -38,6 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FetchEntityMetadata` now returns `api.ErrInstanceNotFound` when the entity does not exist.
 - Large-payload externalization now uses an inclusive threshold boundary to match the .NET Azure Blob payload extension.
 - Same-name live external-event waiters now use the Durable Task .NET LIFO replay contract, while events buffered before a waiter remain FIFO. This replay-contract change can reassign events for in-flight orchestrations that already have multiple concurrent same-name waits, so drain those instances before upgrading.
+- `durabletaskscheduler.Options.Validate` now rejects `ClientID`, `TenantID`, `TokenFilePath`, and `AdditionallyAllowedTenants` when `Authentication` is `None` or `TokenCredential`, because neither mode constructs an Azure Identity credential and the values can never be used. It also rejects a blank or newline-bearing `ResourceID`.
+- `durabletaskscheduler.NewOptionsFromConnectionString` now rejects `Authentication=TokenCredential` with guidance to use `NewOptionsWithCredential`, instead of reporting it as a generic unsupported value.
+- Documented that `client.NewTaskHubGrpcWorker` and `TaskHubGrpcClient.StartWorkItemListener` borrow the caller's connection and never replace or close it, so recovery from a permanently wedged channel requires `client.NewTaskHubGrpcWorkerWithConnectionFactory` or `durabletaskscheduler.NewWorker`.
+
+### Fixed
+
+- gRPC worker reconnect and transient RPC retry delays are now deterministic and always within the configured `[baseDelay, maxDelay]` bounds. The previous randomized exponential backoff could wait up to 50% less than the configured base delay and up to 50% longer than the configured maximum, and doubling now saturates instead of overflowing to a non-positive duration for very large configured maximums, which would have produced an unthrottled reconnect loop.
+- A work item that the service delivers concurrently with the gRPC worker's silent-disconnect timeout is now processed instead of dropped. Previously the racing message was discarded without being abandoned, so the service considered it dispatched and it could only be redelivered after its lock expired.
+- `client.WithMaxConcurrentOrchestrationWorkItems`, `WithMaxConcurrentActivityWorkItems`, and `WithMaxConcurrentEntityWorkItems` now reject limits above `math.MaxInt32`. Previously such a limit silently wrapped to a negative value in the 32-bit `GetWorkItems` fields advertised to the service.
+- `client.WithTaskExecutorOptions` now rejects nil options instead of panicking when the worker builds its task executor.
+- `client.WithWorkItemFilters` now rejects contradictory configurations that combine a `RejectAll*` flag with entries of the same kind, and rejects duplicate orchestration, activity, or entity filter names whose effective version sets would otherwise depend on iteration order.
+- A redundant `ExecutionSuspended` event received while an orchestration is already suspended is now dropped instead of buffered. Previously the buffered suspend was replayed when the matching resume drained the buffer, immediately re-suspending the orchestration, so N suspends required N resumes.
+- Terminating a suspended orchestration now completes it. The terminate event clears the suspended flag so the completion action is emitted, and a terminal completion event now takes precedence over the suspended flag when reporting runtime status. Previously such an instance stayed `SUSPENDED` forever and `WaitForOrchestrationCompletion` never returned.
+- The gRPC `StartInstance` handler now maps backend errors through the shared management error mapping, so a rejected duplicate instance ID reaches gRPC clients as `codes.AlreadyExists` and stays matchable with `errors.Is(err, api.ErrDuplicateInstance)`. Previously it surfaced as an untyped `codes.Unknown` error.
+- `durabletaskscheduler` `Authentication=DefaultAzure` now applies `TenantID` and `AdditionallyAllowedTenants` to `DefaultAzureCredential`. Previously both were accepted from options and connection strings and then silently dropped, so tenant-scoped `DefaultAzure` configurations authenticated against the wrong tenant set.
+- `durabletaskscheduler` identity fields are now trimmed for every authentication mode, and blank `AdditionallyAllowedTenants` entries are dropped. Previously only `ManagedIdentity` trimmed `ClientID`, so padded values reached Azure Identity verbatim.
+- `durabletaskscheduler` token scopes now trim whitespace and all trailing slashes from `Options.ResourceID`. Previously only one trailing slash was removed and untrimmed values produced a malformed scope.
+- `TaskHubGrpcClient.ScheduleNewOrchestration` now sends the caller's W3C trace context on `CreateInstanceRequest`, and the gRPC sidecar's `StartInstance` handler now starts the `create_orchestration` span from it. Previously every orchestration scheduled over gRPC or the Durable Task Scheduler began a disconnected root trace instead of joining the caller's trace.
+- Activity spans now report `Error` status with the activity's failure message when an activity fails. Previously a failed activity was reported as a task failure without a Go error, so its span was indistinguishable from a successful one in a distributed trace.
 
 ## [v0.6.0] - 2025-02-05
 

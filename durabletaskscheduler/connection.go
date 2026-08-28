@@ -75,22 +75,86 @@ func (c *schedulerPerRPCCredentials) RequireTransportSecurity() bool {
 	return c.credential != nil
 }
 
-func resolveCredential(options *Options) (azcore.TokenCredential, error) {
+// credentialSpec is the normalized set of Azure Identity inputs a single DTS
+// authentication mode can actually use. Fields the selected mode cannot use are
+// left empty so credential construction is deterministic and reviewable.
+type credentialSpec struct {
+	authentication             AuthenticationType
+	clientID                   string
+	tenantID                   string
+	tokenFilePath              string
+	additionallyAllowedTenants []string
+}
+
+// credentialFactory builds the Azure Identity credential for a resolved spec.
+// Production code always uses newAzureIdentityCredential; it is threaded as a
+// parameter rather than a package variable so tests can exercise credential
+// selection without contacting Azure and without mutating process-global state.
+type credentialFactory func(credentialSpec) (azcore.TokenCredential, error)
+
+// newCredentialSpec maps options onto the fields the selected authentication
+// mode supports in Azure Identity for Go. Values are trimmed, and fields a mode
+// cannot consume are dropped rather than forwarded.
+func newCredentialSpec(options *Options) (credentialSpec, error) {
+	clientID := strings.TrimSpace(options.ClientID)
+	tenantID := strings.TrimSpace(options.TenantID)
+	tokenFilePath := strings.TrimSpace(options.TokenFilePath)
+	additionalTenants := normalizeAdditionallyAllowedTenants(options.AdditionallyAllowedTenants)
+
+	spec := credentialSpec{authentication: options.Authentication}
 	switch options.Authentication {
-	case AuthenticationNone:
-		return nil, nil
-	case AuthenticationTokenCredential:
-		return options.Credential, nil
+	case AuthenticationNone, AuthenticationTokenCredential:
+		// No Azure Identity credential is constructed for these modes.
 	case AuthenticationDefaultAzure:
-		credential, err := azidentity.NewDefaultAzureCredential(nil)
+		spec.tenantID = tenantID
+		spec.additionallyAllowedTenants = additionalTenants
+	case AuthenticationManagedIdentity:
+		spec.clientID = clientID
+	case AuthenticationWorkloadIdentity:
+		spec.clientID = clientID
+		spec.tenantID = tenantID
+		spec.tokenFilePath = tokenFilePath
+		spec.additionallyAllowedTenants = additionalTenants
+	case AuthenticationEnvironment:
+		// EnvironmentCredential is configured entirely by environment variables.
+	case AuthenticationAzureCLI, AuthenticationAzurePowerShell:
+		spec.tenantID = tenantID
+		spec.additionallyAllowedTenants = additionalTenants
+	case AuthenticationInteractiveBrowser:
+		spec.clientID = clientID
+		spec.tenantID = tenantID
+		spec.additionallyAllowedTenants = additionalTenants
+	default:
+		return credentialSpec{}, fmt.Errorf("unsupported DTS authentication type %q", options.Authentication)
+	}
+	return spec, nil
+}
+
+func normalizeAdditionallyAllowedTenants(tenants []string) []string {
+	var normalized []string
+	for _, tenant := range tenants {
+		if tenant = strings.TrimSpace(tenant); tenant != "" {
+			normalized = append(normalized, tenant)
+		}
+	}
+	return normalized
+}
+
+func newAzureIdentityCredential(spec credentialSpec) (azcore.TokenCredential, error) {
+	switch spec.authentication {
+	case AuthenticationDefaultAzure:
+		credential, err := azidentity.NewDefaultAzureCredential(&azidentity.DefaultAzureCredentialOptions{
+			TenantID:                   spec.tenantID,
+			AdditionallyAllowedTenants: spec.additionallyAllowedTenants,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create DefaultAzureCredential: %w", err)
 		}
 		return credential, nil
 	case AuthenticationManagedIdentity:
 		credentialOptions := &azidentity.ManagedIdentityCredentialOptions{}
-		if clientID := strings.TrimSpace(options.ClientID); clientID != "" {
-			credentialOptions.ID = azidentity.ClientID(clientID)
+		if spec.clientID != "" {
+			credentialOptions.ID = azidentity.ClientID(spec.clientID)
 		}
 		credential, err := azidentity.NewManagedIdentityCredential(credentialOptions)
 		if err != nil {
@@ -99,10 +163,10 @@ func resolveCredential(options *Options) (azcore.TokenCredential, error) {
 		return credential, nil
 	case AuthenticationWorkloadIdentity:
 		credential, err := azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
-			ClientID:                   options.ClientID,
-			TenantID:                   options.TenantID,
-			TokenFilePath:              options.TokenFilePath,
-			AdditionallyAllowedTenants: append([]string(nil), options.AdditionallyAllowedTenants...),
+			ClientID:                   spec.clientID,
+			TenantID:                   spec.tenantID,
+			TokenFilePath:              spec.tokenFilePath,
+			AdditionallyAllowedTenants: spec.additionallyAllowedTenants,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create WorkloadIdentityCredential: %w", err)
@@ -116,8 +180,8 @@ func resolveCredential(options *Options) (azcore.TokenCredential, error) {
 		return credential, nil
 	case AuthenticationAzureCLI:
 		credential, err := azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{
-			TenantID:                   options.TenantID,
-			AdditionallyAllowedTenants: append([]string(nil), options.AdditionallyAllowedTenants...),
+			TenantID:                   spec.tenantID,
+			AdditionallyAllowedTenants: spec.additionallyAllowedTenants,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create AzureCLICredential: %w", err)
@@ -125,8 +189,8 @@ func resolveCredential(options *Options) (azcore.TokenCredential, error) {
 		return credential, nil
 	case AuthenticationAzurePowerShell:
 		credential, err := azidentity.NewAzurePowerShellCredential(&azidentity.AzurePowerShellCredentialOptions{
-			TenantID:                   options.TenantID,
-			AdditionallyAllowedTenants: append([]string(nil), options.AdditionallyAllowedTenants...),
+			TenantID:                   spec.tenantID,
+			AdditionallyAllowedTenants: spec.additionallyAllowedTenants,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create AzurePowerShellCredential: %w", err)
@@ -134,20 +198,46 @@ func resolveCredential(options *Options) (azcore.TokenCredential, error) {
 		return credential, nil
 	case AuthenticationInteractiveBrowser:
 		credential, err := azidentity.NewInteractiveBrowserCredential(&azidentity.InteractiveBrowserCredentialOptions{
-			ClientID:                   options.ClientID,
-			TenantID:                   options.TenantID,
-			AdditionallyAllowedTenants: append([]string(nil), options.AdditionallyAllowedTenants...),
+			ClientID:                   spec.clientID,
+			TenantID:                   spec.tenantID,
+			AdditionallyAllowedTenants: spec.additionallyAllowedTenants,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create InteractiveBrowserCredential: %w", err)
 		}
 		return credential, nil
 	default:
-		return nil, fmt.Errorf("unsupported DTS authentication type %q", options.Authentication)
+		return nil, fmt.Errorf("unsupported DTS authentication type %q", spec.authentication)
 	}
 }
 
+func resolveCredential(options *Options, factory credentialFactory) (azcore.TokenCredential, error) {
+	switch options.Authentication {
+	case AuthenticationNone:
+		return nil, nil
+	case AuthenticationTokenCredential:
+		return options.Credential, nil
+	}
+	spec, err := newCredentialSpec(options)
+	if err != nil {
+		return nil, err
+	}
+	return factory(spec)
+}
+
+// tokenScope builds the OAuth scope requested for a DTS resource ID.
+func tokenScope(resourceID string) string {
+	return strings.TrimRight(strings.TrimSpace(resourceID), "/") + "/.default"
+}
+
 func prepareOptions(options *Options) (Options, error) {
+	return prepareOptionsWith(options, newAzureIdentityCredential)
+}
+
+// prepareOptionsWith normalizes, validates, and resolves the credential for a
+// caller-supplied option set. The credential factory is a parameter so tests can
+// cover every authentication mode offline.
+func prepareOptionsWith(options *Options, factory credentialFactory) (Options, error) {
 	if options == nil {
 		return Options{}, fmt.Errorf("DTS options are required")
 	}
@@ -162,7 +252,12 @@ func prepareOptions(options *Options) (Options, error) {
 	if prepared.Authentication == "" {
 		prepared.Authentication = AuthenticationDefaultAzure
 	}
-	if prepared.ResourceID == "" {
+	// Only an exactly empty resource ID defaults. A whitespace-only value is
+	// left intact so Validate below rejects it as documented instead of
+	// silently collapsing to the default resource.
+	if trimmed := strings.TrimSpace(prepared.ResourceID); trimmed != "" {
+		prepared.ResourceID = trimmed
+	} else if prepared.ResourceID == "" {
 		prepared.ResourceID = DefaultResourceID
 	}
 	if prepared.HelloTimeout == 0 {
@@ -174,7 +269,7 @@ func prepareOptions(options *Options) (Options, error) {
 	if err := prepared.Validate(); err != nil {
 		return Options{}, err
 	}
-	credential, err := resolveCredential(&prepared)
+	credential, err := resolveCredential(&prepared, factory)
 	if err != nil {
 		return Options{}, err
 	}
@@ -183,6 +278,25 @@ func prepareOptions(options *Options) (Options, error) {
 		prepared.Credential = credential
 	}
 	return prepared, nil
+}
+
+// newPerRPCCredentials builds the DTS metadata carried on every RPC for a role.
+func newPerRPCCredentials(
+	options *Options,
+	role connectionRole,
+	workerID string,
+) *schedulerPerRPCCredentials {
+	userAgent := options.UserAgent
+	if userAgent == "" {
+		userAgent = fmt.Sprintf("durabletask-go/%s (%s)", sdkVersion(), role)
+	}
+	return &schedulerPerRPCCredentials{
+		credential: options.Credential,
+		scope:      tokenScope(options.ResourceID),
+		taskHub:    options.TaskHubName,
+		userAgent:  userAgent,
+		workerID:   workerID,
+	}
 }
 
 func connect(
@@ -194,7 +308,6 @@ func connect(
 	if err != nil {
 		return nil, err
 	}
-	credential := options.Credential
 
 	host := endpoint.Host
 	if endpoint.Port() == "" {
@@ -215,20 +328,9 @@ func connect(
 		transportCredentials = insecure.NewCredentials()
 	}
 
-	userAgent := options.UserAgent
-	if userAgent == "" {
-		userAgent = fmt.Sprintf("durabletask-go/%s (%s)", sdkVersion(), role)
-	}
-	perRPCCredentials := &schedulerPerRPCCredentials{
-		credential: credential,
-		scope:      strings.TrimSuffix(options.ResourceID, "/") + "/.default",
-		taskHub:    options.TaskHubName,
-		userAgent:  userAgent,
-		workerID:   workerID,
-	}
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),
-		grpc.WithPerRPCCredentials(perRPCCredentials),
+		grpc.WithPerRPCCredentials(newPerRPCCredentials(options, role, workerID)),
 	}
 	if len(options.UnaryInterceptors) > 0 {
 		dialOptions = append(dialOptions, grpc.WithChainUnaryInterceptor(options.UnaryInterceptors...))
