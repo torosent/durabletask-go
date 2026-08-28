@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
@@ -28,6 +29,10 @@ var (
 	ErrTaskHubGrpcWorkerAlreadyRunning = errors.New("gRPC worker is already running")
 	errSilentDisconnect                = errors.New("work item stream was silent beyond the configured timeout")
 )
+
+// maxWorkerConcurrency is the largest concurrency limit representable on the
+// GetWorkItems wire contract, whose fields are 32-bit.
+const maxWorkerConcurrency = math.MaxInt32
 
 type workItemsStream interface {
 	Recv() (*protos.WorkItem, error)
@@ -85,6 +90,11 @@ type taskHubGrpcWorkerOptions struct {
 	largePayloads               *api.LargePayloadOptions
 	converter                   api.DataConverter
 	unversionedOrchestrators    map[string]struct{}
+	// waitFn overrides every delay the worker imposes on itself: reconnect
+	// backoff, transient RPC retry backoff, and work-item abandon delays. It is
+	// only set by tests so the deterministic delay schedule can be observed
+	// without sleeping.
+	waitFn func(context.Context, time.Duration) error
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -107,8 +117,8 @@ func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
 
 func WithMaxConcurrentOrchestrationWorkItems(n int) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
-		if n <= 0 {
-			return fmt.Errorf("maximum concurrent orchestration work items must be greater than zero")
+		if err := validateWorkerConcurrency("orchestration", n); err != nil {
+			return err
 		}
 		options.maxConcurrentOrchestrations = n
 		return nil
@@ -117,8 +127,8 @@ func WithMaxConcurrentOrchestrationWorkItems(n int) TaskHubGrpcWorkerOption {
 
 func WithMaxConcurrentActivityWorkItems(n int) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
-		if n <= 0 {
-			return fmt.Errorf("maximum concurrent activity work items must be greater than zero")
+		if err := validateWorkerConcurrency("activity", n); err != nil {
+			return err
 		}
 		options.maxConcurrentActivities = n
 		return nil
@@ -128,12 +138,29 @@ func WithMaxConcurrentActivityWorkItems(n int) TaskHubGrpcWorkerOption {
 // WithMaxConcurrentEntityWorkItems limits concurrent entity batch execution.
 func WithMaxConcurrentEntityWorkItems(n int) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
-		if n <= 0 {
-			return fmt.Errorf("maximum concurrent entity work items must be greater than zero")
+		if err := validateWorkerConcurrency("entity", n); err != nil {
+			return err
 		}
 		options.maxConcurrentEntities = n
 		return nil
 	}
+}
+
+// validateWorkerConcurrency rejects limits that cannot be advertised on the
+// 32-bit GetWorkItems fields, which would otherwise silently wrap to a negative
+// value on 64-bit platforms.
+func validateWorkerConcurrency(kind string, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("maximum concurrent %s work items must be greater than zero", kind)
+	}
+	if n > maxWorkerConcurrency {
+		return fmt.Errorf(
+			"maximum concurrent %s work items must be at most %d",
+			kind,
+			maxWorkerConcurrency,
+		)
+	}
+	return nil
 }
 
 func WithWorkerHelloTimeout(timeout time.Duration) TaskHubGrpcWorkerOption {
@@ -166,6 +193,8 @@ func WithWorkerRPCTimeout(timeout time.Duration) TaskHubGrpcWorkerOption {
 	}
 }
 
+// WithWorkerReconnectBackoff configures the deterministic reconnect schedule.
+// Delays double from baseDelay and are always within [baseDelay, maxDelay].
 func WithWorkerReconnectBackoff(baseDelay, maxDelay time.Duration) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		if baseDelay <= 0 || maxDelay < baseDelay {
@@ -177,6 +206,9 @@ func WithWorkerReconnectBackoff(baseDelay, maxDelay time.Duration) TaskHubGrpcWo
 	}
 }
 
+// WithWorkerTransientRetryPolicy configures the deterministic retry schedule for
+// completion and abandon RPCs. Delays double from baseDelay and are always
+// within [baseDelay, maxDelay].
 func WithWorkerTransientRetryPolicy(maxAttempts int, baseDelay, maxDelay time.Duration) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		if maxAttempts <= 0 {
@@ -212,6 +244,11 @@ func WithMaximumTimerInterval(interval time.Duration) TaskHubGrpcWorkerOption {
 // This allows task options such as task.WithVersioning to participate in DTS dispatch.
 func WithTaskExecutorOptions(options ...task.TaskExecutorOption) TaskHubGrpcWorkerOption {
 	return func(workerOptions *taskHubGrpcWorkerOptions) error {
+		for _, option := range options {
+			if option == nil {
+				return errors.New("task executor option cannot be nil")
+			}
+		}
 		workerOptions.taskExecutorOptions = append(workerOptions.taskExecutorOptions, options...)
 		return nil
 	}
@@ -382,7 +419,15 @@ type grpcWorkerConnection struct {
 }
 
 // NewTaskHubGrpcWorker creates a worker that borrows a caller-owned connection.
-// Reconnects recreate the work-item stream on the same connection.
+//
+// The worker never closes or replaces the supplied connection: a reconnect only
+// recreates the work-item stream on that same connection. Recovery is therefore
+// limited to what the caller's connection can do on its own. A connection that
+// is permanently wedged (for example one whose credentials expired, or one whose
+// endpoint moved) keeps producing poisoned streams and the worker keeps retrying
+// on the escalating reconnect schedule without ever obtaining a fresh channel.
+// Use [NewTaskHubGrpcWorkerWithConnectionFactory], or the Durable Task Scheduler
+// NewWorker, when the worker should own and recreate its channels.
 func NewTaskHubGrpcWorker(
 	cc grpc.ClientConnInterface,
 	registry *task.TaskRegistry,
@@ -823,7 +868,7 @@ func (w *TaskHubGrpcWorker) execute(run *grpcWorkerRun, connection *grpcWorkerCo
 }
 
 func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerConnection) error {
-	reconnectBackoff := newInfiniteBackoff(w.options.reconnectBaseDelay, w.options.reconnectMaxDelay)
+	reconnectBackoff := newWorkerBackoff(w.options.reconnectBaseDelay, w.options.reconnectMaxDelay)
 	for {
 		observedMessage, err := w.consumeConnection(run, connection)
 		w.retireConnection(run, connection)
@@ -835,12 +880,23 @@ func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerCo
 			return fmt.Errorf("work item stream stopped with a non-retryable error: %w", err)
 		}
 		if observedMessage {
+			// The stream proved the endpoint healthy before it ended, so this is
+			// a drain rather than a poisoned connection and the escalating
+			// reconnect schedule restarts from the base delay.
 			reconnectBackoff.Reset()
+		} else if errors.Is(err, errSilentDisconnect) {
+			// Silence before the first message means the stream was accepted but
+			// never produced anything, so keep escalating instead of hammering a
+			// wedged endpoint.
+			w.logger.Warnf(
+				"gRPC work item stream stayed silent for %v before delivering any message; treating it as poisoned",
+				w.options.silentDisconnectTimeout,
+			)
 		}
 
 		for {
-			delay := reconnectBackoff.NextBackOff()
-			if err := waitForRetry(run.intakeCtx, delay); err != nil {
+			delay := reconnectBackoff.Next()
+			if err := w.wait(run.intakeCtx, delay); err != nil {
 				return nil
 			}
 
@@ -920,50 +976,93 @@ func cloneWorkItemFilters(filters *WorkItemFilters) (*WorkItemFilters, error) {
 		RejectAllActivities:     filters.RejectAllActivities,
 		RejectAllEntities:       filters.RejectAllEntities,
 	}
-	if filters.Orchestrations != nil {
-		result.Orchestrations = make([]WorkItemFilter, len(filters.Orchestrations))
+	var err error
+	if result.Orchestrations, err = cloneNamedFilters(
+		"orchestration", "RejectAllOrchestrations", filters.RejectAllOrchestrations, filters.Orchestrations,
+	); err != nil {
+		return nil, err
 	}
-	if filters.Activities != nil {
-		result.Activities = make([]WorkItemFilter, len(filters.Activities))
+	if result.Activities, err = cloneNamedFilters(
+		"activity", "RejectAllActivities", filters.RejectAllActivities, filters.Activities,
+	); err != nil {
+		return nil, err
 	}
-	if filters.Entities != nil {
-		result.Entities = slices.Clone(filters.Entities)
+	if result.Entities, err = cloneEntityFilters(filters.RejectAllEntities, filters.Entities); err != nil {
+		return nil, err
 	}
-	for i, filter := range filters.Orchestrations {
+	return result, nil
+}
+
+// cloneNamedFilters validates one kind of named filter and returns a sorted deep
+// copy with sorted version sets, so the advertised filter set is deterministic.
+func cloneNamedFilters(
+	kind string,
+	rejectAllField string,
+	rejectAll bool,
+	filters []WorkItemFilter,
+) ([]WorkItemFilter, error) {
+	if rejectAll && len(filters) > 0 {
+		return nil, fmt.Errorf("%s filters cannot be combined with %s", kind, rejectAllField)
+	}
+	if filters == nil {
+		return nil, nil
+	}
+	cloned := make([]WorkItemFilter, len(filters))
+	for i, filter := range filters {
 		if filter.Name == "" {
-			return nil, errors.New("orchestration filter name cannot be empty")
+			return nil, fmt.Errorf("%s filter name cannot be empty", kind)
 		}
-		result.Orchestrations[i] = WorkItemFilter{Name: filter.Name, Versions: slices.Clone(filter.Versions)}
+		versions := slices.Clone(filter.Versions)
+		slices.Sort(versions)
+		cloned[i] = WorkItemFilter{Name: filter.Name, Versions: versions}
 	}
-	for i, filter := range filters.Activities {
-		if filter.Name == "" {
-			return nil, errors.New("activity filter name cannot be empty")
-		}
-		result.Activities[i] = WorkItemFilter{Name: filter.Name, Versions: slices.Clone(filter.Versions)}
+	slices.SortFunc(cloned, func(left, right WorkItemFilter) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	if err := rejectDuplicateFilterNames(kind, cloned); err != nil {
+		return nil, err
 	}
-	for _, name := range result.Entities {
-		name = strings.TrimSpace(name)
-		if name == "" {
+	return cloned, nil
+}
+
+// cloneEntityFilters validates entity filter names and returns them lowercased
+// and sorted, which is the case-insensitive form the service is given.
+func cloneEntityFilters(rejectAll bool, names []string) ([]string, error) {
+	if rejectAll && len(names) > 0 {
+		return nil, errors.New("entity filters cannot be combined with RejectAllEntities")
+	}
+	if names == nil {
+		return nil, nil
+	}
+	cloned := make([]string, len(names))
+	for i, name := range names {
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if normalized == "" {
 			return nil, errors.New("entity filter name cannot be empty")
 		}
+		cloned[i] = normalized
 	}
-	for i, name := range result.Entities {
-		result.Entities[i] = strings.ToLower(strings.TrimSpace(name))
+	slices.Sort(cloned)
+	for i := 1; i < len(cloned); i++ {
+		if cloned[i] == cloned[i-1] {
+			return nil, fmt.Errorf("entity work-item filter %q is declared more than once", cloned[i])
+		}
 	}
-	slices.SortFunc(result.Orchestrations, func(left, right WorkItemFilter) int {
-		return strings.Compare(left.Name, right.Name)
-	})
-	slices.SortFunc(result.Activities, func(left, right WorkItemFilter) int {
-		return strings.Compare(left.Name, right.Name)
-	})
-	for i := range result.Orchestrations {
-		slices.Sort(result.Orchestrations[i].Versions)
+	return cloned, nil
+}
+
+// rejectDuplicateFilterNames reports names declared more than once, which would
+// otherwise make the effective version set silently depend on iteration order.
+func rejectDuplicateFilterNames(kind string, filters []WorkItemFilter) error {
+	seen := make(map[string]struct{}, len(filters))
+	for _, filter := range filters {
+		normalized := strings.ToLower(filter.Name)
+		if _, ok := seen[normalized]; ok {
+			return fmt.Errorf("%s work-item filter %q is declared more than once", kind, filter.Name)
+		}
+		seen[normalized] = struct{}{}
 	}
-	for i := range result.Activities {
-		slices.Sort(result.Activities[i].Versions)
-	}
-	slices.Sort(result.Entities)
-	return result, nil
+	return nil
 }
 
 func workItemFiltersToProto(filters *WorkItemFilters) *protos.WorkItemFilters {
@@ -1059,7 +1158,27 @@ func isTransientWorkerGRPCCode(code codes.Code) bool {
 	}
 }
 
+// wait blocks for the given delay, honoring the test wait seam when one is
+// configured. Every worker-imposed delay must go through it so no code path
+// sleeps for real under test.
+func (w *TaskHubGrpcWorker) wait(ctx context.Context, delay time.Duration) error {
+	if w.options.waitFn != nil {
+		return w.options.waitFn(ctx, delay)
+	}
+	return waitForRetry(ctx, delay)
+}
+
 func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		// A zero timer fires immediately and would race with cancellation, so
+		// observe the context first and keep shutdown deterministic.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -1070,17 +1189,54 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// newInfiniteBackoff returns an exponential backoff that never gives up, so the
-// caller decides when to stop retrying.
-func newInfiniteBackoff(initialInterval, maxInterval time.Duration) *backoff.ExponentialBackOff {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = initialInterval
-	b.MaxInterval = maxInterval
-	b.MaxElapsedTime = 0
-	b.Reset()
-	return b
+// workerBackoff is a deterministic exponential backoff. Every delay it produces
+// is within [base, max]: unlike a randomized backoff it never returns a delay
+// below the configured base or up to 50% above the configured maximum, and its
+// doubling saturates instead of overflowing for very large maximums.
+type workerBackoff struct {
+	base    time.Duration
+	max     time.Duration
+	current time.Duration
+}
+
+func newWorkerBackoff(base, max time.Duration) *workerBackoff {
+	if base <= 0 {
+		base = time.Millisecond
+	}
+	if max < base {
+		max = base
+	}
+	return &workerBackoff{base: base, max: max, current: base}
+}
+
+// Reset restarts the schedule at the base delay.
+func (b *workerBackoff) Reset() {
+	b.current = b.base
+}
+
+// Next returns the current delay and advances the schedule.
+func (b *workerBackoff) Next() time.Duration {
+	delay := b.current
+	b.current = doubleDurationBounded(b.current, b.max)
+	return delay
+}
+
+// doubleDurationBounded doubles delay without overflowing int64 and clamps the
+// result to max.
+func doubleDurationBounded(delay, max time.Duration) time.Duration {
+	if delay >= max || delay > math.MaxInt64/2 {
+		return max
+	}
+	if doubled := delay * 2; doubled < max {
+		return doubled
+	}
+	return max
 }
 
 func newInfiniteRetries() *backoff.ExponentialBackOff {
-	return newInfiniteBackoff(backoff.DefaultInitialInterval, 15*time.Second)
+	b := backoff.NewExponentialBackOff()
+	b.MaxInterval = 15 * time.Second
+	b.MaxElapsedTime = 0
+	b.Reset()
+	return b
 }

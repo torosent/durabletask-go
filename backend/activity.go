@@ -110,6 +110,13 @@ func (p *activityProcessor) ProcessWorkItem(ctx context.Context, wi WorkItem) er
 	}
 
 	awi.Result = result
+
+	// An activity that returns an error is reported as a TaskFailed result rather than a
+	// Go error, so the failure must be surfaced explicitly on the span. Otherwise failed
+	// activities are indistinguishable from successful ones in a distributed trace.
+	if taskFailed := result.GetTaskFailed(); taskFailed != nil && span != nil {
+		span.SetStatus(codes.Error, taskFailed.GetFailureDetails().GetErrorMessage())
+	}
 	return nil
 }
 

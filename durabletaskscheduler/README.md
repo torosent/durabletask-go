@@ -22,11 +22,55 @@ go run ./samples/durabletaskscheduler
 
 Connection strings support the Azure Identity modes that have Go equivalents:
 `DefaultAzure`, `ManagedIdentity`, `WorkloadIdentity`, `Environment`,
-`AzureCLI`, `AzurePowerShell`, and `InteractiveBrowser`. Authentication-specific
-keys include `ClientID`, `TenantID`, `TokenFilePath`, and
-`AdditionallyAllowedTenants`. Applications can instead call
-`NewOptionsWithCredential` with any `azcore.TokenCredential`. Plaintext
-`http://` endpoints are accepted only with `Authentication=None`.
+`AzureCLI`, `AzurePowerShell`, `InteractiveBrowser`, and `None`. Keys and
+`Authentication` values are case-insensitive, surrounding whitespace is trimmed,
+empty segments are skipped, and a repeated key uses its last value. Only the
+first `=` in a segment separates the key from the value, so values may contain
+`=`. Unknown keys, malformed segments, and a missing or blank `Endpoint`,
+`TaskHub`, or `Authentication` are rejected. `VisualStudio` and
+`VisualStudioCode` have no Go equivalent, and `TokenCredential` is programmatic
+only: both are rejected with guidance to use `NewOptionsWithCredential` with any
+`azcore.TokenCredential`. Plaintext `http://` endpoints are accepted only with
+`Authentication=None`, which also requires `AllowInsecureConnection`.
+
+Authentication-specific keys are `ClientID`, `TenantID`, `TokenFilePath`, and
+the comma-separated `AdditionallyAllowedTenants`. Each mode consumes only the
+fields Azure Identity for Go supports for it:
+
+| Authentication | ClientID | TenantID | TokenFilePath | AdditionallyAllowedTenants |
+| --- | --- | --- | --- | --- |
+| `DefaultAzure` | ignored | used | ignored | used |
+| `ManagedIdentity` | used | ignored | ignored | ignored |
+| `WorkloadIdentity` | used | used | used | used |
+| `Environment` | ignored | ignored | ignored | ignored |
+| `AzureCLI` | ignored | used | ignored | used |
+| `AzurePowerShell` | ignored | used | ignored | used |
+| `InteractiveBrowser` | used | used | ignored | used |
+| `None` | rejected | rejected | rejected | rejected |
+| `TokenCredential` | rejected | rejected | rejected | rejected |
+
+`Environment` is configured entirely by the `AZURE_*` environment variables, and
+`WorkloadIdentity` falls back to them for any field left unset. Fields are
+trimmed before use and blank `AdditionallyAllowedTenants` entries are dropped.
+`None` and `TokenCredential` construct no Azure Identity credential, so
+supplying identity fields for them fails validation instead of being silently
+ignored.
+
+Access tokens are requested for `Options.ResourceID` (default
+`https://durabletask.io`) with trailing slashes removed and `/.default`
+appended. Token acquisition failures are surfaced as retriable `Unavailable`
+gRPC errors. Every RPC carries `taskhub` and `x-user-agent` metadata; worker
+connections add `workerid`. `Options.UserAgent` and `Options.WorkerID` override
+the generated values and are rejected if they contain leading/trailing
+whitespace or newlines. Unset worker IDs default to
+`<hostname>,<pid>,<uuid>`.
+
+`Options.HelloTimeout` (default 30 seconds) bounds the fail-fast `Hello`
+handshake for both `NewClient` and the worker connection factory; the caller's
+context still applies when it is shorter. Client channels use a default gRPC
+service config that retries `UNAVAILABLE` up to five attempts with a 50 ms
+initial backoff, 250 ms cap, and multiplier 2. Worker channels do not, because
+the worker owns its own reconnect loop.
 
 `NewClient` creates and owns a management connection; call `Close` when done.
 After five consecutive `Unavailable` responses (or unexpected unary
@@ -38,11 +82,21 @@ not count. Configure the thresholds with
 `Options.ChannelRecreateMinInterval`. Authentication, interceptors, large
 payload settings, and data conversion are preserved across replacements.
 
-`client.NewTaskHubGrpcClient` remains the lower-level borrowed-connection API:
-it never recreates or closes its caller-supplied `grpc.ClientConnInterface`.
-`NewWorker` creates a separate worker with its own connection factory. The
-worker recreates channels after transient disconnects and closes retired
-channels only after their in-flight completions have drained.
+`client.NewTaskHubGrpcClient`, `client.NewTaskHubGrpcWorker`, and
+`TaskHubGrpcClient.StartWorkItemListener` are lower-level APIs that borrow the
+caller's `grpc.ClientConnInterface`; they never replace or close it.
+`NewWorker` owns its channels, recreates them after transient disconnects, and
+closes retired channels after their in-flight completions drain.
+`client.NewTaskHubGrpcWorkerWithConnectionFactory` provides the same lifecycle
+when its factory returns a non-nil closer, which transfers ownership to the
+worker. Use an owning configuration to recover from a permanently wedged
+channel. See `client.NewTaskHubGrpcWorker` for the full ownership contract.
+
+Reconnect and RPC retry delays are deterministic and always stay within
+`[baseDelay, maxDelay]`. A stream that delivers at least one message before it
+ends is treated as a drain and restarts the schedule at the base delay; a stream
+that stays silent past `WithWorkerSilentDisconnectTimeout` before its first
+message is treated as poisoned and keeps escalating.
 
 `Options.MaximumTimerInterval` defaults to three days. Longer durable timers
 are split into deterministic sequential timer actions that retain the original

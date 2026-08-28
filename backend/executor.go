@@ -1225,6 +1225,13 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 	if err := helpers.ValidateOrchestrationInstanceID(instanceID); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	// Honor the trace context supplied by the caller so that the orchestration's trace
+	// joins the caller's trace instead of starting a disconnected root trace.
+	if tracedCtx, err := helpers.ContextFromTraceContext(ctx, req.ParentTraceContext); err != nil {
+		g.logger.Warnf("%v: failed to parse the caller's trace context: %v", instanceID, err)
+	} else {
+		ctx = tracedCtx
+	}
 	ctx, span := helpers.StartNewCreateOrchestrationSpan(ctx, req.Name, req.Version.GetValue(), instanceID)
 	defer span.End()
 
@@ -1238,7 +1245,7 @@ func (g *grpcExecutor) StartInstance(ctx context.Context, req *protos.CreateInst
 		return nil, status.Errorf(codes.InvalidArgument, "invalid orchestration ID reuse policy: %v", err)
 	}
 	if err := g.backend.CreateOrchestrationInstance(ctx, e, WithOrchestrationIdReusePolicy(policy)); err != nil {
-		return nil, err
+		return nil, managementRPCError(err, "failed to start orchestration")
 	}
 
 	return &protos.CreateInstanceResponse{InstanceId: instanceID}, nil

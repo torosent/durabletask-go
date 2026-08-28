@@ -22,12 +22,38 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 var (
 	grpcClient *client.TaskHubGrpcClient
 	ctx        = context.Background()
 )
+
+// serveBufconn serves the supplied gRPC server over an in-memory listener and
+// returns a client connection dialed against it. It keeps the in-process
+// transport setup identical across every bufconn test in this package. The
+// listener is closed during cleanup, after any cleanup the caller registers
+// later (such as stopping the server).
+func serveBufconn(t *testing.T, server *grpc.Server, target string) *grpc.ClientConn {
+	t.Helper()
+	listener := bufconn.Listen(1024 * 1024)
+	t.Cleanup(func() {
+		require.NoError(t, listener.Close())
+	})
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	connection, err := grpc.NewClient(
+		"passthrough:///"+target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+	)
+	require.NoError(t, err)
+	return connection
+}
 
 // TestMain is the entry point for the test suite. We use this to set up a gRPC server and client instance
 // which are used by all tests in the suite.

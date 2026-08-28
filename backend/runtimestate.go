@@ -388,10 +388,12 @@ func (s *OrchestrationRuntimeState) RuntimeStatus() protos.OrchestrationStatus {
 	switch {
 	case s.startEvent == nil:
 		return protos.OrchestrationStatus_ORCHESTRATION_STATUS_PENDING
-	case s.isSuspended:
-		return protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED
+	// Completion wins over suspension: terminating a suspended orchestration
+	// must report the terminal status instead of leaving it stuck as SUSPENDED.
 	case s.completedEvent != nil:
 		return s.completedEvent.GetOrchestrationStatus()
+	case s.isSuspended:
+		return protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED
 	}
 
 	return protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING

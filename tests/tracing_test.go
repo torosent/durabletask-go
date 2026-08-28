@@ -2,27 +2,21 @@ package tests
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/tests/tracingtree"
 )
 
 type (
 	spanValidator          func(t assert.TestingT, spans []trace.ReadOnlySpan, index int)
 	spanAttributeValidator func(t assert.TestingT, span trace.ReadOnlySpan) bool
 	spanEventValidator     func(t assert.TestingT, span trace.ReadOnlySpan, eventIndex int) bool
-)
-
-var (
-	initTracingOnce     sync.Once
-	sharedTraceExporter = tracetest.NewInMemoryExporter()
 )
 
 func assertSpanSequence(t assert.TestingT, spans []trace.ReadOnlySpan, spanAsserts ...spanValidator) {
@@ -222,16 +216,9 @@ func assertTimerFired() spanAttributeValidator {
 // to examine the exported traces. We only want to look at exported traces because we do
 // tricks to mark certain spans as non-exported (i.e. orchestration replays), and want
 // to ensure that those spans are never actually exported.
+//
+// The provider and exporter are owned by the shared tracingtree package so that the
+// embedded, gRPC, and Durable Task Scheduler suites all observe spans the same way.
 func initTracing() *tracetest.InMemoryExporter {
-	// The global tracer provider can only be initialized once.
-	// Subsequent initializations will silently fail.
-	initTracingOnce.Do(func() {
-		processor := trace.NewSimpleSpanProcessor(sharedTraceExporter)
-		provider := trace.NewTracerProvider(trace.WithSpanProcessor(processor))
-		otel.SetTracerProvider(provider)
-	})
-
-	// Reset the shared exporter so that new tests don't see traces from previous tests.
-	sharedTraceExporter.Reset()
-	return sharedTraceExporter
+	return tracingtree.Init()
 }
