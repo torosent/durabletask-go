@@ -439,15 +439,44 @@ their documented environment variables and local services are available. PR
 validation runs the complete suite against all three services and repeats it
 with the race detector on the latest supported Go version.
 
-### Checking orchestrator goroutines
+### Checking orchestrators for replay hazards
 
-Orchestrators must use `ctx.Go` instead of raw `go` statements so execution
-remains deterministic. Build and run the vet-compatible analyzer with:
+Orchestrator code is replayed from history on every turn, so it must be
+deterministic and free of side effects. `cmd/orchestratorvet` is a
+[`go vet`](https://pkg.go.dev/cmd/vet)-compatible driver for the
+`orchestratorgo` analyzer, which performs whole-package analysis of the
+orchestrators a package registers with `task.TaskRegistry`.
 
 ```bash
-go build -o /tmp/orchestratorvet ./cmd/orchestratorvet
-go vet -vettool=/tmp/orchestratorvet ./...
+go build -o ./bin/orchestratorvet ./cmd/orchestratorvet
+go vet -vettool=$PWD/bin/orchestratorvet ./...
 ```
+
+The analyzer starts from every `AddOrchestrator`, `AddOrchestratorN`,
+`AddOrchestratorVersion`, and `AddOrchestratorNVersion` call it can resolve, and
+follows the call graph through same-package named functions, methods, resolvable
+function variables, and nested function literals. Code that is not reachable
+from a registered orchestrator, including activity and entity bodies, is never
+reported. It reports wall-clock reads and host timers, nondeterministic
+identifier and random sources, unsafe parallelism and synchronization, direct
+filesystem, network, process, and environment I/O, replay-unsafe logging,
+provably non-progressing unbounded loops, task names a complete registration set
+proves are missing, and registration forms that `task.TaskRegistry` rejects or
+that derive an unstable name.
+
+`time.Now()` and `go func() { ... }()` carry `analysis.SuggestedFix` rewrites to
+`ctx.CurrentTimeUtc` and `ctx.Go`, which `gopls` and `go vet -fix` can apply.
+Other diagnostics have no fix because no single rewrite is always correct.
+
+The analyzer reports only what it can prove and stays silent otherwise, so
+enabling it on an existing codebase does not produce a wave of diagnostics.
+Files ending in `_test.go` are excluded by default because tests commonly
+register intentionally invalid or nondeterministic orchestrators. Pass
+`-orchestratorgo.test-files` to include them.
+
+See [`cmd/orchestratorvet/README.md`](cmd/orchestratorvet/README.md) for the
+full list of checks, the suggested fixes, the false-positive guardrails, and the
+limitations.
 
 ## Running integration tests
 
