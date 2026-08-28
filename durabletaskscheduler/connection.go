@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/google/uuid"
+	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -164,6 +165,9 @@ func prepareOptions(options *Options) (Options, error) {
 	}
 	if prepared.HelloTimeout == 0 {
 		prepared.HelloTimeout = 30 * time.Second
+	}
+	if prepared.MaximumTimerInterval == 0 {
+		prepared.MaximumTimerInterval = task.DefaultMaximumTimerInterval
 	}
 	if err := prepared.Validate(); err != nil {
 		return Options{}, err

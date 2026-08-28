@@ -56,6 +56,10 @@ type Options struct {
 	// HelloTimeout controls fail-fast connectivity checks.
 	HelloTimeout time.Duration
 
+	// MaximumTimerInterval limits one physical durable timer action. Longer
+	// timers are split deterministically. Zero uses the three-day default.
+	MaximumTimerInterval time.Duration
+
 	// LargePayloads enables external payload references for clients and workers.
 	LargePayloads *api.LargePayloadOptions
 
@@ -71,11 +75,12 @@ type Options struct {
 
 func NewOptions(endpointAddress, taskHubName string) *Options {
 	return &Options{
-		EndpointAddress: endpointAddress,
-		TaskHubName:     taskHubName,
-		Authentication:  AuthenticationDefaultAzure,
-		ResourceID:      DefaultResourceID,
-		HelloTimeout:    30 * time.Second,
+		EndpointAddress:      endpointAddress,
+		TaskHubName:          taskHubName,
+		Authentication:       AuthenticationDefaultAzure,
+		ResourceID:           DefaultResourceID,
+		HelloTimeout:         30 * time.Second,
+		MaximumTimerInterval: task.DefaultMaximumTimerInterval,
 	}
 }
 
@@ -195,6 +200,9 @@ func (o *Options) Validate() error {
 	}
 	if o.HelloTimeout < 0 {
 		return fmt.Errorf("DTS Hello timeout cannot be negative")
+	}
+	if o.MaximumTimerInterval < 0 {
+		return fmt.Errorf("DTS maximum timer interval cannot be negative")
 	}
 	if _, err := api.NormalizeLargePayloadOptions(o.LargePayloads); err != nil {
 		return fmt.Errorf("invalid DTS large payload options: %w", err)

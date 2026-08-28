@@ -33,6 +33,13 @@ keys include `ClientID`, `TenantID`, `TokenFilePath`, and
 worker recreates channels after transient disconnects and closes retired
 channels only after their in-flight completions have drained.
 
+`Options.MaximumTimerInterval` defaults to three days. Longer durable timers
+are split into deterministic sequential timer actions that retain the original
+deadline. Generic gRPC and embedded workers can configure the same behavior
+with `client.WithMaximumTimerInterval` and `task.WithMaximumTimerInterval`.
+Changing the interval is replay-breaking for in-flight orchestrations with
+affected timers.
+
 ### Advanced management
 
 `TaskHubGrpcClient` exposes bounded `QueryInstances` and `ListInstanceIDs`

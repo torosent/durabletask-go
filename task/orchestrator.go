@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -271,7 +272,7 @@ func newOrchestrationContext(
 		errorProperties:           errorProperties,
 		logger:                    logger,
 		metrics:                   metrics,
-		orchestrationOptions:      options,
+		orchestrationOptions:      normalizeOrchestrationOptions(options),
 		defaultVersion:            defaultVersion,
 		converter:                 api.NormalizeDataConverter(converter),
 		registry:                  registry,
@@ -878,7 +879,47 @@ func (ctx *OrchestrationContext) createTimerInternal(
 	if scope.isCanceled() {
 		return newTaskInScope(ctx, scope)
 	}
-	fireAt := ctx.CurrentTimeUtc.Add(delay)
+
+	logicalTimer := newTaskInScope(ctx, scope)
+	deadline := ctx.CurrentTimeUtc.Add(delay)
+	if err := timestamppb.New(deadline).CheckValid(); err != nil {
+		logicalTimer.failLocal(api.WrapInvalidArgument(fmt.Errorf("timer deadline %v is out of range: %w", deadline, err)))
+		return logicalTimer
+	}
+
+	var scheduleNextChunk func()
+	scheduleNextChunk = func() {
+		if logicalTimer.isCompleted {
+			return
+		}
+
+		fireAt := deadline
+		isFinalChunk := true
+		maximumInterval := ctx.orchestrationOptions.MaximumTimerInterval
+		if deadline.Sub(ctx.CurrentTimeUtc) > maximumInterval {
+			fireAt = ctx.CurrentTimeUtc.Add(maximumInterval)
+			isFinalChunk = false
+		}
+		chunk := ctx.createTimerAction(fireAt, scope)
+		chunk.onCompleted(func() {
+			if logicalTimer.isCompleted {
+				return
+			}
+			if isFinalChunk || chunk.isCanceled || chunk.localErr != nil || chunk.failureDetails != nil {
+				logicalTimer.completeFrom(chunk, nil)
+				return
+			}
+			scheduleNextChunk()
+		})
+	}
+	scheduleNextChunk()
+	return logicalTimer
+}
+
+func (ctx *OrchestrationContext) createTimerAction(
+	fireAt time.Time,
+	scope *cancellationScope,
+) *completableTask {
 	timerAction := helpers.NewCreateTimerAction(ctx.getNextSequenceNumber(), fireAt)
 	ctx.pendingActions[timerAction.Id] = timerAction
 

@@ -66,6 +66,20 @@ func (s *fakeHistoryStream) Recv() (*protos.HistoryChunk, error) {
 	return nil, io.EOF
 }
 
+func TestMaximumTimerIntervalWorkerOption(t *testing.T) {
+	options := defaultTaskHubGrpcWorkerOptions()
+	require.Nil(t, options.maximumTimerInterval)
+	require.Empty(t, options.executorOptions())
+	require.NoError(t, WithTaskExecutorOptions(task.WithMaximumTimerInterval(time.Hour))(&options))
+	require.Len(t, options.executorOptions(), 1)
+	require.Error(t, WithMaximumTimerInterval(-time.Second)(&options))
+	require.NoError(t, WithMaximumTimerInterval(0)(&options))
+	require.Equal(t, task.DefaultMaximumTimerInterval, *options.maximumTimerInterval)
+	require.Len(t, options.executorOptions(), 2)
+	require.NoError(t, WithMaximumTimerInterval(2*time.Hour)(&options))
+	require.Equal(t, 2*time.Hour, *options.maximumTimerInterval)
+}
+
 type fakeSidecarClient struct {
 	protos.TaskHubSidecarServiceClient
 
