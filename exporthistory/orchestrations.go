@@ -151,7 +151,7 @@ func runExportJobOrchestration(ctx *task.OrchestrationContext, input ExportJobRu
 
 		listRequest := ListTerminalInstancesRequest{
 			CompletedTimeFrom:    config.Filter.CompletedTimeFrom,
-			CompletedTimeTo:      config.Filter.CompletedTimeTo,
+			CompletedTimeTo:      optionalTime(config.Filter.CompletedTimeTo),
 			RuntimeStatus:        config.Filter.RuntimeStatus,
 			MaxInstancesPerBatch: config.MaxInstancesPerBatch,
 		}
@@ -216,7 +216,7 @@ func runExportJobOrchestration(ctx *task.OrchestrationContext, input ExportJobRu
 		}
 		// A page without a next checkpoint is the last one the task hub has.
 		// A continuous job re-lists from the last committed cursor after idling,
-		// which re-scans at most one page.
+		// which re-scans at most one page and overwrites deterministic blob names.
 		if config.Mode == ExportModeContinuous {
 			logger.Info("export job drained its backlog; waiting for new instances", "jobId", jobID)
 			if err := ctx.CreateTimer(continuousIdleDelay).Await(nil); err != nil {

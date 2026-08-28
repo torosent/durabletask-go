@@ -286,9 +286,7 @@ func (s *AzureBlobStore) createContainerWithRetry(ctx context.Context, container
 			if waitErr := s.waitForRetry(ctx, backoff); waitErr != nil {
 				return waitErr
 			}
-			if backoff < containerBeingDeletedMaxBackoff {
-				backoff = min(backoff*2, containerBeingDeletedMaxBackoff)
-			}
+			backoff = min(backoff*2, containerBeingDeletedMaxBackoff)
 		default:
 			return fmt.Errorf("create export container %q: %w", container, err)
 		}

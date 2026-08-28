@@ -372,16 +372,22 @@ func TestEntityCommitCheckpoint(t *testing.T) {
 		assert.Contains(t, state.LastError, "InstanceId: instance-2, Reason: error2")
 	})
 
-	t.Run("failures with a checkpoint keep the job active", func(t *testing.T) {
+	t.Run("failures cannot be silently discarded by a checkpoint", func(t *testing.T) {
 		harness := newEntityHarness(t, "job-1")
 		harness.call(createOperation, batchOptions("job-1"))
-		harness.call(commitCheckpointOperation, CommitCheckpointRequest{
+		before := harness.jobState()
+		_, err := harness.tryCall(commitCheckpointOperation, CommitCheckpointRequest{
 			ScannedInstances: 1,
 			Checkpoint:       &ExportCheckpoint{LastInstanceKey: "cursor"},
 			Failures:         []ExportFailure{{InstanceID: "i", Reason: "r"}},
 			RunToken:         harness.runToken(),
 		})
-		assert.Equal(t, ExportJobStatusActive, harness.jobState().Status)
+		require.ErrorContains(t, err, "checkpoint and failures cannot be committed together")
+		after := harness.jobState()
+		assert.Equal(t, before.Status, after.Status)
+		assert.Equal(t, before.ScannedInstances, after.ScannedInstances)
+		assert.Equal(t, before.ExportedInstances, after.ExportedInstances)
+		assert.Equal(t, before.Checkpoint, after.Checkpoint)
 	})
 
 	t.Run("a checkpoint for a deleted job does not resurrect it", func(t *testing.T) {

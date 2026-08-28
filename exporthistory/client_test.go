@@ -505,6 +505,16 @@ func TestListJobs(t *testing.T) {
 		assert.Equal(t, "job-1", result.Jobs[0].JobID)
 	})
 
+	t.Run("rejects an invalid status", func(t *testing.T) {
+		backend := newFakeBackend()
+		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		invalid := ExportJobStatus(99)
+		_, err := client.ListJobs(context.Background(), ExportJobQuery{Status: &invalid})
+		require.ErrorIs(t, err, ErrValidation)
+		assert.Contains(t, err.Error(), "invalid export job status")
+		assert.Zero(t, backend.lastQuery)
+	})
+
 	t.Run("filters by creation time", func(t *testing.T) {
 		backend := newFakeBackend()
 		backend.queryPages = pages(t)

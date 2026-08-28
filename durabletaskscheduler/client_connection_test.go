@@ -20,6 +20,7 @@ import (
 
 type fakeClientConnection struct {
 	invoke     func(context.Context, string) error
+	newStream  func(context.Context, string, ...grpc.CallOption) (grpc.ClientStream, error)
 	closeCount atomic.Int32
 }
 
@@ -46,12 +47,15 @@ func (c *fakeClientConnection) Invoke(
 	return c.invoke(ctx, method)
 }
 
-func (*fakeClientConnection) NewStream(
-	context.Context,
-	*grpc.StreamDesc,
-	string,
-	...grpc.CallOption,
+func (c *fakeClientConnection) NewStream(
+	ctx context.Context,
+	_ *grpc.StreamDesc,
+	method string,
+	options ...grpc.CallOption,
 ) (grpc.ClientStream, error) {
+	if c.newStream != nil {
+		return c.newStream(ctx, method, options...)
+	}
 	return nil, errors.New("streaming is not configured")
 }
 
@@ -209,7 +213,6 @@ func TestRecreatingClientConnSuccessAndApplicationErrorResetFailureCount(t *test
 	require.Never(t, func() bool {
 		return recreateCalls.Load() != 0
 	}, 50*time.Millisecond, time.Millisecond)
-
 	connection.mu.Lock()
 	defer connection.mu.Unlock()
 	require.Equal(t, 1, connection.consecutiveFailures)
@@ -217,7 +220,10 @@ func TestRecreatingClientConnSuccessAndApplicationErrorResetFailureCount(t *test
 
 func TestRecreatingClientConnLongPollDeadlineDoesNotTriggerRecreation(t *testing.T) {
 	connectionImpl := &fakeClientConnection{
-		invoke: func(context.Context, string) error {
+		invoke: func(_ context.Context, method string) error {
+			if method == "/test/fail" {
+				return status.Error(codes.Unavailable, "unavailable")
+			}
 			return status.Error(codes.DeadlineExceeded, "long poll elapsed")
 		},
 	}
@@ -229,10 +235,11 @@ func TestRecreatingClientConnLongPollDeadlineDoesNotTriggerRecreation(t *testing
 			recreateCalls.Add(1)
 			return previous, nil
 		},
-		1,
+		2,
 		0,
 	)
 
+	require.Error(t, connection.Invoke(context.Background(), "/test/fail", nil, nil))
 	for _, method := range []string{
 		protos.TaskHubSidecarService_WaitForInstanceStart_FullMethodName,
 		protos.TaskHubSidecarService_WaitForInstanceCompletion_FullMethodName,
@@ -242,12 +249,15 @@ func TestRecreatingClientConnLongPollDeadlineDoesNotTriggerRecreation(t *testing
 	require.Never(t, func() bool {
 		return recreateCalls.Load() != 0
 	}, 50*time.Millisecond, time.Millisecond)
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	require.Equal(t, 1, connection.consecutiveFailures)
 }
 
 func TestRecreatingClientConnRegularDeadlineTriggersRecreation(t *testing.T) {
 	connectionImpl := &fakeClientConnection{
-		invoke: func(ctx context.Context, _ string) error {
-			return status.FromContextError(ctx.Err()).Err()
+		invoke: func(context.Context, string) error {
+			return status.Error(codes.DeadlineExceeded, "server deadline")
 		},
 	}
 	recreated := make(chan struct{}, 1)
@@ -262,10 +272,8 @@ func TestRecreatingClientConnRegularDeadlineTriggersRecreation(t *testing.T) {
 		0,
 	)
 
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
 	require.Equal(t, codes.DeadlineExceeded, status.Code(connection.Invoke(
-		ctx,
+		context.Background(),
 		protos.TaskHubSidecarService_GetInstance_FullMethodName,
 		nil,
 		nil,
@@ -275,6 +283,140 @@ func TestRecreatingClientConnRegularDeadlineTriggersRecreation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("regular deadline did not trigger channel recreation")
 	}
+}
+
+func TestRecreatingClientConnCallerDeadlineDoesNotTriggerRecreation(t *testing.T) {
+	connectionImpl := &fakeClientConnection{
+		invoke: func(ctx context.Context, method string) error {
+			if method == "/test/fail" {
+				return status.Error(codes.Unavailable, "unavailable")
+			}
+			<-ctx.Done()
+			return status.FromContextError(ctx.Err()).Err()
+		},
+	}
+	var recreateCalls atomic.Int32
+	connection := newTestRecreatingClientConn(
+		t,
+		fakeTransport(connectionImpl),
+		func(_ context.Context, previous *clientTransport) (*clientTransport, error) {
+			recreateCalls.Add(1)
+			return previous, nil
+		},
+		2,
+		0,
+	)
+
+	require.Error(t, connection.Invoke(context.Background(), "/test/fail", nil, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+	require.Equal(t, codes.DeadlineExceeded, status.Code(connection.Invoke(
+		ctx,
+		protos.TaskHubSidecarService_GetInstance_FullMethodName,
+		nil,
+		nil,
+	)))
+	require.Never(t, func() bool {
+		return recreateCalls.Load() != 0
+	}, 50*time.Millisecond, time.Millisecond)
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
+	require.Equal(t, 1, connection.consecutiveFailures)
+}
+
+func TestRecreatingClientConnStreamingOutcomesAffectFailureCount(t *testing.T) {
+	streamFailure := status.Error(codes.Unavailable, "stream unavailable")
+	connectionImpl := &fakeClientConnection{
+		newStream: func(
+			_ context.Context,
+			_ string,
+			options ...grpc.CallOption,
+		) (grpc.ClientStream, error) {
+			return nil, finishStreamCall(options, streamFailure)
+		},
+	}
+	recreated := make(chan struct{}, 1)
+	connection := newTestRecreatingClientConn(
+		t,
+		fakeTransport(connectionImpl),
+		func(_ context.Context, previous *clientTransport) (*clientTransport, error) {
+			recreated <- struct{}{}
+			return previous, nil
+		},
+		1,
+		0,
+	)
+
+	_, err := connection.NewStream(
+		context.Background(),
+		&grpc.StreamDesc{ServerStreams: true},
+		protos.TaskHubSidecarService_StreamInstanceHistory_FullMethodName,
+	)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	select {
+	case <-recreated:
+	case <-time.After(time.Second):
+		t.Fatal("stream failure did not trigger channel recreation")
+	}
+}
+
+func TestRecreatingClientConnSuccessfulStreamResetsFailureCount(t *testing.T) {
+	callCount := 0
+	connectionImpl := &fakeClientConnection{
+		invoke: func(context.Context, string) error {
+			return status.Error(codes.Unavailable, "unavailable")
+		},
+		newStream: func(
+			_ context.Context,
+			_ string,
+			options ...grpc.CallOption,
+		) (grpc.ClientStream, error) {
+			callCount++
+			_ = finishStreamCall(options, nil)
+			return nil, nil
+		},
+	}
+	var recreateCalls atomic.Int32
+	connection := newTestRecreatingClientConn(
+		t,
+		fakeTransport(connectionImpl),
+		func(_ context.Context, previous *clientTransport) (*clientTransport, error) {
+			recreateCalls.Add(1)
+			return previous, nil
+		},
+		2,
+		0,
+	)
+
+	require.Error(t, connection.Invoke(context.Background(), "/test/fail", nil, nil))
+	connection.mu.Lock()
+	require.Equal(t, 1, connection.consecutiveFailures)
+	connection.mu.Unlock()
+	stream, err := connection.NewStream(
+		context.Background(),
+		&grpc.StreamDesc{ServerStreams: true},
+		protos.TaskHubSidecarService_StreamInstanceHistory_FullMethodName,
+	)
+	require.NoError(t, err)
+	require.Nil(t, stream)
+	require.Equal(t, 1, callCount)
+	connection.mu.Lock()
+	require.Zero(t, connection.consecutiveFailures)
+	connection.mu.Unlock()
+	require.Error(t, connection.Invoke(context.Background(), "/test/fail", nil, nil))
+	require.Never(t, func() bool {
+		return recreateCalls.Load() != 0
+	}, 50*time.Millisecond, time.Millisecond)
+}
+
+func finishStreamCall(options []grpc.CallOption, err error) error {
+	for _, option := range options {
+		if onFinish, ok := option.(grpc.OnFinishCallOption); ok {
+			onFinish.OnFinish(err)
+		}
+	}
+	return err
 }
 
 func TestRecreatingClientConnRequestCancellationDoesNotTriggerRecreation(t *testing.T) {

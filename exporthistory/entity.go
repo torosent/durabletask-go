@@ -47,9 +47,7 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		// Run carries an optional fencing token, so an absent input is not an
 		// error.
 		_ = ctx.GetInput(&request)
-		if !runTokenMatches(&state, request.RunToken) {
-			ctx.Logger().Warn("dropping a run signal from a stale export job generation",
-				"jobId", jobID, "requestToken", request.RunToken)
+		if dropsStaleMutation(ctx, &state, "a run signal", request.RunToken) {
 			return nil, nil
 		}
 		if err := runExportJob(ctx, &state); err != nil {
@@ -68,9 +66,7 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		if err := ctx.GetInput(&request); err != nil {
 			return nil, &ValidationError{JobID: jobID, Message: "checkpoint commit request is required"}
 		}
-		if !runTokenMatches(&state, request.RunToken) {
-			ctx.Logger().Warn("dropping a checkpoint from a stale export job generation",
-				"jobId", jobID, "requestToken", request.RunToken)
+		if dropsStaleMutation(ctx, &state, "a checkpoint", request.RunToken) {
 			return nil, nil
 		}
 		if err := commitCheckpoint(ctx, &state, request); err != nil {
@@ -81,9 +77,7 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		// MarkAsCompleted carries an optional fencing token, so an absent input
 		// is not an error.
 		_ = ctx.GetInput(&request)
-		if !runTokenMatches(&state, request.RunToken) {
-			ctx.Logger().Warn("dropping a completion from a stale export job generation",
-				"jobId", jobID, "requestToken", request.RunToken)
+		if dropsStaleMutation(ctx, &state, "a completion", request.RunToken) {
 			return nil, nil
 		}
 		if err := markExportJobCompleted(ctx, &state); err != nil {
@@ -94,9 +88,7 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		// MarkAsFailed carries an optional message and fencing token, so an
 		// absent input is not an error.
 		_ = ctx.GetInput(&request)
-		if !runTokenMatches(&state, request.RunToken) {
-			ctx.Logger().Warn("dropping a failure from a stale export job generation",
-				"jobId", jobID, "requestToken", request.RunToken)
+		if dropsStaleMutation(ctx, &state, "a failure", request.RunToken) {
 			return nil, nil
 		}
 		if err := markExportJobFailed(ctx, &state, request.Error); err != nil {
@@ -139,6 +131,24 @@ func newRunToken() string {
 // mutation must carry the exact value; an empty token from an older run is stale.
 func runTokenMatches(state *ExportJobState, token string) bool {
 	return state.RunToken == "" || (token != "" && state.RunToken == token)
+}
+
+// dropsStaleMutation reports whether a mutation carrying token belongs to a
+// superseded run generation, logging the drop when it does. Every
+// orchestration-originated mutation is fenced this way, so a run left over from
+// a deleted-and-recreated job cannot alter the new generation. The mutation
+// argument names the dropped signal in the log entry, for example "a run
+// signal".
+func dropsStaleMutation(ctx *task.EntityContext, state *ExportJobState, mutation, token string) bool {
+	if runTokenMatches(state, token) {
+		return false
+	}
+	ctx.Logger().Warn(
+		"dropping "+mutation+" from a stale export job generation",
+		"jobId", ctx.ID.Key,
+		"requestToken", token,
+	)
+	return true
 }
 
 func createExportJob(ctx *task.EntityContext, state *ExportJobState, options JobCreationOptions) error {
@@ -240,6 +250,12 @@ func commitCheckpoint(ctx *task.EntityContext, state *ExportJobState, request Co
 		return &ValidationError{
 			JobID:   ctx.ID.Key,
 			Message: "checkpoint progress counts must not be negative",
+		}
+	}
+	if request.Checkpoint != nil && len(request.Failures) > 0 {
+		return &ValidationError{
+			JobID:   ctx.ID.Key,
+			Message: "checkpoint and failures cannot be committed together",
 		}
 	}
 	state.ScannedInstances += request.ScannedInstances

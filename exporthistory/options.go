@@ -128,76 +128,54 @@ func (o JobCreationOptions) normalize(now time.Time, futureSkew time.Duration) (
 	if err := validateJobID(normalized.JobID); err != nil {
 		return JobCreationOptions{}, err
 	}
+	// invalidf reports a validation failure against the job ID resolved above,
+	// which every rule below shares.
+	invalidf := func(format string, args ...any) (JobCreationOptions, error) {
+		return JobCreationOptions{}, &ValidationError{
+			JobID:   normalized.JobID,
+			Message: fmt.Sprintf(format, args...),
+		}
+	}
 
 	switch normalized.Mode {
 	case ExportModeBatch:
-		if normalized.CompletedTimeFrom.IsZero() {
-			return JobCreationOptions{}, &ValidationError{
-				JobID:   normalized.JobID,
-				Message: "CompletedTimeFrom is required for Batch export mode",
-			}
-		}
-		if normalized.CompletedTimeTo.IsZero() {
-			return JobCreationOptions{}, &ValidationError{
-				JobID:   normalized.JobID,
-				Message: "CompletedTimeTo is required for Batch export mode",
-			}
-		}
-		if !normalized.CompletedTimeTo.After(normalized.CompletedTimeFrom) {
-			return JobCreationOptions{}, &ValidationError{
-				JobID: normalized.JobID,
-				Message: fmt.Sprintf(
-					"CompletedTimeTo (%s) must be greater than CompletedTimeFrom (%s) for Batch export mode",
-					formatInstant(normalized.CompletedTimeTo), formatInstant(normalized.CompletedTimeFrom)),
-			}
-		}
-		if normalized.CompletedTimeTo.After(now.Add(futureSkew)) {
-			return JobCreationOptions{}, &ValidationError{
-				JobID: normalized.JobID,
-				Message: fmt.Sprintf(
-					"CompletedTimeTo (%s) cannot be in the future; it must be less than or equal to the current time (%s)",
-					formatInstant(normalized.CompletedTimeTo), formatInstant(now)),
-			}
+		switch {
+		case normalized.CompletedTimeFrom.IsZero():
+			return invalidf("CompletedTimeFrom is required for Batch export mode")
+		case normalized.CompletedTimeTo.IsZero():
+			return invalidf("CompletedTimeTo is required for Batch export mode")
+		case !normalized.CompletedTimeTo.After(normalized.CompletedTimeFrom):
+			return invalidf(
+				"CompletedTimeTo (%s) must be greater than CompletedTimeFrom (%s) for Batch export mode",
+				formatInstant(normalized.CompletedTimeTo), formatInstant(normalized.CompletedTimeFrom))
+		case normalized.CompletedTimeTo.After(now.Add(futureSkew)):
+			return invalidf(
+				"CompletedTimeTo (%s) cannot be in the future; it must be less than or equal to the current time (%s)",
+				formatInstant(normalized.CompletedTimeTo), formatInstant(now))
 		}
 	case ExportModeContinuous:
 		if !normalized.CompletedTimeTo.IsZero() {
-			return JobCreationOptions{}, &ValidationError{
-				JobID:   normalized.JobID,
-				Message: "CompletedTimeTo is not allowed for Continuous export mode",
-			}
+			return invalidf("CompletedTimeTo is not allowed for Continuous export mode")
 		}
 		if normalized.CompletedTimeFrom.IsZero() {
 			normalized.CompletedTimeFrom = now
 		}
 	default:
-		return JobCreationOptions{}, &ValidationError{
-			JobID:   normalized.JobID,
-			Message: fmt.Sprintf("invalid export mode %d", int(normalized.Mode)),
-		}
+		return invalidf("invalid export mode %d", int(normalized.Mode))
 	}
 
 	switch {
 	case normalized.MaxInstancesPerBatch == 0:
 		normalized.MaxInstancesPerBatch = DefaultMaxInstancesPerBatch
 	case normalized.MaxInstancesPerBatch < 1 || normalized.MaxInstancesPerBatch > MaxInstancesPerBatchLimit:
-		return JobCreationOptions{}, &ValidationError{
-			JobID: normalized.JobID,
-			Message: fmt.Sprintf("MaxInstancesPerBatch must be between 1 and %d, but was %d",
-				MaxInstancesPerBatchLimit, normalized.MaxInstancesPerBatch),
-		}
+		return invalidf("MaxInstancesPerBatch must be between 1 and %d, but was %d",
+			MaxInstancesPerBatchLimit, normalized.MaxInstancesPerBatch)
 	}
 
 	if len(normalized.RuntimeStatus) == 0 {
 		normalized.RuntimeStatus = TerminalStatuses()
-	} else {
-		for _, status := range normalized.RuntimeStatus {
-			if !isTerminalStatus(status) {
-				return JobCreationOptions{}, &ValidationError{
-					JobID:   normalized.JobID,
-					Message: terminalStatusesValidationMessage,
-				}
-			}
-		}
+	} else if err := validateTerminalStatuses(normalized.RuntimeStatus); err != nil {
+		return JobCreationOptions{}, withJobID(err, normalized.JobID)
 	}
 
 	if normalized.Format == nil {
@@ -206,10 +184,7 @@ func (o JobCreationOptions) normalize(now time.Time, futureSkew time.Duration) (
 	} else {
 		format := *normalized.Format
 		if !format.Kind.IsValid() {
-			return JobCreationOptions{}, &ValidationError{
-				JobID:   normalized.JobID,
-				Message: fmt.Sprintf("invalid export format kind %d", int(format.Kind)),
-			}
+			return invalidf("invalid export format kind %d", int(format.Kind))
 		}
 		if format.SchemaVersion == "" {
 			format.SchemaVersion = DefaultSchemaVersion

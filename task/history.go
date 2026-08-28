@@ -87,7 +87,9 @@ type OrchestrationOptions struct {
 	// timers are split into deterministic sequential actions that retain the
 	// original deadline. Zero uses [DefaultMaximumTimerInterval].
 	//
-	// Changing this value is a replay-breaking change for in-flight
+	// Upgrading from a release that did not split long timers is replay-compatible
+	// once the historical logical deadline has fired. Changing this value between
+	// two splitting configurations remains replay-breaking for in-flight
 	// orchestrations that have timers longer than either the old or new value.
 	MaximumTimerInterval time.Duration
 

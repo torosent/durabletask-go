@@ -179,7 +179,7 @@ func TestListTerminalInstancesActivity(t *testing.T) {
 		to := from.Add(time.Hour)
 		result, err := runtime.listTerminalInstancesActivity(newActivityContext(t, ListTerminalInstancesRequest{
 			CompletedTimeFrom:    from,
-			CompletedTimeTo:      to,
+			CompletedTimeTo:      &to,
 			RuntimeStatus:        []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
 			LastInstanceKey:      "cursor",
 			MaxInstancesPerBatch: 7,
@@ -201,7 +201,7 @@ func TestListTerminalInstancesActivity(t *testing.T) {
 		assert.Equal(t, "cursor", query.ContinuationToken)
 	})
 
-	t.Run("omits the checkpoint at the end of the stream", func(t *testing.T) {
+	t.Run("omits the backend cursor at the end of the stream", func(t *testing.T) {
 		source := newFakeSource()
 		// A task hub reports the last page by omitting the continuation token.
 		source.pages = []api.InstanceIDQueryResult{{InstanceIDs: []api.InstanceID{"a"}}}
@@ -210,8 +210,7 @@ func TestListTerminalInstancesActivity(t *testing.T) {
 		require.NoError(t, err)
 		page := result.(InstancePage)
 		assert.Equal(t, []string{"a"}, page.InstanceIDs)
-		assert.Nil(t, page.NextCheckpoint,
-			"committing an empty cursor would restart the scan and re-export forever")
+		assert.Nil(t, page.NextCheckpoint)
 	})
 
 	t.Run("defaults the status filter and page size", func(t *testing.T) {

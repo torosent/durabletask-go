@@ -144,6 +144,11 @@ func (c *Client) ListJobs(ctx context.Context, query ExportJobQuery) (*ExportJob
 	if strings.Contains(query.JobIDPrefix, "@") {
 		return nil, &ValidationError{Message: "export job ID prefix must not contain '@'"}
 	}
+	if query.Status != nil && !query.Status.IsValid() {
+		return nil, &ValidationError{
+			Message: fmt.Sprintf("invalid export job status %d", int(*query.Status)),
+		}
+	}
 	entities, err := c.backend.QueryEntities(ctx, api.EntityQuery{
 		InstanceIDStartsWith: strings.ToLower("@"+ExportJobEntityName+"@") + query.JobIDPrefix,
 		IncludeState:         true,

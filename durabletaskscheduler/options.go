@@ -267,6 +267,16 @@ func (o *Options) Validate() error {
 			return fmt.Errorf("invalid DTS versioning options: %w", err)
 		}
 	}
+	for _, interceptor := range o.UnaryInterceptors {
+		if interceptor == nil {
+			return fmt.Errorf("DTS unary interceptors cannot contain nil")
+		}
+	}
+	for _, interceptor := range o.StreamInterceptors {
+		if interceptor == nil {
+			return fmt.Errorf("DTS stream interceptors cannot contain nil")
+		}
+	}
 
 	endpoint, err := normalizeEndpoint(o.EndpointAddress)
 	if err != nil {

@@ -191,17 +191,18 @@ client reconstructs the typed error across the orchestration boundary and
   continuation token (embedded sqlite and Postgres) or by returning an empty page
   with a token (Durable Task Scheduler). Both are handled. A backend that omits
   the token on a non-empty final page makes a continuous job re-scan that final
-  page on each idle cycle; re-exports overwrite the same objects, but the job's
-  scanned and exported counters include the re-scan.
+  page on each idle cycle; deterministic blob names make the writes idempotent,
+  but scanned and exported counters include the re-scan.
 - **List visibility lag.** The service's instance-ID index can lag orchestration
   completion. A batch job whose first page is empty legitimately completes with
   nothing exported, so schedule a job after the window's instances are listable.
-- **Retry semantics.** A per-instance export retries three times (15s, 30s) for
-  transient failures such as a storage write error. Conditions retrying cannot
-  fix, such as a missing or non-terminal instance, are collected immediately. A
-  page whose instances still fail is attempted three times in total, waiting 1
-  minute before the second attempt and 2 minutes before the third; the third
-  attempt fails the page instead of waiting again.
+- **Retry semantics.** A per-instance export is attempted up to three times
+  (retry delays 15s, then 30s) for transient failures such as a storage write
+  error. Conditions retrying cannot fix, such as a missing or non-terminal
+  instance, are collected immediately. A page whose instances still fail is
+  attempted three times in total, waiting 1 minute before the second attempt and
+  2 minutes before the third; the third attempt fails the page instead of
+  waiting again.
 - **Delete is not atomic** with terminating and purging the job's orchestration.
 
 ## Tests

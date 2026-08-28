@@ -910,7 +910,14 @@ func (ctx *OrchestrationContext) createTimerInternal(
 			if logicalTimer.isCompleted {
 				return
 			}
-			if isFinalChunk || chunk.isCanceled || chunk.localErr != nil || chunk.failureDetails != nil {
+			// A pre-splitting worker recorded the logical deadline as one timer.
+			// If replay reaches that historical TimerFired event, CurrentTimeUtc
+			// is already at or beyond the deadline and no intermediate chunk may
+			// consume the next sequence number.
+			if isFinalChunk ||
+				(!chunk.timerFireAt.IsZero() && !deadline.After(chunk.timerFireAt)) ||
+				!deadline.After(ctx.CurrentTimeUtc) ||
+				chunk.isCanceled || chunk.localErr != nil || chunk.failureDetails != nil {
 				logicalTimer.completeFrom(chunk, nil)
 				return
 			}
@@ -1343,6 +1350,9 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 	delete(ctx.pendingTasks, timerID)
 
 	// completing a task will resume the corresponding Await() call
+	if tf.GetFireAt() != nil {
+		task.timerFireAt = tf.GetFireAt().AsTime()
+	}
 	task.complete(nil)
 	return nil
 }
@@ -1463,6 +1473,10 @@ func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTermi
 	// action be emitted and discards events that can no longer be processed.
 	ctx.isSuspended = false
 	ctx.suspendedEvents = nil
+	// Termination can arrive in the same work item that lets the root coroutine
+	// complete naturally. Keep exactly one terminal action, with termination
+	// taking precedence over the pending natural completion.
+	ctx.clearCompletionActions()
 	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 
