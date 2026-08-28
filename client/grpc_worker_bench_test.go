@@ -50,7 +50,7 @@ func BenchmarkWorkItemFiltersFromRegistry(b *testing.B) {
 		b.Run(fmt.Sprintf("unversioned/size=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				filters := workItemFiltersFromRegistry(snapshot, nil, nil)
+				filters := workItemFiltersFromRegistry(snapshot, nil, nil, nil)
 				if len(filters.Orchestrations) == 0 {
 					b.Fatal("no orchestration filters were derived")
 				}
@@ -59,7 +59,7 @@ func BenchmarkWorkItemFiltersFromRegistry(b *testing.B) {
 		b.Run(fmt.Sprintf("strict/size=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				filters := workItemFiltersFromRegistry(snapshot, strict, nil)
+				filters := workItemFiltersFromRegistry(snapshot, strict, nil, nil)
 				if len(filters.Orchestrations) == 0 {
 					b.Fatal("no orchestration filters were derived")
 				}
@@ -72,7 +72,7 @@ func BenchmarkWorkItemFiltersFromRegistry(b *testing.B) {
 // filters, which is sent on every worker stream generation.
 func BenchmarkWorkItemFiltersToProto(b *testing.B) {
 	for _, size := range workItemFilterBenchmarkSizes {
-		filters := workItemFiltersFromRegistry(benchmarkRegistrySnapshot(b, size), nil, nil)
+		filters := workItemFiltersFromRegistry(benchmarkRegistrySnapshot(b, size), nil, nil, nil)
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
@@ -90,7 +90,7 @@ func BenchmarkWorkItemFiltersToProto(b *testing.B) {
 func BenchmarkValidateWorkItemFilters(b *testing.B) {
 	for _, size := range workItemFilterBenchmarkSizes {
 		snapshot := benchmarkRegistrySnapshot(b, size)
-		filters := workItemFiltersFromRegistry(snapshot, nil, nil)
+		filters := workItemFiltersFromRegistry(snapshot, nil, nil, nil)
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
@@ -106,7 +106,7 @@ func BenchmarkValidateWorkItemFilters(b *testing.B) {
 // runs on the worker's hot path.
 func BenchmarkMatchesWorkItemFilters(b *testing.B) {
 	for _, size := range workItemFilterBenchmarkSizes {
-		filters := workItemFiltersFromRegistry(benchmarkRegistrySnapshot(b, size), nil, nil)
+		filters := workItemFiltersFromRegistry(benchmarkRegistrySnapshot(b, size), nil, nil, nil)
 		name := fmt.Sprintf("Orchestrator%d", size/2)
 		b.Run(fmt.Sprintf("accept/size=%d", size), func(b *testing.B) {
 			b.ReportAllocs()
