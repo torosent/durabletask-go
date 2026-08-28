@@ -307,6 +307,7 @@ cancels them only if the shutdown context expires.
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
 | Legacy instance-ID `IGNORE` | Known-compatible local sidecars only, with `client.WithLegacyOrchestrationIDReusePolicyWire`; rejected for DTS because the current wire format is ambiguous |
+| History export jobs (preview) | Supported through the top-level [`exporthistory`](../exporthistory) package; register the system tasks and opt in with `exporthistory.WithExportHistory()` |
 
 The current V2 protobuf cannot carry per-operation trace context or request time
 to an entity worker, and it has no properties map for legacy extended-session

@@ -90,6 +90,7 @@ type taskHubGrpcWorkerOptions struct {
 	largePayloads               *api.LargePayloadOptions
 	converter                   api.DataConverter
 	unversionedOrchestrators    map[string]struct{}
+	unversionedActivities       map[string]struct{}
 	// waitFn overrides every delay the worker imposes on itself: reconnect
 	// backoff, transient RPC retry backoff, and work-item abandon delays. It is
 	// only set by tests so the deterministic delay schedule can be observed
@@ -315,18 +316,36 @@ func CombineTaskHubGrpcWorkerOptions(options ...TaskHubGrpcWorkerOption) TaskHub
 // orchestrators to remain routable when strict worker versioning is enabled.
 func WithUnversionedOrchestratorNames(names ...string) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
-		if options.unversionedOrchestrators == nil {
-			options.unversionedOrchestrators = make(map[string]struct{}, len(names))
-		}
-		for _, name := range names {
-			name = strings.TrimSpace(name)
-			if name == "" {
-				return errors.New("unversioned orchestrator name cannot be empty")
-			}
-			options.unversionedOrchestrators[strings.ToLower(name)] = struct{}{}
-		}
-		return nil
+		return addUnversionedTaskNames(&options.unversionedOrchestrators, "orchestrator", names)
 	}
+}
+
+// WithUnversionedActivityNames allows explicitly unversioned system activities
+// to remain routable when strict worker versioning is enabled. System
+// orchestrations run unversioned and an activity inherits its caller's version,
+// so a system component's activities must be advertised unversioned too.
+func WithUnversionedActivityNames(names ...string) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		return addUnversionedTaskNames(&options.unversionedActivities, "activity", names)
+	}
+}
+
+func addUnversionedTaskNames(
+	allowed *map[string]struct{},
+	kind string,
+	names []string,
+) error {
+	if *allowed == nil {
+		*allowed = make(map[string]struct{}, len(names))
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("unversioned %s name cannot be empty", kind)
+		}
+		(*allowed)[strings.ToLower(name)] = struct{}{}
+	}
+	return nil
 }
 
 // WithWorkItemFilters restricts orchestration/activity names and versions and entity names accepted by the worker.
@@ -525,6 +544,7 @@ func newTaskHubGrpcWorker(
 			snapshot,
 			options.versioning,
 			options.unversionedOrchestrators,
+			options.unversionedActivities,
 		)
 	}
 	return &TaskHubGrpcWorker{
@@ -554,21 +574,32 @@ func (options taskHubGrpcWorkerOptions) executorOptions() []task.TaskExecutorOpt
 			task.WithUnversionedOrchestratorNames(slices.Collect(maps.Keys(options.unversionedOrchestrators))...),
 		)
 	}
+	if len(options.unversionedActivities) > 0 {
+		executorOptions = append(
+			executorOptions,
+			task.WithUnversionedActivityNames(slices.Collect(maps.Keys(options.unversionedActivities))...),
+		)
+	}
 	return executorOptions
 }
 
 func workItemFiltersFromRegistry(
 	snapshot task.TaskRegistrySnapshot,
 	versioning *task.VersioningOptions,
-	allowedUnversioned map[string]struct{},
+	allowedUnversionedOrchestrators map[string]struct{},
+	allowedUnversionedActivities map[string]struct{},
 ) *WorkItemFilters {
 	entities := slices.Clone(snapshot.Entities)
 	if slices.Contains(entities, "*") {
 		entities = nil
 	}
+	orchestrations := taskRegistrationsToFilters(
+		snapshot.Orchestrators, versioning, allowedUnversionedOrchestrators)
+	activities := taskRegistrationsToFilters(
+		snapshot.Activities, versioning, allowedUnversionedActivities)
 	return &WorkItemFilters{
-		Orchestrations:          taskRegistrationsToFilters(snapshot.Orchestrators, versioning, allowedUnversioned),
-		Activities:              taskRegistrationsToFilters(snapshot.Activities, versioning, nil),
+		Orchestrations:          orchestrations,
+		Activities:              activities,
 		Entities:                entities,
 		RejectAllOrchestrations: len(snapshot.Orchestrators) == 0,
 		RejectAllActivities:     len(snapshot.Activities) == 0,

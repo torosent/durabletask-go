@@ -37,6 +37,50 @@ leaking generated protobuf messages.
 See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
 and the [environment-driven sample](./samples/durabletaskscheduler).
 
+## History export (preview)
+
+The top-level [`exporthistory`](./exporthistory) package exports terminal
+orchestration histories to Azure Blob Storage as gzip-compressed JSONL, using a
+durable entity for job state, a dedicated orchestration for the export work, and
+two activities for listing and exporting. It supports batch and continuous jobs,
+durable checkpoints, terminal-status filters, per-batch instance limits, failure
+collection, and typed validation, not-found, and invalid-transition errors.
+Exported objects are stored as opaque gzip files (`.jsonl.gz` with content type
+`application/gzip` and no `Content-Encoding`), so every reader gets exactly the
+bytes the object name promises.
+
+```go
+store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+    ConnectionString: storageConnectionString,
+    ContainerName:    "history-exports",
+})
+err = exporthistory.Register(registry, exporthistory.WorkerOptions{
+    Source: taskHubClient, // supplies ListInstanceIDs and orchestration history
+    Store:  store,
+})
+worker, err := durabletaskscheduler.NewWorker(options, registry, logger,
+    durabletaskclient.WithAutoWorkItemFilters(),
+    exporthistory.WithExportHistory(),
+)
+
+exportClient, err := exporthistory.NewClient(taskHubClient, exporthistory.ClientOptions{
+    ContainerName: "history-exports",
+})
+job, err := exportClient.CreateJob(ctx, exporthistory.JobCreationOptions{
+    Mode:              exporthistory.ExportModeBatch,
+    CompletedTimeFrom: from,
+    CompletedTimeTo:   to,
+})
+description, err := job.Describe(ctx)
+```
+
+This package is **preview**: its exported API, the serialized shape of the
+`ExportJob` entity state, and the names of its system tasks may change without a
+major version bump. Extended sessions are not supported.
+
+See the [export history guide](./exporthistory/README.md) and the
+[sample](./samples/exporthistory).
+
 ## Task versions
 
 Orchestrators and activities can register multiple implementations under the

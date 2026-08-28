@@ -348,9 +348,42 @@ func TestStrictAutoFiltersPreserveAllowedUnversionedOrchestrator(t *testing.T) {
 		},
 		&task.VersioningOptions{Version: "1.0", MatchStrategy: task.VersionMatchStrict},
 		map[string]struct{}{"system": {}},
+		nil,
 	)
 	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "system", Versions: []string{""}})
 	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "application", Versions: []string{"1.0"}})
+}
+
+// TestStrictAutoFiltersPreserveAllowedUnversionedActivity keeps a system
+// component's unversioned activities routable under strict worker versioning.
+// An activity inherits its caller's version, so an unversioned system
+// orchestration schedules unversioned activities.
+func TestStrictAutoFiltersPreserveAllowedUnversionedActivity(t *testing.T) {
+	snapshot := task.TaskRegistrySnapshot{
+		Activities: []task.TaskRegistration{
+			{Name: "SystemActivity"},
+			{Name: "application", Version: "1.0"},
+		},
+	}
+	versioning := &task.VersioningOptions{Version: "1.0", MatchStrategy: task.VersionMatchStrict}
+
+	// Without the allow-list the worker demands its own version for the system
+	// activity, so the service never dispatches the unversioned work item.
+	blocked := workItemFiltersFromRegistry(snapshot, versioning, nil, nil)
+	require.Contains(t, blocked.Activities, WorkItemFilter{Name: "SystemActivity", Versions: []string{"1.0"}})
+
+	allowed := workItemFiltersFromRegistry(
+		snapshot, versioning, nil, map[string]struct{}{"systemactivity": {}})
+	require.Contains(t, allowed.Activities, WorkItemFilter{Name: "SystemActivity", Versions: []string{""}})
+	require.Contains(t, allowed.Activities, WorkItemFilter{Name: "application", Versions: []string{"1.0"}})
+}
+
+func TestWithUnversionedActivityNamesRejectsBlankNames(t *testing.T) {
+	options := defaultTaskHubGrpcWorkerOptions()
+	require.Error(t, WithUnversionedActivityNames("  ")(&options))
+	require.NoError(t, WithUnversionedActivityNames("Alpha", "beta")(&options))
+	require.Contains(t, options.unversionedActivities, "alpha")
+	require.Contains(t, options.unversionedActivities, "beta")
 }
 
 func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
@@ -368,7 +401,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 		return nil, nil
 	}))
 
-	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil, nil)
+	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil, nil, nil)
 	require.Equal(t, []WorkItemFilter{
 		{Name: "legacy", Versions: []string{}},
 		{Name: "mixed", Versions: []string{"", "v2"}},
@@ -378,7 +411,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 	strict := workItemFiltersFromRegistry(registry.Snapshot(), &task.VersioningOptions{
 		Version:       "v3",
 		MatchStrategy: task.VersionMatchStrict,
-	}, nil)
+	}, nil, nil)
 	require.Equal(t, []string{"v3"}, strict.Orchestrations[0].Versions)
 	require.Equal(t, []string{"v3"}, strict.Activities[0].Versions)
 	require.Error(t, validateStrictAutoFilters(registry.Snapshot(), &task.VersioningOptions{
