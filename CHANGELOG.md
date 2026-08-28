@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added DTS recurring interval schedules with create/get/list and per-schedule describe, update, pause, resume, and delete operations, durable execution-token state, worker registration/capability helpers, versions, tags, context, retries, and converter-aware inputs.
 - Added deterministic long-timer splitting with a configurable three-day default across embedded, generic gRPC, and DTS workers.
 - Added failure-threshold-based gRPC channel recreation for the owned DTS management client, with long-poll deadline exemptions and in-flight protection.
+- Expanded scheduled-task parity across boundary times, missed intervals, lifecycle transitions, stale tokens, no-op updates, typed client errors, and arbitrary text inputs.
+- Hardened Azure Blob container initialization and deletion recovery under concurrency, and added bounded concurrent payload transformation with deterministic failure ordering.
 
 ### Changed
 
