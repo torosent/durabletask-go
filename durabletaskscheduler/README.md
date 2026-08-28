@@ -42,6 +42,13 @@ operations with opaque continuation tokens, plus `RestartInstance`,
 can filter locally by exact tag key/value pairs when the current wire contract
 does not carry tag filters.
 
+`GetOrchestrationHistory` returns API-owned history records with validated event
+and approximate byte caps. `StreamOrchestrationHistory` invokes a callback in
+service order without retaining the history in memory. Both preserve execution identity,
+timestamps, failures, tags, context fields, rewind markers, and native entity
+events. Serialized payloads remain raw until a `ReadInput`, `ReadResult`, or
+`ReadData` helper applies the configured data converter.
+
 The embedded sqlite and Postgres sidecar implementations support these
 operations directly. The current DTS emulator supports query, restart, and
 batch purge, but has known service limitations: `SkipGracefulOrchestrationTerminations`
@@ -83,7 +90,59 @@ whereas unfiltered delivery produces a deterministic task-not-found failure.
 Auto-generated filters reject task kinds with no registrations and validate
 that strict worker versions can resolve every advertised logical name.
 Capability advertisement is explicit: history streaming is enabled by default,
-while scheduled tasks use `client.WithScheduledTaskCapability(true)`.
+while scheduled tasks use `durabletaskscheduler.WithScheduledTasks()`.
+
+### Recurring scheduled tasks
+
+Scheduled tasks use recurring UTC intervals, not cron expressions. Register the
+system entity and orchestrators before creating the worker:
+
+```go
+registry := task.NewTaskRegistry()
+registry.AddOrchestratorNVersion("Backup", "1.0", backup)
+durabletaskscheduler.RegisterScheduledTasksWithDefaultVersion(registry, "1.0")
+
+worker, _ := durabletaskscheduler.NewWorker(
+    options,
+    registry,
+    logger,
+    durabletaskscheduler.WithScheduledTasks(),
+    client.WithAutoWorkItemFilters(),
+)
+```
+
+Create and manage schedules through the DTS client:
+
+```go
+schedules := schedulerClient.ScheduledTasks()
+handle, _ := schedules.Create(ctx, durabletaskscheduler.ScheduleCreationOptions{
+    ScheduleID:              "nightly-backup",
+    OrchestrationName:       "Backup",
+    TypedOrchestrationInput: backupRequest,
+    Interval:                24 * time.Hour,
+    StartAt:                 firstRun,
+    StartImmediatelyIfLate:  true,
+    Tags:                    map[string]string{"team": "storage"},
+    ContextFields:           api.ContextFields{"tenant": "north"},
+})
+
+description, _ := handle.Describe(ctx)
+_ = handle.Pause(ctx)
+_ = handle.Update(ctx, durabletaskscheduler.ScheduleUpdateOptions{Interval: &newInterval})
+_ = handle.Resume(ctx)
+_ = handle.Delete(ctx)
+```
+
+`Get` returns `nil, nil` for a missing schedule. `List` is continuation-based;
+status and creation-time filters are applied after each entity page, so pages
+can be underfilled. Schedule operations return typed errors compatible with
+`errors.Is` and `errors.As`. A fixed target instance ID prevents overlapping
+runs. Fixed target instance IDs cannot be combined with a retry policy because
+each retry requires a distinct durable instance. Tags, context fields, and
+retry policies use an internal launch
+orchestrator because the entity-start wire action cannot carry them directly.
+Explicit work-item filters must include the `Schedule` entity and both system
+orchestrators; auto filters include them from the registry.
 
 ### Data converters
 
@@ -112,8 +171,32 @@ options.LargePayloads = &api.LargePayloadOptions{
 }
 ```
 
-`payload.NewFileStore` provides a bounded local-file implementation. Workers
-advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured. The same
+`payload.NewFileStore` provides a bounded local-file implementation. For
+production DTS interoperability, `payload.NewAzureBlobStore` emits the same
+self-describing `blob:v2:<absolute-blob-url>` token as the .NET SDK and can read
+legacy .NET `blob:v1` tokens:
+
+```go
+store, _ := payload.NewAzureBlobStore(payload.AzureBlobStoreOptions{
+    ConnectionString: os.Getenv("AzureWebJobsStorage"),
+    Container:        "durabletask-payloads",
+})
+options.LargePayloads = &api.LargePayloadOptions{
+    Store:    store,
+    Resolver: store,
+}
+```
+
+Identity authentication uses `AccountURL` plus an `azcore.TokenCredential`.
+Cross-account identity reads require an explicit `AllowedHosts` entry. Azure
+Blob defaults match .NET: 256 KiB inclusive threshold, 10 MiB maximum, gzip
+enabled, eight exponential retries, and the `durabletask-payloads` container.
+Tokens are treated as untrusted: userinfo, SAS/query strings, fragments,
+unapproved hosts, malformed paths, oversized downloads, and invalid integrity
+metadata are rejected. Go-written blobs include size, SHA-256, and content-MD5
+integrity data; .NET blobs without that metadata remain readable.
+
+Workers advertise `LARGE_PAYLOADS` only when `LargePayloads` is configured. The same
 abstraction can be used with embedded backends through
 `backend.NewLargePayloadBackend`. Resolver implementations must treat reference
 locations as untrusted and enforce their own scheme/account/path allow lists.
@@ -140,12 +223,14 @@ cancels them only if the shutdown context expires.
 | Work-item filters for orchestrations, activities, and entities | Supported |
 | Completion tokens and abandon RPCs | Supported |
 | Health pings, silent-disconnect detection, and channel recreation | Supported |
-| Streamed orchestration history | Supported and advertised |
+| Public orchestration history | Supported through buffered and callback-streaming API-owned records |
 | Version-aware registry dispatch and controlled unversioned fallback | Supported |
 | Default versions, activity inheritance, and ContinueAsNew migration | Supported; backend/service must honor `newVersion` |
 | Name/version work-item filters | Supported, auto-generated or explicit, advertised, and locally enforced |
 | Pluggable application data conversion | Supported with shared client/worker configuration; default is JSON |
-| Scheduled-task capability | Supported; opt in with `client.WithScheduledTaskCapability(true)` |
+| Recurring interval schedules | Supported: create/get/list/describe/update/pause/resume/delete, start/end times, versions, tags/context, and retries |
+| Scheduled-task capability | Supported; register system tasks and opt in with `durabletaskscheduler.WithScheduledTasks()` |
+| Azure Blob `blob:v2` payloads | Supported with connection-string or identity authentication and .NET-compatible gzip/token semantics |
 | Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | DTS instance-ID replacement (`TERMINATE`) | Supported |
@@ -176,4 +261,10 @@ The integration suite is environment-gated:
 DTS_EMULATOR_ENDPOINT=http://127.0.0.1:8080 \
 DTS_TASK_HUB=default \
 go test ./tests/durabletaskscheduler -count=1
+```
+
+Azurite-backed blob tests additionally use:
+
+```bash
+export AZURITE_CONNECTION_STRING='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<development-key>;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
 ```

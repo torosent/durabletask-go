@@ -42,6 +42,9 @@ func run() error {
 	if err := registry.AddActivityNVersion("SayHello", "1.0", sayHello); err != nil {
 		return err
 	}
+	if err := durabletaskscheduler.RegisterScheduledTasksWithDefaultVersion(registry, options.Versioning.DefaultVersion); err != nil {
+		return err
+	}
 
 	logger := backend.DefaultLogger()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -61,7 +64,7 @@ func run() error {
 		options,
 		registry,
 		logger,
-		durabletaskclient.WithScheduledTaskCapability(true),
+		durabletaskscheduler.WithScheduledTasks(),
 		durabletaskclient.WithAutoWorkItemFilters(),
 	)
 	if err != nil {
@@ -102,6 +105,34 @@ func run() error {
 		return err
 	}
 	fmt.Printf("matched %d tagged orchestration(s)\n", len(query.Orchestrations))
+
+	history, err := schedulerClient.GetOrchestrationHistory(ctx, instanceID, api.HistoryQuery{
+		ExecutionID: metadata.ExecutionID,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("history contains %d event(s)\n", len(history.Events))
+
+	scheduleID := "sample-hourly"
+	schedule, err := schedulerClient.ScheduledTasks().Create(ctx, durabletaskscheduler.ScheduleCreationOptions{
+		ScheduleID:        scheduleID,
+		OrchestrationName: "ActivitySequence",
+		Interval:          time.Hour,
+		StartAt:           time.Now().UTC().Add(time.Hour),
+		Tags:              map[string]string{"sample": "scheduled-task"},
+	})
+	if err != nil {
+		return err
+	}
+	description, err := schedule.Describe(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("schedule %s is %s; next run: %s\n", description.ScheduleID, description.Status, description.NextRunAt)
+	if err := schedule.Delete(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 

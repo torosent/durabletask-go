@@ -118,6 +118,80 @@ func startGrpcListener(t *testing.T, r *task.TaskRegistry) context.CancelFunc {
 	}
 }
 
+func Test_Grpc_OrchestrationHistory(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("GrpcHistoryEcho", func(ctx task.ActivityContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		return input + "-done", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("GrpcHistory", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		var result string
+		if err := ctx.CallActivity("GrpcHistoryEcho", task.WithActivityInput(input)).Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}))
+	stopListener := startGrpcListener(t, registry)
+	defer stopListener()
+
+	testCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	instanceID := api.InstanceID(fmt.Sprintf("grpc-history-%d", time.Now().UnixNano()))
+	_, err := grpcClient.ScheduleNewOrchestration(
+		testCtx,
+		"GrpcHistory",
+		api.WithInstanceID(instanceID),
+		api.WithInput("value"),
+		api.WithTags(map[string]string{"source": "history-test"}),
+		api.WithContextFields(api.ContextFields{"tenant": "north"}),
+	)
+	require.NoError(t, err)
+	metadata, err := grpcClient.WaitForOrchestrationCompletion(testCtx, instanceID)
+	require.NoError(t, err)
+
+	history, err := grpcClient.GetOrchestrationHistory(
+		testCtx,
+		instanceID,
+		api.HistoryQuery{ExecutionID: metadata.ExecutionID},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, history.Events)
+	require.Equal(t, api.HistoryEventOrchestratorStarted, history.Events[0].Type)
+
+	var foundStart, foundTaskResult, foundCompletion bool
+	for _, event := range history.Events {
+		switch event.Type {
+		case api.HistoryEventExecutionStarted:
+			require.Equal(t, map[string]string{"source": "history-test"}, event.ExecutionStarted.Tags)
+			require.Equal(t, api.ContextFields{"tenant": "north"}, event.ExecutionStarted.ContextFields)
+			var input string
+			require.NoError(t, event.ReadInput(&input))
+			require.Equal(t, "value", input)
+			foundStart = true
+		case api.HistoryEventTaskCompleted:
+			var result string
+			require.NoError(t, event.ReadResult(&result))
+			require.Equal(t, "value-done", result)
+			foundTaskResult = true
+		case api.HistoryEventExecutionCompleted:
+			var result string
+			require.NoError(t, event.ReadResult(&result))
+			require.Equal(t, "value-done", result)
+			foundCompletion = true
+		}
+	}
+	require.True(t, foundStart)
+	require.True(t, foundTaskResult)
+	require.True(t, foundCompletion)
+}
+
 func Test_Grpc_AdvancedManagementOperations(t *testing.T) {
 	registry := task.NewTaskRegistry()
 	require.NoError(t, registry.AddOrchestratorN("GrpcManagementComplete", func(ctx *task.OrchestrationContext) (any, error) {

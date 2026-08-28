@@ -27,6 +27,9 @@ func TestNormalizeLargePayloadOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DefaultLargePayloadThresholdBytes, normalized.ThresholdBytes)
 	require.Equal(t, DefaultLargePayloadMaxBytes, normalized.MaxPayloadBytes)
+
+	_, err = NormalizeLargePayloadOptions(&LargePayloadOptions{})
+	require.ErrorIs(t, err, ErrInvalidArgument)
 }
 
 type testPayloadStore struct{}

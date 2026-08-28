@@ -43,6 +43,10 @@ func (be *largePayloadBackend) UnwrapBackend() Backend {
 	return be.Backend
 }
 
+func (be *largePayloadBackend) rawHistoryBackend() Backend {
+	return be.Backend
+}
+
 func (be *largePayloadBackend) CreateOrchestrationInstance(
 	ctx context.Context,
 	event *HistoryEvent,

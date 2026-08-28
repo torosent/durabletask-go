@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added centralized request/response gRPC error mapping that preserves both `errors.Is` categories and original gRPC status codes.
 - Added version-keyed orchestrator and activity registrations, exact-match dispatch with controlled unversioned fallback, client/worker default versions, activity inheritance, registry-derived filters, and ContinueAsNew version migration.
 - Added API-owned pluggable data conversion across orchestration, activity, entity, event, status, management, metadata, and ContinueAsNew payloads, with JSON as the compatibility default and raw API bypasses.
+- Added API-owned orchestration history retrieval for embedded and gRPC/DTS management clients, including bounded callback streaming, execution selection, native entity and rewind events, typed payload readers, converter integration, and large-payload hydration.
+- Added Azure Blob large-payload storage with production Azure SDK configuration, gzip support, bounded and validated reads, legacy `blob:v1` reads, and interoperable self-describing .NET `blob:v2` tokens.
+- Added DTS recurring interval schedules with create/get/list and per-schedule describe, update, pause, resume, and delete operations, durable execution-token state, worker registration/capability helpers, versions, tags, context, retries, and converter-aware inputs.
 
 ### Changed
 
@@ -29,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Orchestration metadata now includes execution ID, completion/scheduled timestamps, parent ID, failure details, and tags when provided by the backend or service.
 - Replaced protobuf failure details in public metadata with `api.FailureDetails`. `RetryPolicy.Handle` now receives deterministic `task.RetryContext`, and non-retriable or canceled failures bypass the handler.
 - `FetchEntityMetadata` now returns `api.ErrInstanceNotFound` when the entity does not exist.
+- Large-payload externalization now uses an inclusive threshold boundary to match the .NET Azure Blob payload extension.
 
 ## [v0.6.0] - 2025-02-05
 
