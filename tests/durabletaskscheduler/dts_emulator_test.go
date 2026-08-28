@@ -1038,6 +1038,59 @@ func TestDTSEmulatorSendEventReplay(t *testing.T) {
 	require.Equal(t, `"pong"`, receiver.SerializedOutput)
 }
 
+func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
+	const (
+		unit            = 2 * time.Second
+		delay           = 7 * unit
+		maximumInterval = 3 * unit
+		expectedTimers  = 3
+	)
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSLongTimer", func(ctx *task.OrchestrationContext) (any, error) {
+		return nil, ctx.CreateTimer(delay).Await(nil)
+	}))
+	options := emulatorOptions(t)
+	options.MaximumTimerInterval = maximumInterval
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSLongTimer",
+		api.WithInstanceID(uniqueInstanceID("go-long-timer")),
+	)
+	require.NoError(t, err)
+	metadata, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+
+	history, err := managementClient.GetOrchestrationHistory(
+		ctx,
+		instanceID,
+		api.HistoryQuery{ExecutionID: metadata.ExecutionID},
+	)
+	require.NoError(t, err)
+	timerCount := 0
+	for _, event := range history.Events {
+		if event.Type == api.HistoryEventTimerCreated {
+			timerCount++
+		}
+	}
+	require.Equal(t, expectedTimers, timerCount)
+}
+
 func TestDTSEmulatorSubOrchestrationRetryAndContinueAsNew(t *testing.T) {
 	var attempts atomic.Int32
 	registry := task.NewTaskRegistry()
@@ -1099,4 +1152,213 @@ func TestDTSEmulatorSubOrchestrationRetryAndContinueAsNew(t *testing.T) {
 	continued, err := managementClient.WaitForOrchestrationCompletion(ctx, continueID, api.WithFetchPayloads(true))
 	require.NoError(t, err)
 	require.Equal(t, "2", continued.SerializedOutput)
+}
+
+func TestDTSEmulatorScheduledTasksAndHistory(t *testing.T) {
+	options := emulatorOptions(t)
+	options.Versioning = &task.VersioningOptions{
+		Version:         "1.0",
+		DefaultVersion:  "1.0",
+		MatchStrategy:   task.VersionMatchStrict,
+		FailureStrategy: task.VersionFailureFail,
+	}
+	registry := task.NewTaskRegistry()
+	var scheduledAttempts atomic.Int32
+	targetName := "DTSScheduledTarget" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+	require.NoError(t, registry.AddOrchestratorNVersion(targetName, "1.0", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		if scheduledAttempts.Add(1) == 1 {
+			return nil, errors.New("retry scheduled target")
+		}
+		return input, nil
+	}))
+	require.NoError(t, durabletaskscheduler.RegisterScheduledTasksWithDefaultVersion(
+		registry,
+		options.Versioning.DefaultVersion,
+	))
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(
+		options,
+		registry,
+		logger,
+		durabletaskscheduler.WithScheduledTasks(),
+		durabletaskclient.WithAutoWorkItemFilters(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	createdFrom := time.Now().UTC().Add(-time.Second)
+	scheduleID := "go-schedule-" + uuid.NewString()
+	scheduleTag := "scheduled-task-" + uuid.NewString()
+	handle, err := managementClient.ScheduledTasks().Create(ctx, durabletaskscheduler.ScheduleCreationOptions{
+		ScheduleID:              scheduleID,
+		OrchestrationName:       targetName,
+		TypedOrchestrationInput: "scheduled",
+		Interval:                2 * time.Second,
+		StartImmediatelyIfLate:  true,
+		Tags:                    map[string]string{"source": scheduleTag},
+		ContextFields:           api.ContextFields{"tenant": "north"},
+		RetryPolicy: &durabletaskscheduler.ScheduleRetryPolicy{
+			MaxAttempts:          2,
+			InitialRetryInterval: time.Second,
+			BackoffCoefficient:   1,
+			MaxRetryInterval:     time.Second,
+			RetryTimeout:         10 * time.Second,
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_ = handle.Delete(cleanupCtx)
+	})
+	description, err := handle.Describe(ctx)
+	require.NoError(t, err)
+	require.Equal(t, durabletaskscheduler.ScheduleStatusActive, description.Status)
+
+	var target *api.OrchestrationMetadata
+	var lastObserved []*api.OrchestrationMetadata
+	deadline := time.Now().Add(30 * time.Second)
+	for target == nil && time.Now().Before(deadline) {
+		result, queryErr := managementClient.QueryInstances(ctx, api.OrchestrationQuery{
+			CreatedTimeFrom:       createdFrom,
+			PageSize:              100,
+			FetchInputsAndOutputs: true,
+		})
+		if queryErr == nil {
+			lastObserved = result.Orchestrations
+			for _, orchestration := range result.Orchestrations {
+				if orchestration.Name == targetName &&
+					orchestration.RuntimeStatus == api.RUNTIME_STATUS_COMPLETED &&
+					orchestration.Tags["source"] == scheduleTag {
+					target = orchestration
+					break
+				}
+			}
+		}
+		if target == nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if target == nil {
+		t.Fatalf("scheduled target did not complete; observed instances: %+v", lastObserved)
+	}
+	require.Equal(t, map[string]string{"source": scheduleTag}, target.Tags)
+	require.EqualValues(t, 2, scheduledAttempts.Load())
+
+	history, err := managementClient.GetOrchestrationHistory(
+		ctx,
+		target.InstanceID,
+		api.HistoryQuery{ExecutionID: target.ExecutionID},
+	)
+	require.NoError(t, err)
+	var foundContext bool
+	for _, event := range history.Events {
+		if event.ExecutionStarted != nil {
+			require.Equal(t, api.ContextFields{"tenant": "north"}, event.ExecutionStarted.ContextFields)
+			foundContext = true
+		}
+	}
+	require.True(t, foundContext)
+
+	page, err := managementClient.ScheduledTasks().List(ctx, durabletaskscheduler.ScheduleQuery{
+		ScheduleIDPrefix: scheduleID,
+		PageSize:         10,
+	})
+	require.NoError(t, err)
+	require.Len(t, page.Schedules, 1)
+
+	require.NoError(t, handle.Pause(ctx))
+	description, err = handle.Describe(ctx)
+	require.NoError(t, err)
+	require.Equal(t, durabletaskscheduler.ScheduleStatusPaused, description.Status)
+	require.NoError(t, handle.Resume(ctx))
+	require.NoError(t, handle.Delete(ctx))
+	require.Eventually(t, func() bool {
+		schedule, getErr := managementClient.ScheduledTasks().Get(ctx, scheduleID)
+		return getErr == nil && schedule == nil
+	}, 10*time.Second, 200*time.Millisecond)
+}
+
+func TestDTSEmulatorAzuriteBlobV2RoundTrip(t *testing.T) {
+	connectionString := os.Getenv("AZURITE_CONNECTION_STRING")
+	if connectionString == "" {
+		t.Skip("set AZURITE_CONNECTION_STRING to run DTS and Azurite interop")
+	}
+	store, err := payload.NewAzureBlobStore(payload.AzureBlobStoreOptions{
+		ConnectionString:  connectionString,
+		Container:         "dtgop1" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16],
+		AllowInsecureHTTP: true,
+	})
+	require.NoError(t, err)
+	options := emulatorOptions(t)
+	options.LargePayloads = &api.LargePayloadOptions{Store: store, Resolver: store}
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSBlobV2Echo", func(ctx task.ActivityContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSBlobV2", func(ctx *task.OrchestrationContext) (any, error) {
+		var input string
+		if err := ctx.GetInput(&input); err != nil {
+			return nil, err
+		}
+		var result string
+		if err := ctx.CallActivity("DTSBlobV2Echo", task.WithActivityInput(input)).Await(&result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}))
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(
+		options,
+		registry,
+		logger,
+		durabletaskclient.WithAutoWorkItemFilters(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	input := strings.Repeat("blob-v2-large-payload-", 20_000)
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSBlobV2",
+		api.WithInstanceID(uniqueInstanceID("go-blob-v2")),
+		api.WithInput(input),
+	)
+	require.NoError(t, err)
+	completed, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	var output string
+	require.NoError(t, completed.ReadOutput(&output))
+	require.Equal(t, input, output)
+	history, err := managementClient.GetOrchestrationHistory(ctx, instanceID, api.HistoryQuery{})
+	require.NoError(t, err)
+	require.NotEmpty(t, history.Events)
 }

@@ -3,6 +3,7 @@ package task
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/failure"
@@ -33,6 +34,7 @@ type completableTask struct {
 	taskName           string
 	taskVersion        string
 	taskID             int32
+	timerFireAt        time.Time
 	entityID           api.EntityID
 	entityOperation    string
 	completionID       uint64

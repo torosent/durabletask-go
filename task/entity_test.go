@@ -74,6 +74,18 @@ func Test_EntityContext_GetInput(t *testing.T) {
 	assert.Equal(t, "hello", input)
 }
 
+func Test_EntityContext_RawState(t *testing.T) {
+	ctx := &EntityContext{}
+	ctx.SetRawState(`{"version":1}`)
+	state, ok := ctx.GetRawState()
+	require.True(t, ok)
+	assert.Equal(t, `{"version":1}`, state)
+
+	ctx.SetRawState("")
+	_, ok = ctx.GetRawState()
+	assert.False(t, ok)
+}
+
 func Test_EntityContext_SignalEntity(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("test", "key1"),
@@ -122,6 +134,21 @@ func Test_EntityContext_StartNewOrchestration(t *testing.T) {
 	assert.Equal(t, "MyOrchestrator", startOrch.Name)
 	assert.Equal(t, "my-instance", startOrch.InstanceId)
 	assert.Equal(t, `"hello"`, startOrch.Input.GetValue())
+}
+
+func Test_EntityContext_StartNewOrchestration_RawInput(t *testing.T) {
+	ctx := &EntityContext{
+		ID:        api.NewEntityID("test", "key1"),
+		Operation: "op",
+	}
+
+	err := ctx.StartNewOrchestration("MyOrchestrator",
+		WithRawEntityStartOrchestrationInput(`{"hello":"world"}`),
+		WithEntityStartOrchestrationInstanceID("my-instance"),
+	)
+	require.NoError(t, err)
+	require.Len(t, ctx.actions, 1)
+	assert.Equal(t, `{"hello":"world"}`, ctx.actions[0].GetStartNewOrchestration().Input.GetValue())
 }
 
 func Test_EntityContext_StartNewOrchestration_DefaultInstanceID(t *testing.T) {

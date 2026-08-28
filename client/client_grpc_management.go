@@ -4,16 +4,82 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/historyconv"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
+
+func (c *TaskHubGrpcClient) GetOrchestrationHistory(
+	ctx context.Context,
+	id api.InstanceID,
+	query api.HistoryQuery,
+) (*api.OrchestrationHistory, error) {
+	return historyconv.Collect(id, query, func(handler api.HistoryEventHandler) error {
+		return c.StreamOrchestrationHistory(ctx, id, query, handler)
+	})
+}
+
+func (c *TaskHubGrpcClient) StreamOrchestrationHistory(
+	ctx context.Context,
+	id api.InstanceID,
+	query api.HistoryQuery,
+	handler api.HistoryEventHandler,
+) error {
+	normalized, err := historyconv.NormalizeStreamRequest(id, query, handler)
+	if err != nil {
+		return err
+	}
+	request := &protos.StreamInstanceHistoryRequest{
+		InstanceId:            string(id),
+		ForWorkItemProcessing: false,
+	}
+	if normalized.ExecutionID != "" {
+		request.ExecutionId = wrapperspb.String(normalized.ExecutionID)
+	}
+
+	streamContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := c.client.StreamInstanceHistory(streamContext, request)
+	if err != nil {
+		return clientRPCError(ctx, "failed to stream orchestration history", err)
+	}
+
+	converter := historyconv.New(c.converter)
+	eventCount := 0
+	for {
+		chunk, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			return nil
+		}
+		if recvErr != nil {
+			return clientRPCError(ctx, "failed to stream orchestration history", recvErr)
+		}
+		if chunk == nil {
+			return errors.New("failed to stream orchestration history: received a nil history chunk")
+		}
+		for _, event := range chunk.GetEvents() {
+			if err := largepayload.TransformHistoryEvent(streamContext, c.largePayloads, event, false); err != nil {
+				return fmt.Errorf("failed to hydrate orchestration history event %d: %w", eventCount, err)
+			}
+			converted, err := converter.Convert(event)
+			if err != nil {
+				return fmt.Errorf("failed to convert orchestration history event %d: %w", eventCount, err)
+			}
+			if err := handler(converted); err != nil {
+				return err
+			}
+			eventCount++
+		}
+	}
+}
 
 func (c *TaskHubGrpcClient) QueryInstances(ctx context.Context, query api.OrchestrationQuery) (*api.OrchestrationQueryResult, error) {
 	pageSize, err := api.NormalizeInstanceQueryPageSize(query.PageSize)

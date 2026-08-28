@@ -3,9 +3,14 @@ package task
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 )
+
+// DefaultMaximumTimerInterval is the default maximum duration of one physical
+// durable timer action.
+const DefaultMaximumTimerInterval = 3 * 24 * time.Hour
 
 // ErrHistoryLimitExceeded is the sentinel error for deterministic history-budget failures.
 var ErrHistoryLimitExceeded = errors.New("orchestration history limit exceeded")
@@ -78,6 +83,16 @@ type HistoryLimitHandler func(HistoryLimitInfo) (any, error)
 
 // OrchestrationOptions configures deterministic orchestration engine policies.
 type OrchestrationOptions struct {
+	// MaximumTimerInterval limits one physical durable timer action. Longer
+	// timers are split into deterministic sequential actions that retain the
+	// original deadline. Zero uses [DefaultMaximumTimerInterval].
+	//
+	// Upgrading from a release that did not split long timers is replay-compatible
+	// once the historical logical deadline has fired. Changing this value between
+	// two splitting configurations remains replay-breaking for in-flight
+	// orchestrations that have timers longer than either the old or new value.
+	MaximumTimerInterval time.Duration
+
 	// MaxEventsPerTurn limits new history events processed in one execution turn.
 	// Zero disables the limit. Old replay history is always processed.
 	MaxEventsPerTurn int
@@ -89,4 +104,14 @@ type OrchestrationOptions struct {
 	// OnHistoryLimitExceeded opts into ContinueAsNew by supplying serializable state.
 	// When nil, exceeding either limit fails with a non-retriable HistoryLimitExceeded failure.
 	OnHistoryLimitExceeded HistoryLimitHandler
+}
+
+func normalizeOrchestrationOptions(options OrchestrationOptions) OrchestrationOptions {
+	if options.MaximumTimerInterval < 0 {
+		panic("maximum timer interval cannot be negative")
+	}
+	if options.MaximumTimerInterval == 0 {
+		options.MaximumTimerInterval = DefaultMaximumTimerInterval
+	}
+	return options
 }

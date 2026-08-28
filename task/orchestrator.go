@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -95,7 +97,9 @@ type callSubOrchestratorOptions struct {
 	rawInput   *wrapperspb.StringValue
 	version    *wrapperspb.StringValue
 
-	retryPolicy *RetryPolicy
+	retryPolicy   *RetryPolicy
+	tags          map[string]string
+	contextFields api.ContextFields
 }
 
 func (options *callSubOrchestratorOptions) versionOrDefault(defaultVersion string) *wrapperspb.StringValue {
@@ -108,8 +112,8 @@ func (options *callSubOrchestratorOptions) versionOrDefault(defaultVersion strin
 	return wrapperspb.String(defaultVersion)
 }
 
-// subOrchestratorOption is a functional option type for the CallSubOrchestrator orchestrator method.
-type subOrchestratorOption func(*callSubOrchestratorOptions, api.DataConverter) error
+// SubOrchestratorOption configures [OrchestrationContext.CallSubOrchestrator].
+type SubOrchestratorOption func(*callSubOrchestratorOptions, api.DataConverter) error
 
 // ContinueAsNewOption is a functional option type for the ContinueAsNew orchestrator method.
 type ContinueAsNewOption func(*OrchestrationContext)
@@ -135,7 +139,7 @@ func WithContinueAsNewVersion(version string) ContinueAsNewOption {
 
 // WithSubOrchestratorInput is a functional option type for the CallSubOrchestrator
 // orchestrator method that serializes an input value with the configured converter.
-func WithSubOrchestratorInput(input any) subOrchestratorOption {
+func WithSubOrchestratorInput(input any) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, converter api.DataConverter) error {
 		bytes, err := marshalData(converter, input)
 		if err != nil {
@@ -148,7 +152,7 @@ func WithSubOrchestratorInput(input any) subOrchestratorOption {
 
 // WithRawSubOrchestratorInput is a functional option type for the CallSubOrchestrator
 // orchestrator method that takes a raw input value.
-func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
+func WithRawSubOrchestratorInput(input string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.rawInput = wrapperspb.String(input)
 		return nil
@@ -157,7 +161,7 @@ func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
 
 // WithSubOrchestrationInstanceID is a functional option type for the CallSubOrchestrator
 // orchestrator method that specifies the instance ID of the sub-orchestration.
-func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
+func WithSubOrchestrationInstanceID(instanceID string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.instanceID = instanceID
 		return nil
@@ -165,14 +169,57 @@ func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
 }
 
 // WithSubOrchestrationVersion configures the sub-orchestration version.
-func WithSubOrchestrationVersion(version string) subOrchestratorOption {
+func WithSubOrchestrationVersion(version string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.version = wrapperspb.String(version)
 		return nil
 	}
 }
 
-func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) subOrchestratorOption {
+// WithSubOrchestrationTags adds user tags to a sub-orchestration.
+func WithSubOrchestrationTags(tags map[string]string) SubOrchestratorOption {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
+		for key := range tags {
+			if key == "" {
+				return errors.New("sub-orchestration tag key cannot be empty")
+			}
+			if err := checkUnreservedKey("tag", key); err != nil {
+				return err
+			}
+		}
+		opts.tags = maps.Clone(tags)
+		return nil
+	}
+}
+
+// WithSubOrchestrationContextFields adds immutable context fields to a
+// sub-orchestration.
+func WithSubOrchestrationContextFields(fields api.ContextFields) SubOrchestratorOption {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
+		for key := range fields {
+			if key == "" {
+				return errors.New("sub-orchestration context field key cannot be empty")
+			}
+			if err := checkUnreservedKey("context field", key); err != nil {
+				return err
+			}
+		}
+		opts.contextFields = maps.Clone(fields)
+		return nil
+	}
+}
+
+// checkUnreservedKey rejects caller-supplied keys that collide with the
+// reserved prefixes used to carry orchestration context on the wire.
+func checkUnreservedKey(kind, key string) error {
+	if strings.HasPrefix(key, api.ReservedContextFieldPrefix) ||
+		strings.HasPrefix(key, tagcodec.UserTagPrefix) {
+		return fmt.Errorf("sub-orchestration %s %q uses a reserved prefix", kind, key)
+	}
+	return nil
+}
+
+func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) SubOrchestratorOption {
 	return func(opt *callSubOrchestratorOptions, _ api.DataConverter) error {
 		if policy == nil {
 			return nil
@@ -225,7 +272,7 @@ func newOrchestrationContext(
 		errorProperties:           errorProperties,
 		logger:                    logger,
 		metrics:                   metrics,
-		orchestrationOptions:      options,
+		orchestrationOptions:      normalizeOrchestrationOptions(options),
 		defaultVersion:            defaultVersion,
 		converter:                 api.NormalizeDataConverter(converter),
 		registry:                  registry,
@@ -451,6 +498,11 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	defer ctx.syncDerivedContexts()
 	// Buffer certain events if we're in a suspended state
 	if ctx.isSuspended && (e.GetExecutionResumed() == nil && e.GetExecutionTerminated() == nil) {
+		if e.GetExecutionSuspended() != nil {
+			// A redundant suspend is a no-op. Buffering it would re-suspend the
+			// orchestration when the matching resume drains the buffer.
+			return nil
+		}
 		ctx.suspendedEvents = append(ctx.suspendedEvents, replayEvent{
 			event:       e,
 			isReplaying: ctx.IsReplaying,
@@ -507,7 +559,7 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	} else if oc := e.GetOrchestratorCompleted(); oc != nil {
 		// Nothing to do
 	} else if e.GetGenericEvent() != nil || e.GetExecutionRewound() != nil {
-		// Backend control markers are replay no-ops.
+		// Service control markers are replay no-ops.
 	} else {
 		err = fmt.Errorf("don't know how to handle event: %v", e)
 	}
@@ -644,7 +696,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 	return task
 }
 
-func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...subOrchestratorOption) Task {
+func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...SubOrchestratorOption) Task {
 	engine := ctx.engineContext()
 	if engine.criticalSectionID != "" {
 		return ctx.newFailedTask(engine, fmt.Errorf("sub-orchestrations cannot be started while holding entity locks"))
@@ -695,8 +747,8 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 			Version:          ctx.Version,
 			ParentInstanceID: ctx.parentInstanceID,
 		},
-		ctx.contextFields,
-		ctx.orchestrationTags,
+		mergeStringMaps(ctx.contextFields, options.contextFields),
+		mergeStringMaps(ctx.orchestrationTags, options.tags),
 	)
 	if createSubOrchestrationAction.GetCreateSubOrchestration().GetInstanceId() == "" {
 		createSubOrchestrationAction.GetCreateSubOrchestration().InstanceId = fmt.Sprintf(
@@ -832,7 +884,54 @@ func (ctx *OrchestrationContext) createTimerInternal(
 	if scope.isCanceled() {
 		return newTaskInScope(ctx, scope)
 	}
-	fireAt := ctx.CurrentTimeUtc.Add(delay)
+
+	logicalTimer := newTaskInScope(ctx, scope)
+	deadline := ctx.CurrentTimeUtc.Add(delay)
+	if err := timestamppb.New(deadline).CheckValid(); err != nil {
+		logicalTimer.failLocal(api.WrapInvalidArgument(fmt.Errorf("timer deadline %v is out of range: %w", deadline, err)))
+		return logicalTimer
+	}
+
+	var scheduleNextChunk func()
+	scheduleNextChunk = func() {
+		if logicalTimer.isCompleted {
+			return
+		}
+
+		fireAt := deadline
+		isFinalChunk := true
+		maximumInterval := ctx.orchestrationOptions.MaximumTimerInterval
+		if deadline.Sub(ctx.CurrentTimeUtc) > maximumInterval {
+			fireAt = ctx.CurrentTimeUtc.Add(maximumInterval)
+			isFinalChunk = false
+		}
+		chunk := ctx.createTimerAction(fireAt, scope)
+		chunk.onCompleted(func() {
+			if logicalTimer.isCompleted {
+				return
+			}
+			// A pre-splitting worker recorded the logical deadline as one timer.
+			// If replay reaches that historical TimerFired event, CurrentTimeUtc
+			// is already at or beyond the deadline and no intermediate chunk may
+			// consume the next sequence number.
+			if isFinalChunk ||
+				(!chunk.timerFireAt.IsZero() && !deadline.After(chunk.timerFireAt)) ||
+				!deadline.After(ctx.CurrentTimeUtc) ||
+				chunk.isCanceled || chunk.localErr != nil || chunk.failureDetails != nil {
+				logicalTimer.completeFrom(chunk, nil)
+				return
+			}
+			scheduleNextChunk()
+		})
+	}
+	scheduleNextChunk()
+	return logicalTimer
+}
+
+func (ctx *OrchestrationContext) createTimerAction(
+	fireAt time.Time,
+	scope *cancellationScope,
+) *completableTask {
 	timerAction := helpers.NewCreateTimerAction(ctx.getNextSequenceNumber(), fireAt)
 	ctx.pendingActions[timerAction.Id] = timerAction
 
@@ -851,7 +950,9 @@ func (ctx *OrchestrationContext) createTimerInternal(
 // wait indefinitely for the event to be received.
 //
 // Orchestrators can wait for the same event name multiple times, so waiting for multiple events with the same name
-// is allowed. Each event received by an orchestrator will complete just one task returned by this method.
+// is allowed. Each event received by an orchestrator will complete just one task returned by this method. Live
+// waiters use LIFO ordering, so the newest waiter receives the next event. Events buffered before any waiter exists
+// retain FIFO arrival order. This ordering is part of the deterministic replay contract.
 //
 // Note that event names are case-insensitive.
 func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout time.Duration) Task {
@@ -875,11 +976,13 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 			engine.pendingExternalEventTasks[key] = taskList
 		}
 		taskElement := taskList.PushBack(task)
+		task.onCompleted(func() {
+			engine.removePendingEventTask(key, taskElement)
+		})
 
 		if timeout > 0 {
 			engine.createTimerInternal(timeout, ctx.scope).onCompleted(func() {
 				task.cancel()
-				engine.removePendingEventTask(key, taskElement)
 			})
 		}
 	}
@@ -1092,7 +1195,7 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 	ctx.Version = es.GetVersion().GetValue()
 	ctx.executionID = es.GetOrchestrationInstance().GetExecutionId().GetValue()
 	_, fields := contextprop.Decode(es.GetTags())
-	ctx.contextFields = mergeContextFields(ctx.contextFields, fields)
+	ctx.contextFields = mergeStringMaps(ctx.contextFields, fields)
 	ctx.orchestrationTags = tagcodec.DecodeUserTagsOrPlain(es.GetTags())
 	if parent := es.GetParentInstance(); parent != nil {
 		ctx.parentInstanceID = api.InstanceID(parent.GetOrchestrationInstance().GetInstanceId())
@@ -1247,6 +1350,9 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 	delete(ctx.pendingTasks, timerID)
 
 	// completing a task will resume the corresponding Await() call
+	if tf.GetFireAt() != nil {
+		task.timerFireAt = tf.GetFireAt().AsTime()
+	}
 	task.complete(nil)
 	return nil
 }
@@ -1254,17 +1360,10 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) error {
 	er := e.GetEventRaised()
 	key := strings.ToUpper(er.GetName())
-	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok {
-		for pendingTasks.Len() > 0 {
-			elem := pendingTasks.Front()
-			task := elem.Value.(*completableTask)
-			ctx.removePendingEventTask(key, elem)
-			if task.isCompleted {
-				continue
-			}
-			task.complete([]byte(er.Input.GetValue()))
-			return nil
-		}
+	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok && pendingTasks.Len() > 0 {
+		task := pendingTasks.Back().Value.(*completableTask)
+		task.complete([]byte(er.Input.GetValue()))
+		return nil
 	}
 
 	// No live waiter consumed the event, so keep it for a future receiver.
@@ -1370,6 +1469,14 @@ func (ctx *OrchestrationContext) onExecutionResumed(er *protos.ExecutionResumedE
 
 func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTerminatedEvent) error {
 	ctx.isTerminated = true
+	// Termination wins over suspension: clearing the flag lets the completion
+	// action be emitted and discards events that can no longer be processed.
+	ctx.isSuspended = false
+	ctx.suspendedEvents = nil
+	// Termination can arrive in the same work item that lets the root coroutine
+	// complete naturally. Keep exactly one terminal action, with termination
+	// taking precedence over the pending natural completion.
+	ctx.clearCompletionActions()
 	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 

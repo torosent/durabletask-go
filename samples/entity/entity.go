@@ -1,106 +1,116 @@
 // This sample demonstrates how to use durable entities with the Durable Task Go SDK.
 // It shows two patterns:
+//
 //  1. A raw entity function (Counter) with manual operation dispatch
+//
 //  2. An auto-dispatch entity (BankAccount) where operations map to methods on a struct
+//
+//     export DTS_CONNECTION_STRING="Endpoint=http://localhost:8080;TaskHub=default;Authentication=None"
+//     go run ./samples/entity
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
-	"github.com/microsoft/durabletask-go/backend/sqlite"
+	"github.com/microsoft/durabletask-go/durabletaskscheduler"
+	"github.com/microsoft/durabletask-go/samples/internal/dtssample"
 	"github.com/microsoft/durabletask-go/task"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	r := task.NewTaskRegistry()
 
 	// Pattern 1: Register a raw entity function with manual dispatch
 	if err := r.AddEntityN("counter", CounterEntity); err != nil {
-		log.Fatalf("Failed to register counter entity: %v", err)
+		return fmt.Errorf("failed to register counter entity: %w", err)
 	}
 
 	// Pattern 2: Register an auto-dispatch entity backed by a struct
 	if err := r.AddEntityN("bankaccount", task.NewEntityFor[BankAccount]()); err != nil {
-		log.Fatalf("Failed to register bank account entity: %v", err)
+		return fmt.Errorf("failed to register bank account entity: %w", err)
 	}
 	if err := r.AddOrchestratorN("transfer", TransferOrchestrator); err != nil {
-		log.Fatalf("Failed to register transfer orchestrator: %v", err)
+		return fmt.Errorf("failed to register transfer orchestrator: %w", err)
 	}
 
-	ctx := context.Background()
-	client, worker, err := Init(ctx, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	app, err := dtssample.Start(ctx, r)
 	if err != nil {
-		log.Fatalf("Failed to initialize: %v", err)
+		return err
 	}
+	client := app.Client
 	defer func() {
-		if err := worker.Shutdown(ctx); err != nil {
-			log.Printf("Failed to shutdown: %v", err)
+		if err := app.Shutdown(); err != nil {
+			log.Printf("Failed to shut down: %v", err)
 		}
 	}()
 
+	// Entity state is durable, so each run uses fresh keys rather than
+	// accumulating on top of a previous run's balances.
+	run := uuid.NewString()
+
 	// --- Demo 1: Counter entity (raw function) ---
 	fmt.Println("=== Counter Entity Demo ===")
-	counterID := api.NewEntityID("counter", "myCounter")
+	counterID := api.NewEntityID("counter", "myCounter-"+run)
 
 	// Signal the entity to perform operations
 	if err := client.SignalEntity(ctx, counterID, "add", api.WithSignalInput(10)); err != nil {
-		log.Printf("Failed to signal entity: %v", err) //nolint:gocritic // sample code, keeping simple
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 	if err := client.SignalEntity(ctx, counterID, "add", api.WithSignalInput(5)); err != nil {
-		log.Printf("Failed to signal entity: %v", err)
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 	if err := client.SignalEntity(ctx, counterID, "add", api.WithSignalInput(-3)); err != nil {
-		log.Printf("Failed to signal entity: %v", err)
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 
 	// Query the entity state
 	meta, err := waitForEntityState(ctx, client, counterID, "12")
 	if err != nil {
-		log.Printf("Failed to fetch entity: %v", err)
-		return
+		return fmt.Errorf("failed to fetch entity: %w", err)
 	}
 	fmt.Printf("Counter state: %s\n", meta.SerializedState) // Expected: 12
 
 	// --- Demo 2: BankAccount entity (auto-dispatch) ---
 	fmt.Println("\n=== Bank Account Entity Demo ===")
-	accountID := api.NewEntityID("bankaccount", "checking-001")
+	accountID := api.NewEntityID("bankaccount", "checking-"+run)
 
 	if err := client.SignalEntity(ctx, accountID, "Deposit", api.WithSignalInput(1000)); err != nil {
-		log.Printf("Failed to signal entity: %v", err)
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 	if err := client.SignalEntity(ctx, accountID, "Deposit", api.WithSignalInput(500)); err != nil {
-		log.Printf("Failed to signal entity: %v", err)
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 	if err := client.SignalEntity(ctx, accountID, "Withdraw", api.WithSignalInput(200)); err != nil {
-		log.Printf("Failed to signal entity: %v", err)
-		return
+		return fmt.Errorf("failed to signal entity: %w", err)
 	}
 
 	meta, err = waitForEntityState(ctx, client, accountID, `{"balance":1300}`)
 	if err != nil {
-		log.Printf("Failed to fetch entity: %v", err)
-		return
+		return fmt.Errorf("failed to fetch entity: %w", err)
 	}
 	fmt.Printf("Bank account state: %s\n", meta.SerializedState) // Expected: {"balance":1300}
 
-	savingsID := api.NewEntityID("bankaccount", "savings-001")
+	savingsID := api.NewEntityID("bankaccount", "savings-"+run)
 	if err := client.SignalEntity(ctx, savingsID, "Deposit", api.WithSignalInput(100)); err != nil {
-		log.Printf("Failed to initialize savings account: %v", err)
-		return
+		return fmt.Errorf("failed to initialize savings account: %w", err)
 	}
 	if _, err := waitForEntityState(ctx, client, savingsID, `{"balance":100}`); err != nil {
-		log.Printf("Failed to initialize savings account: %v", err)
-		return
+		return fmt.Errorf("failed to initialize savings account: %w", err)
 	}
 	transferID, err := client.ScheduleNewOrchestration(
 		ctx,
@@ -108,41 +118,16 @@ func main() {
 		api.WithInput(TransferInput{From: accountID, To: savingsID, Amount: 300}),
 	)
 	if err != nil {
-		log.Printf("Failed to schedule transfer: %v", err)
-		return
+		return fmt.Errorf("failed to schedule transfer: %w", err)
 	}
 	transfer, err := client.WaitForOrchestrationCompletion(ctx, transferID)
 	if err != nil {
-		log.Printf("Transfer failed: %v", err)
-		return
+		return fmt.Errorf("transfer failed: %w", err)
 	}
 	fmt.Printf("Transfer result: %s\n", transfer.SerializedOutput)
 
 	fmt.Println("\nDone!")
-}
-
-// Init creates and initializes an in-memory client and worker pair.
-func Init(ctx context.Context, r *task.TaskRegistry) (backend.EntityTaskHubClient, backend.TaskHubWorker, error) {
-	logger := backend.DefaultLogger()
-	be := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), logger)
-	executor := task.NewTaskExecutor(r)
-	orchestrationWorker := backend.NewOrchestrationWorker(be, executor, logger)
-	activityWorker := backend.NewActivityTaskWorker(be, executor, logger)
-	entityBackend, ok := backend.GetBackendCapability[backend.EntityBackend](be)
-	if !ok {
-		return nil, nil, fmt.Errorf("backend does not support durable entities")
-	}
-	entityWorker := backend.NewEntityWorker(
-		entityBackend,
-		executor.(backend.EntityExecutor),
-		logger,
-	)
-	taskHubWorker := backend.NewTaskHubWorker(be, orchestrationWorker, activityWorker, logger, entityWorker)
-	if err := taskHubWorker.Start(ctx); err != nil {
-		return nil, nil, err
-	}
-	taskHubClient := backend.NewTaskHubClient(be)
-	return taskHubClient.(backend.EntityTaskHubClient), taskHubWorker, nil
+	return nil
 }
 
 // --- Pattern 1: Raw entity function ---
@@ -240,20 +225,22 @@ func TransferOrchestrator(ctx *task.OrchestrationContext) (any, error) {
 
 func waitForEntityState(
 	ctx context.Context,
-	client backend.EntityTaskHubClient,
+	client *durabletaskscheduler.Client,
 	entityID api.EntityID,
 	expected string,
 ) (*api.EntityMetadata, error) {
-	timeout := time.NewTimer(10 * time.Second)
+	timeout := time.NewTimer(30 * time.Second)
 	defer timeout.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		metadata, err := client.FetchEntityMetadata(ctx, entityID, true)
-		if err != nil {
+		// The entity does not exist until the service has processed its first
+		// signal, so a not-found result means "not ready yet", not a failure.
+		if err != nil && !errors.Is(err, api.ErrInstanceNotFound) {
 			return nil, err
 		}
-		if metadata != nil && metadata.SerializedState == expected {
+		if err == nil && metadata != nil && metadata.SerializedState == expected {
 			return metadata, nil
 		}
 		select {
