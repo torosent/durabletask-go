@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/bits"
 	"reflect"
 	"strconv"
 	"strings"
@@ -449,10 +450,11 @@ func ExecuteScheduleOperationOrchestrator(ctx *task.OrchestrationContext) (any, 
 	if request.OperationName == "" {
 		return nil, &ScheduleValidationError{Message: "operation name is required"}
 	}
-	if err := ctx.CallEntity(request.EntityID, request.OperationName, task.WithEntityInput(request.Input)).Await(nil); err != nil {
+	var result any
+	if err := ctx.CallEntity(request.EntityID, request.OperationName, task.WithEntityInput(request.Input)).Await(&result); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	return result, nil
 }
 
 type scheduledTaskRequest struct {
@@ -820,7 +822,7 @@ func createSchedule(ctx *task.EntityContext, state *scheduleState, options Sched
 
 func updateSchedule(ctx *task.EntityContext, state *scheduleState, options ScheduleUpdateOptions) error {
 	if state.Status != ScheduleStatusActive && state.Status != ScheduleStatusPaused {
-		return invalidTransition("", state.Status, state.Status, updateScheduleOperation)
+		return invalidTransition(scheduleID(state), state.Status, state.Status, updateScheduleOperation)
 	}
 	if state.ScheduleConfiguration == nil {
 		return &ScheduleValidationError{Message: "schedule configuration is missing"}
@@ -979,14 +981,52 @@ func determineNextRun(state *scheduleState, config *scheduleConfiguration, now t
 	if interval < time.Second {
 		return time.Time{}, &ScheduleValidationError{Message: "interval must be at least one second"}
 	}
-	elapsed := now.Sub(start)
-	remainder := elapsed % interval
-	delay := interval - remainder
+	// Land on the same instant .NET computes as
+	// start + interval*(floor((now-start)/interval)+1) without relying on
+	// time.Duration arithmetic, which saturates for extreme start times.
+	delay := interval - intervalRemainder(start, now, interval)
 	next := now.Add(delay)
-	if next.Before(now) {
+	// Go can represent instants far beyond .NET's DateTimeOffset.MaxValue, so a
+	// schedule running near the end of year 9999 would otherwise produce a next
+	// run that only fails later when the state is serialized for the service.
+	if next.Before(now) || next.After(maxScheduleTime) {
 		return time.Time{}, &ScheduleValidationError{Message: "next scheduled time overflows time range"}
 	}
 	return next, nil
+}
+
+// maxScheduleTime is DateTimeOffset.MaxValue, the largest instant the .NET
+// schedule wire format can carry. .NET timestamps have 100ns resolution, so the
+// last representable tick is 999999900ns into the final second.
+var maxScheduleTime = time.Date(9999, time.December, 31, 23, 59, 59, 999999900, time.UTC)
+
+// intervalRemainder returns (now-start) mod interval exactly. It uses 128-bit
+// arithmetic because the elapsed nanoseconds between the minimum and maximum
+// representable timestamps do not fit in a time.Duration. Inputs outside the
+// domain of that division clamp to zero: a non-positive interval, which would
+// divide by zero, and a start after now, which would make the elapsed time
+// negative.
+func intervalRemainder(start, now time.Time, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	seconds := now.Unix() - start.Unix()
+	nanos := int64(now.Nanosecond()) - int64(start.Nanosecond())
+	if nanos < 0 {
+		seconds--
+		nanos += int64(time.Second)
+	}
+	if seconds < 0 {
+		return 0
+	}
+	high, low := bits.Mul64(uint64(seconds), uint64(time.Second))
+	low, carry := bits.Add64(low, uint64(nanos), 0)
+	high += carry
+	divisor := uint64(interval)
+	// Reducing the high word first keeps bits.Div64 in range and leaves the
+	// remainder unchanged, since the discarded multiple of 2^64 divides evenly.
+	_, remainder := bits.Div64(high%divisor, low, divisor)
+	return time.Duration(remainder)
 }
 
 func scheduleConfigFromCreate(ctx *task.EntityContext, options ScheduleCreationOptions) (*scheduleConfiguration, error) {
