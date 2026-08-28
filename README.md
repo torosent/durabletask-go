@@ -1,19 +1,12 @@
-# Durable Task Scheduler SDK for Go
+# Durable Task SDK for Go
 
 [![Build](https://github.com/microsoft/durabletask-go/actions/workflows/pr-validation.yml/badge.svg)](https://github.com/microsoft/durabletask-go/actions/workflows/pr-validation.yml)
 
-The Durable Task Scheduler SDK for Go provides management and worker APIs for
+The Durable Task SDK for Go provides management and worker APIs for
 writing durable, fault-tolerant business logic (*orchestrations*) as ordinary Go
 code and running it on [Azure Durable Task Scheduler](https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/durable-task-scheduler)
 (DTS). Orchestrations, activities, and durable entities are written in Go, while
 the scheduler owns durable state, dispatch, and recovery.
-
-The API follows the same SDK model as
-[`microsoft/durabletask-dotnet`](https://github.com/microsoft/durabletask-dotnet).
-It also takes inspiration from [Go Workflows](https://github.com/cschleiden/go-workflows)
-and [Temporal](https://github.com/temporalio/temporal).
-
-> This project is a work-in-progress and should not be used for production workloads. The public API surface is also not yet stable. The project itself is also in the very early stages and is missing some of the basics, such as contribution guidelines, etc.
 
 ## Durable Task Scheduler
 
@@ -75,24 +68,6 @@ before registering the export system tasks.
 
 See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
 and the [environment-driven sample](./samples/durabletaskscheduler).
-
-### Package layout
-
-| Package | Purpose |
-| - | - |
-| [`durabletaskscheduler`](./durabletaskscheduler) | `NewClient` and `NewWorker` — the DTS integration surface most applications use |
-| [`task`](./task) | Registering and authoring orchestrators, activities, and entities |
-| [`api`](./api) | Instance IDs, orchestration metadata, queries, and client option types |
-| [`client`](./client) | Lower-level gRPC management client and worker over a caller-owned connection |
-| [`payload`](./payload) | Large payload stores (memory, file, Azure Blob Storage) |
-| [`exporthistory`](./exporthistory) | Preview history export to Azure Blob Storage |
-| [`backend`](./backend) | Internal runtime plumbing shared by the above — logger, metric hooks, executor contract |
-
-DTS owns durable state, dispatch, and recovery, so this SDK has no task hub host
-and no pluggable storage. `backend` is shared runtime plumbing that appears in
-current public signatures for logging, metrics, and task execution; it is not
-an extension point, and nothing in it lets an application implement or host a
-task hub.
 
 ## History export (preview)
 
@@ -206,18 +181,6 @@ buffered with a validated event cap or consumed incrementally with
 `api.LargePayloadOptions` store/resolver on DTS clients and workers; the
 `payload` package includes production Azure Blob support that emits the same
 self-describing `blob:v2` tokens as the .NET SDK.
-
-## Language SDKs for gRPC
-
-Durable Task Scheduler speaks the same gRPC contract to every Durable Task SDK, so a single task hub can host orchestrations written in any of the following languages:
-
-| Language/Stack | Package | Project Home | Samples |
-| - | - | - | - |
-| .NET | [![NuGet](https://img.shields.io/nuget/v/Microsoft.DurableTask.Client.svg?style=flat)](https://www.nuget.org/packages/Microsoft.DurableTask.Client/) | [GitHub](https://github.com/microsoft/durabletask-dotnet) | [Samples](https://github.com/microsoft/durabletask-dotnet/tree/main/samples) |
-| Java | [![Maven Central](https://img.shields.io/maven-central/v/com.microsoft/durabletask-client?label=durabletask-client)](https://search.maven.org/artifact/com.microsoft/durabletask-client) | [GitHub](https://github.com/microsoft/durabletask-java) | [Samples](https://github.com/microsoft/durabletask-java/tree/main/samples/src/main/java/io/durabletask/samples) |
-| Python | [![PyPI version](https://badge.fury.io/py/durabletask.svg)](https://badge.fury.io/py/durabletask) | [GitHub](https://github.com/microsoft/durabletask-python) | [Samples](https://github.com/microsoft/durabletask-python/tree/main/examples) |
-
-The gRPC API is defined [here](https://github.com/microsoft/durabletask-protobuf).
 
 ## Writing orchestrations in Go
 
