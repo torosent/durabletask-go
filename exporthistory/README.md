@@ -187,12 +187,11 @@ client reconstructs the typed error across the orchestration boundary and
 ## Service behavior and limitations
 
 - **Extended sessions are not supported.**
-- **Pagination.** A task hub signals the end of the stream either by omitting the
-  continuation token (embedded sqlite and Postgres) or by returning an empty page
-  with a token (Durable Task Scheduler). Both are handled. A backend that omits
-  the token on a non-empty final page makes a continuous job re-scan that final
-  page on each idle cycle; deterministic blob names make the writes idempotent,
-  but scanned and exported counters include the re-scan.
+- **Pagination.** DTS signals the end of the stream by omitting the continuation
+  token. An empty page that still carries a token advances the cursor and the job
+  keeps listing. If a non-empty final page omits its token, a continuous job
+  re-scans that page on each idle cycle; deterministic blob names make the
+  writes idempotent, but scanned and exported counters include the re-scan.
 - **List visibility lag.** The service's instance-ID index can lag orchestration
   completion. A batch job whose first page is empty legitimately completes with
   nothing exported, so schedule a job after the window's instances are listable.
@@ -213,9 +212,6 @@ skip unless their environment is configured:
 ```bash
 # Azure Blob write path against Azurite
 AZURITE_CONNECTION_STRING="..." go test ./exporthistory/
-
-# End-to-end over the in-memory gRPC transport
-go test ./tests/grpc/ -run Test_Bufconn_ExportHistory
 
 # End-to-end against a live Durable Task Scheduler plus Azurite
 DTS_EMULATOR_ENDPOINT="http://127.0.0.1:8080" DTS_TASK_HUB=default \

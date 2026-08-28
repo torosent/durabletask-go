@@ -19,7 +19,7 @@ import (
 // The export client and activities are written against the task hub client's
 // public surface, so the concrete gRPC client must satisfy both contracts.
 var (
-	_ clientBackend = (*durabletaskclient.TaskHubGrpcClient)(nil)
+	_ taskHubClient = (*durabletaskclient.TaskHubGrpcClient)(nil)
 	_ HistorySource = (*durabletaskclient.TaskHubGrpcClient)(nil)
 )
 
@@ -168,9 +168,9 @@ func entityMetadata(t *testing.T, jobID string, state ExportJobState) *api.Entit
 	return &api.EntityMetadata{InstanceID: EntityID(jobID), SerializedState: string(payload)}
 }
 
-func newTestClient(t *testing.T, backend *fakeBackend, options ClientOptions) *Client {
+func newTestClient(t *testing.T, hub *fakeBackend, options ClientOptions) *Client {
 	t.Helper()
-	client, err := newClient(backend, options)
+	client, err := newClient(hub, options)
 	require.NoError(t, err)
 	return client
 }
@@ -217,8 +217,8 @@ func TestJobClientValidation(t *testing.T) {
 }
 
 func TestCreateJobSchedulesTheOperationOrchestrator(t *testing.T) {
-	backend := newFakeBackend()
-	client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	hub := newFakeBackend()
+	client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 
 	job, err := client.CreateJob(context.Background(), JobCreationOptions{
 		Mode:              ExportModeBatch,
@@ -229,14 +229,14 @@ func TestCreateJobSchedulesTheOperationOrchestrator(t *testing.T) {
 	require.NotNil(t, job)
 	assert.NotEmpty(t, job.ID())
 
-	require.Len(t, backend.scheduled, 1)
-	call := backend.scheduled[0]
+	require.Len(t, hub.scheduled, 1)
+	call := hub.scheduled[0]
 	assert.Equal(t, ExecuteExportJobOperationOrchestratorName, call.name)
 	assert.Equal(t, createOperation, call.request.OperationName)
 	assert.Equal(t, EntityID(job.ID()), call.request.EntityID)
 	// System operations must not inherit an application default version.
 	assert.Equal(t, "", call.version)
-	require.Equal(t, []api.InstanceID{"test-instance"}, backend.waited)
+	require.Equal(t, []api.InstanceID{"test-instance"}, hub.waited)
 }
 
 func TestCreateJobResolvesTheDestination(t *testing.T) {
@@ -288,8 +288,8 @@ func TestCreateJobResolvesTheDestination(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			backend := newFakeBackend()
-			client := newTestClient(t, backend, test.clientOptions)
+			hub := newFakeBackend()
+			client := newTestClient(t, hub, test.clientOptions)
 			job, err := client.JobClient("job-1")
 			require.NoError(t, err)
 
@@ -300,8 +300,8 @@ func TestCreateJobResolvesTheDestination(t *testing.T) {
 			}
 			require.NoError(t, job.Create(context.Background(), options))
 
-			require.Len(t, backend.scheduled, 1)
-			created, ok := backend.scheduled[0].request.Input.(map[string]any)
+			require.Len(t, hub.scheduled, 1)
+			created, ok := hub.scheduled[0].request.Input.(map[string]any)
 			require.True(t, ok)
 			destination, ok := created["Destination"].(map[string]any)
 			require.True(t, ok)
@@ -339,23 +339,23 @@ func TestCreateJobRejectsMismatchedJobID(t *testing.T) {
 }
 
 func TestCreateJobPropagatesValidationBeforeScheduling(t *testing.T) {
-	backend := newFakeBackend()
-	client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	hub := newFakeBackend()
+	client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 	_, err := client.CreateJob(context.Background(), JobCreationOptions{Mode: ExportModeBatch})
 	require.ErrorIs(t, err, ErrValidation)
-	assert.Empty(t, backend.scheduled)
+	assert.Empty(t, hub.scheduled)
 }
 
 func TestCreateJobReportsOrchestrationFailure(t *testing.T) {
-	backend := newFakeBackend()
-	backend.completion = &api.OrchestrationMetadata{
+	hub := newFakeBackend()
+	hub.completion = &api.OrchestrationMetadata{
 		RuntimeStatus: api.RUNTIME_STATUS_FAILED,
 		FailureDetails: &api.FailureDetails{
 			ErrorType:  invalidTransitionErrorType,
 			Properties: map[string]any{"from": float64(1), "to": float64(1), "operation": createOperation},
 		},
 	}
-	client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 	_, err := client.CreateJob(context.Background(), JobCreationOptions{
 		Mode:              ExportModeBatch,
 		CompletedTimeFrom: time.Now().UTC().Add(-time.Hour),
@@ -363,7 +363,7 @@ func TestCreateJobReportsOrchestrationFailure(t *testing.T) {
 	})
 	require.ErrorIs(t, err, ErrJobInvalidTransition)
 
-	backend.completion = &api.OrchestrationMetadata{
+	hub.completion = &api.OrchestrationMetadata{
 		RuntimeStatus:  api.RUNTIME_STATUS_FAILED,
 		FailureDetails: &api.FailureDetails{ErrorType: "Contoso.Boom", ErrorMessage: "boom"},
 	}
@@ -378,16 +378,16 @@ func TestCreateJobReportsOrchestrationFailure(t *testing.T) {
 
 func TestCreateJobPropagatesTransportErrors(t *testing.T) {
 	scheduleFailure := errors.New("schedule failed")
-	backend := newFakeBackend()
-	backend.scheduleErr = scheduleFailure
-	client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	hub := newFakeBackend()
+	hub.scheduleErr = scheduleFailure
+	client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 	_, err := client.CreateJob(context.Background(), JobCreationOptions{Mode: ExportModeContinuous})
 	require.ErrorIs(t, err, scheduleFailure)
 
 	waitFailure := errors.New("wait failed")
-	backend = newFakeBackend()
-	backend.completionErr = waitFailure
-	client = newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	hub = newFakeBackend()
+	hub.completionErr = waitFailure
+	client = newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 	_, err = client.CreateJob(context.Background(), JobCreationOptions{Mode: ExportModeContinuous})
 	require.ErrorIs(t, err, waitFailure)
 }
@@ -395,8 +395,8 @@ func TestCreateJobPropagatesTransportErrors(t *testing.T) {
 func TestGetJob(t *testing.T) {
 	t.Run("returns the description when the job exists", func(t *testing.T) {
 		now := time.Now().UTC().Truncate(time.Millisecond)
-		backend := newFakeBackend()
-		backend.entity = entityMetadata(t, "job-1", ExportJobState{
+		hub := newFakeBackend()
+		hub.entity = entityMetadata(t, "job-1", ExportJobState{
 			Status:            ExportJobStatusActive,
 			CreatedAt:         &now,
 			LastModifiedAt:    &now,
@@ -408,7 +408,7 @@ func TestGetJob(t *testing.T) {
 				Format:      DefaultExportFormat(),
 			},
 		})
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		description, err := client.GetJob(context.Background(), "job-1")
 		require.NoError(t, err)
 		assert.Equal(t, "job-1", description.JobID)
@@ -420,8 +420,8 @@ func TestGetJob(t *testing.T) {
 	})
 
 	t.Run("reports a typed not-found error", func(t *testing.T) {
-		backend := newFakeBackend()
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, ErrJobNotFound)
 		var notFound *NotFoundError
@@ -430,25 +430,25 @@ func TestGetJob(t *testing.T) {
 	})
 
 	t.Run("maps a missing instance to not found", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.entityErr = api.ErrInstanceNotFound
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entityErr = api.ErrInstanceNotFound
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, ErrJobNotFound)
 	})
 
 	t.Run("a deleted entity with empty state is not found", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.entity = &api.EntityMetadata{InstanceID: EntityID("job-1")}
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entity = &api.EntityMetadata{InstanceID: EntityID("job-1")}
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, ErrJobNotFound)
 	})
 
 	t.Run("corrupt state surfaces a deserialization error", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.entity = &api.EntityMetadata{InstanceID: EntityID("job-1"), SerializedState: "not json"}
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entity = &api.EntityMetadata{InstanceID: EntityID("job-1"), SerializedState: "not json"}
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to deserialize export job state")
@@ -456,9 +456,9 @@ func TestGetJob(t *testing.T) {
 
 	t.Run("propagates transport errors", func(t *testing.T) {
 		failure := errors.New("fetch failed")
-		backend := newFakeBackend()
-		backend.entityErr = failure
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entityErr = failure
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, failure)
 	})
@@ -480,24 +480,24 @@ func TestListJobs(t *testing.T) {
 	}
 
 	t.Run("returns every job when unfiltered", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.queryPages = pages(t)
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.queryPages = pages(t)
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		result, err := client.ListJobs(context.Background(), ExportJobQuery{})
 		require.NoError(t, err)
 		require.Len(t, result.Jobs, 2)
 		assert.Equal(t, "job-1", result.Jobs[0].JobID)
 		assert.Equal(t, "job-2", result.Jobs[1].JobID)
 		assert.Equal(t, "next", result.ContinuationToken)
-		assert.Equal(t, "@exportjob@", backend.lastQuery.InstanceIDStartsWith)
-		assert.True(t, backend.lastQuery.IncludeState)
-		assert.Equal(t, int32(DefaultJobQueryPageSize), backend.lastQuery.PageSize)
+		assert.Equal(t, "@exportjob@", hub.lastQuery.InstanceIDStartsWith)
+		assert.True(t, hub.lastQuery.IncludeState)
+		assert.Equal(t, int32(DefaultJobQueryPageSize), hub.lastQuery.PageSize)
 	})
 
 	t.Run("filters by status", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.queryPages = pages(t)
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.queryPages = pages(t)
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		active := ExportJobStatusActive
 		result, err := client.ListJobs(context.Background(), ExportJobQuery{Status: &active})
 		require.NoError(t, err)
@@ -506,19 +506,19 @@ func TestListJobs(t *testing.T) {
 	})
 
 	t.Run("rejects an invalid status", func(t *testing.T) {
-		backend := newFakeBackend()
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		invalid := ExportJobStatus(99)
 		_, err := client.ListJobs(context.Background(), ExportJobQuery{Status: &invalid})
 		require.ErrorIs(t, err, ErrValidation)
 		assert.Contains(t, err.Error(), "invalid export job status")
-		assert.Zero(t, backend.lastQuery)
+		assert.Zero(t, hub.lastQuery)
 	})
 
 	t.Run("filters by creation time", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.queryPages = pages(t)
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.queryPages = pages(t)
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		result, err := client.ListJobs(context.Background(), ExportJobQuery{
 			CreatedFrom: older.Add(time.Hour),
 		})
@@ -528,18 +528,18 @@ func TestListJobs(t *testing.T) {
 	})
 
 	t.Run("applies the job ID prefix to the entity query", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.queryPages = &api.EntityQueryResults{}
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.queryPages = &api.EntityQueryResults{}
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.ListJobs(context.Background(), ExportJobQuery{
 			JobIDPrefix:       "nightly-",
 			PageSize:          25,
 			ContinuationToken: "token",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "@exportjob@nightly-", backend.lastQuery.InstanceIDStartsWith)
-		assert.Equal(t, int32(25), backend.lastQuery.PageSize)
-		assert.Equal(t, "token", backend.lastQuery.ContinuationToken)
+		assert.Equal(t, "@exportjob@nightly-", hub.lastQuery.InstanceIDStartsWith)
+		assert.Equal(t, int32(25), hub.lastQuery.PageSize)
+		assert.Equal(t, "token", hub.lastQuery.ContinuationToken)
 	})
 
 	t.Run("validates the page size and prefix", func(t *testing.T) {
@@ -554,14 +554,14 @@ func TestListJobs(t *testing.T) {
 
 	t.Run("surfaces query errors", func(t *testing.T) {
 		failure := errors.New("query failed")
-		backend := newFakeBackend()
-		backend.queryErr = failure
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.queryErr = failure
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.ListJobs(context.Background(), ExportJobQuery{})
 		require.ErrorIs(t, err, failure)
 
-		backend = newFakeBackend()
-		client = newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub = newFakeBackend()
+		client = newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err = client.ListJobs(context.Background(), ExportJobQuery{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "returned no result")
@@ -578,33 +578,33 @@ func TestListJobs(t *testing.T) {
 
 func TestDeleteJob(t *testing.T) {
 	t.Run("deletes the entity then terminates and purges the orchestration", func(t *testing.T) {
-		backend := newFakeBackend()
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.NoError(t, job.Delete(context.Background()))
 
-		require.Len(t, backend.scheduled, 1)
-		assert.Equal(t, deleteOperation, backend.scheduled[0].request.OperationName)
+		require.Len(t, hub.scheduled, 1)
+		assert.Equal(t, deleteOperation, hub.scheduled[0].request.OperationName)
 		instanceID := GetOrchestratorInstanceID("job-1")
-		assert.Equal(t, []api.InstanceID{instanceID}, backend.terminated)
-		assert.Equal(t, []api.InstanceID{instanceID}, backend.purged)
+		assert.Equal(t, []api.InstanceID{instanceID}, hub.terminated)
+		assert.Equal(t, []api.InstanceID{instanceID}, hub.purged)
 	})
 
 	t.Run("tolerates a missing orchestration", func(t *testing.T) {
 		for _, name := range []string{"terminate", "wait", "purge"} {
-			backend := newFakeBackend()
+			hub := newFakeBackend()
 			switch name {
 			case "terminate":
-				backend.terminateErr = api.ErrInstanceNotFound
+				hub.terminateErr = api.ErrInstanceNotFound
 			case "wait":
-				backend.completionErrByInstance = map[api.InstanceID]error{
+				hub.completionErrByInstance = map[api.InstanceID]error{
 					GetOrchestratorInstanceID("job-1"): api.ErrInstanceNotFound,
 				}
 			case "purge":
-				backend.purgeErr = api.ErrInstanceNotFound
+				hub.purgeErr = api.ErrInstanceNotFound
 			}
-			client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+			client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 			job, err := client.JobClient("job-1")
 			require.NoError(t, err)
 			require.NoError(t, job.Delete(context.Background()), name)
@@ -613,9 +613,9 @@ func TestDeleteJob(t *testing.T) {
 
 	t.Run("reports other cleanup failures", func(t *testing.T) {
 		failure := errors.New("terminate failed")
-		backend := newFakeBackend()
-		backend.terminateErr = failure
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.terminateErr = failure
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		err = job.Delete(context.Background())
@@ -624,14 +624,14 @@ func TestDeleteJob(t *testing.T) {
 	})
 
 	t.Run("does not clean up when the entity delete fails", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.completion = &api.OrchestrationMetadata{RuntimeStatus: api.RUNTIME_STATUS_FAILED}
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.completion = &api.OrchestrationMetadata{RuntimeStatus: api.RUNTIME_STATUS_FAILED}
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.Error(t, job.Delete(context.Background()))
-		assert.Empty(t, backend.terminated)
-		assert.Empty(t, backend.purged)
+		assert.Empty(t, hub.terminated)
+		assert.Empty(t, hub.purged)
 	})
 }
 
@@ -649,98 +649,98 @@ func TestCreateClearsTheRunOfATerminalJob(t *testing.T) {
 
 	for _, status := range []ExportJobStatus{ExportJobStatusCompleted, ExportJobStatusFailed} {
 		t.Run("clears the run of a "+status.String()+" job", func(t *testing.T) {
-			backend := newFakeBackend()
-			backend.entity = entityMetadata(t, "job-1", ExportJobState{
+			hub := newFakeBackend()
+			hub.entity = entityMetadata(t, "job-1", ExportJobState{
 				Status:                 status,
 				OrchestratorInstanceID: string(instanceID),
 			})
-			client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+			client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 			job, err := client.JobClient("job-1")
 			require.NoError(t, err)
 			require.NoError(t, job.Create(context.Background(), options))
 
-			assert.Equal(t, []api.InstanceID{instanceID}, backend.terminated)
-			assert.Equal(t, []api.InstanceID{instanceID}, backend.purged)
-			require.Len(t, backend.scheduled, 1)
-			assert.Equal(t, createOperation, backend.scheduled[0].request.OperationName)
+			assert.Equal(t, []api.InstanceID{instanceID}, hub.terminated)
+			assert.Equal(t, []api.InstanceID{instanceID}, hub.purged)
+			require.Len(t, hub.scheduled, 1)
+			assert.Equal(t, createOperation, hub.scheduled[0].request.OperationName)
 		})
 	}
 
 	t.Run("leaves the run of an active job alone", func(t *testing.T) {
 		// The entity rejects recreating an Active job, so clearing its
 		// orchestration would strand the run that still owns it.
-		backend := newFakeBackend()
-		backend.entity = entityMetadata(t, "job-1", ExportJobState{
+		hub := newFakeBackend()
+		hub.entity = entityMetadata(t, "job-1", ExportJobState{
 			Status:                 ExportJobStatusActive,
 			OrchestratorInstanceID: string(instanceID),
 		})
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.NoError(t, job.Create(context.Background(), options))
-		assert.Empty(t, backend.terminated)
-		assert.Empty(t, backend.purged)
+		assert.Empty(t, hub.terminated)
+		assert.Empty(t, hub.purged)
 	})
 
 	t.Run("a job that does not exist needs no cleanup", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.entityErr = api.ErrInstanceNotFound
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entityErr = api.ErrInstanceNotFound
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.NoError(t, job.Create(context.Background(), options))
-		assert.Empty(t, backend.terminated)
-		assert.Empty(t, backend.purged)
-		require.Len(t, backend.scheduled, 1)
+		assert.Empty(t, hub.terminated)
+		assert.Empty(t, hub.purged)
+		require.Len(t, hub.scheduled, 1)
 	})
 
 	t.Run("a purge failure fails the create rather than starting a dead job", func(t *testing.T) {
 		// Without the purge the task hub keeps the previous instance ID, so the
 		// new run would be dropped and the job would sit Active but idle.
 		failure := errors.New("purge failed")
-		backend := newFakeBackend()
-		backend.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusCompleted})
-		backend.purgeErr = failure
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusCompleted})
+		hub.purgeErr = failure
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.ErrorIs(t, job.Create(context.Background(), options), failure)
-		assert.Empty(t, backend.scheduled)
+		assert.Empty(t, hub.scheduled)
 	})
 
 	t.Run("a rejected terminate does not block the recreate", func(t *testing.T) {
 		// A job that is already terminal has normally finished its run, and a
 		// task hub that refuses to terminate a finished instance must not stop
 		// the purge that actually frees the instance ID.
-		backend := newFakeBackend()
-		backend.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusCompleted})
-		backend.terminateErr = errors.New("orchestration is not running")
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusCompleted})
+		hub.terminateErr = errors.New("orchestration is not running")
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.NoError(t, job.Create(context.Background(), options))
-		assert.Equal(t, []api.InstanceID{instanceID}, backend.purged)
-		require.Len(t, backend.scheduled, 1)
+		assert.Equal(t, []api.InstanceID{instanceID}, hub.purged)
+		require.Len(t, hub.scheduled, 1)
 	})
 
 	t.Run("a missing previous orchestration is not an error", func(t *testing.T) {
-		backend := newFakeBackend()
-		backend.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusFailed})
-		backend.purgeErr = api.ErrInstanceNotFound
-		client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+		hub := newFakeBackend()
+		hub.entity = entityMetadata(t, "job-1", ExportJobState{Status: ExportJobStatusFailed})
+		hub.purgeErr = api.ErrInstanceNotFound
+		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)
 		require.NoError(t, job.Create(context.Background(), options))
-		require.Len(t, backend.scheduled, 1)
+		require.Len(t, hub.scheduled, 1)
 	})
 }
 
 func TestDescribeUsesTheClientJobID(t *testing.T) {
-	backend := newFakeBackend()
+	hub := newFakeBackend()
 	// The service reports the lowercased entity key; the handle's own ID wins so
 	// a caller always sees the ID it asked for.
-	backend.entity = entityMetadata(t, "JOB-1", ExportJobState{Status: ExportJobStatusActive})
-	client := newTestClient(t, backend, ClientOptions{ContainerName: "container"})
+	hub.entity = entityMetadata(t, "JOB-1", ExportJobState{Status: ExportJobStatusActive})
+	client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 	job, err := client.JobClient("job-1")
 	require.NoError(t, err)
 	description, err := job.Describe(context.Background())

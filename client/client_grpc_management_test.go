@@ -3,65 +3,130 @@ package client
 import (
 	"context"
 	"errors"
-	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
-	"github.com/microsoft/durabletask-go/backend/sqlite"
+	"github.com/microsoft/durabletask-go/internal/grpcerrors"
+	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-type lifecycleErrorBackend struct {
-	backend.Backend
+// managementServer is a fake task hub service that answers only the management
+// RPCs these tests drive over the wire. It stores nothing: the assertions are
+// about the gRPC round trip performed by TaskHubGrpcClient.
+type managementServer struct {
+	protos.UnimplementedTaskHubSidecarServiceServer
+
+	mu      sync.Mutex
+	created bool
+	deleted bool
 }
 
-func (*lifecycleErrorBackend) CreateTaskHub(context.Context) error {
-	return backend.ErrTaskHubExists
+func (s *managementServer) CreateTaskHub(
+	context.Context,
+	*protos.CreateTaskHubRequest,
+) (*protos.CreateTaskHubResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.created = true
+	return &protos.CreateTaskHubResponse{}, nil
 }
 
-func (*lifecycleErrorBackend) DeleteTaskHub(context.Context) error {
-	return backend.ErrTaskHubNotFound
+func (s *managementServer) DeleteTaskHub(
+	context.Context,
+	*protos.DeleteTaskHubRequest,
+) (*protos.DeleteTaskHubResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleted = true
+	return &protos.DeleteTaskHubResponse{}, nil
 }
 
-func (*lifecycleErrorBackend) Stop(context.Context) error {
-	return nil
+func (*managementServer) QueryInstances(
+	_ context.Context,
+	req *protos.QueryInstancesRequest,
+) (*protos.QueryInstancesResponse, error) {
+	if req.GetQuery().GetMaxInstanceCount() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "page size must be positive")
+	}
+	return &protos.QueryInstancesResponse{}, nil
+}
+
+func (*managementServer) ListInstanceIds(
+	_ context.Context,
+	req *protos.ListInstanceIdsRequest,
+) (*protos.ListInstanceIdsResponse, error) {
+	if req.GetPageSize() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "page size must be positive")
+	}
+	return &protos.ListInstanceIdsResponse{}, nil
+}
+
+func (s *managementServer) lifecycleCalls() (bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.created, s.deleted
+}
+
+// lifecycleErrorServer fails both lifecycle RPCs with the durable error reasons
+// a task hub service attaches, so the client-side sentinel mapping is observed.
+type lifecycleErrorServer struct {
+	protos.UnimplementedTaskHubSidecarServiceServer
+}
+
+func (*lifecycleErrorServer) CreateTaskHub(
+	context.Context,
+	*protos.CreateTaskHubRequest,
+) (*protos.CreateTaskHubResponse, error) {
+	return nil, grpcerrors.New(
+		codes.AlreadyExists,
+		backend.ErrTaskHubExists.Error(),
+		grpcerrors.ReasonTaskHubExists,
+	)
+}
+
+func (*lifecycleErrorServer) DeleteTaskHub(
+	context.Context,
+	*protos.DeleteTaskHubRequest,
+) (*protos.DeleteTaskHubResponse, error) {
+	return nil, grpcerrors.New(
+		codes.NotFound,
+		backend.ErrTaskHubNotFound.Error(),
+		grpcerrors.ReasonTaskHubNotFound,
+	)
+}
+
+// bareLifecycleErrorServer omits the durable error reason detail so the
+// status-code-only fallback in clientRPCError is exercised too.
+type bareLifecycleErrorServer struct {
+	protos.UnimplementedTaskHubSidecarServiceServer
+}
+
+func (*bareLifecycleErrorServer) CreateTaskHub(
+	context.Context,
+	*protos.CreateTaskHubRequest,
+) (*protos.CreateTaskHubResponse, error) {
+	return nil, status.Error(codes.AlreadyExists, "task hub already exists")
+}
+
+func (*bareLifecycleErrorServer) DeleteTaskHub(
+	context.Context,
+	*protos.DeleteTaskHubRequest,
+) (*protos.DeleteTaskHubResponse, error) {
+	return nil, status.Error(codes.NotFound, "task hub not found")
 }
 
 func TestTaskHubGrpcManagementOverBufconn(t *testing.T) {
-	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	be := sqlite.NewSqliteBackend(sqlite.NewSqliteOptions(""), backend.DefaultLogger())
-	executor, register := backend.NewGrpcExecutor(
-		be,
-		backend.DefaultLogger(),
-		backend.WithTaskHubLifecycleManagement(),
-	)
-	register(grpcServer)
-	go func() {
-		_ = grpcServer.Serve(listener)
-	}()
-	t.Cleanup(func() {
-		grpcServer.Stop()
-		_ = executor.Shutdown(context.Background())
-	})
+	server := &managementServer{}
+	client := startQueryClient(t, server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	connection, err := grpc.NewClient(
-		"passthrough:///bufnet",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, connection.Close()) })
-	client := NewTaskHubGrpcClient(connection, backend.DefaultLogger())
 
 	require.NoError(t, client.CreateTaskHub(ctx))
 	query, err := client.QueryInstances(ctx, api.OrchestrationQuery{PageSize: 10})
@@ -71,42 +136,30 @@ func TestTaskHubGrpcManagementOverBufconn(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, ids.InstanceIDs)
 	require.NoError(t, client.DeleteTaskHub(ctx))
+
+	created, deleted := server.lifecycleCalls()
+	require.True(t, created)
+	require.True(t, deleted)
 }
 
 func TestTaskHubLifecycleErrorsRoundTripOverGRPC(t *testing.T) {
-	listener := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	executor, register := backend.NewGrpcExecutor(
-		&lifecycleErrorBackend{},
-		backend.DefaultLogger(),
-		backend.WithTaskHubLifecycleManagement(),
-	)
-	register(grpcServer)
-	go func() {
-		_ = grpcServer.Serve(listener)
-	}()
-	t.Cleanup(func() {
-		grpcServer.Stop()
-		_ = executor.Shutdown(context.Background())
-	})
+	for _, test := range []struct {
+		name   string
+		server protos.TaskHubSidecarServiceServer
+	}{
+		{name: "with-durable-error-reason", server: &lifecycleErrorServer{}},
+		{name: "status-code-only", server: &bareLifecycleErrorServer{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := startQueryClient(t, test.server)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	connection, err := grpc.NewClient(
-		"passthrough:///bufnet",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, connection.Close()) })
-	client := NewTaskHubGrpcClient(connection, backend.DefaultLogger())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-	if err := client.CreateTaskHub(ctx); !errors.Is(err, backend.ErrTaskHubExists) {
-		t.Fatalf("CreateTaskHub() error = %v", err)
-	}
-	if err := client.DeleteTaskHub(ctx); !errors.Is(err, backend.ErrTaskHubNotFound) {
-		t.Fatalf("DeleteTaskHub() error = %v", err)
+			err := client.CreateTaskHub(ctx)
+			require.True(t, errors.Is(err, backend.ErrTaskHubExists), "CreateTaskHub() error = %v", err)
+			err = client.DeleteTaskHub(ctx)
+			require.True(t, errors.Is(err, backend.ErrTaskHubNotFound), "DeleteTaskHub() error = %v", err)
+		})
 	}
 }

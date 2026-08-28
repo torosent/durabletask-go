@@ -8,10 +8,16 @@ import (
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// RebuildRewindHistory rebuilds an orchestration history so a failed execution
+// can be replayed from the point of failure: failed tasks and their scheduling
+// events are dropped, failed sub-orchestrations are reported to the caller, and
+// the ExecutionStarted event is reissued for the target instance.
+//
+// DTS performs rewind service-side, so the SDK does not call this. It stays here
+// as the reference implementation of the deterministic rewind transformation and
+// is covered by rewind_test.go.
 func RebuildRewindHistory(
 	id api.InstanceID,
 	history []*protos.HistoryEvent,
@@ -92,25 +98,4 @@ func RebuildRewindHistory(
 		rebuilt = append(rebuilt, proto.Clone(event).(*protos.HistoryEvent))
 	}
 	return rebuilt, newStart, failedChildren, nil
-}
-
-func NewExecutionRewoundEvent(id api.InstanceID, reason string, start *protos.ExecutionStartedEvent) *protos.HistoryEvent {
-	rewound := &protos.ExecutionRewoundEvent{
-		Reason:             wrapperspb.String(reason),
-		ParentTraceContext: start.GetParentTraceContext(),
-		Name:               wrapperspb.String(start.GetName()),
-		Version:            start.GetVersion(),
-		Input:              start.GetInput(),
-		ParentInstance:     start.GetParentInstance(),
-		Tags:               maps.Clone(start.GetTags()),
-	}
-	if parent := start.GetParentInstance(); parent != nil {
-		rewound.InstanceId = wrapperspb.String(string(id))
-		rewound.ParentExecutionId = parent.GetOrchestrationInstance().GetExecutionId()
-	}
-	return &protos.HistoryEvent{
-		EventId:   -1,
-		Timestamp: timestamppb.Now(),
-		EventType: &protos.HistoryEvent_ExecutionRewound{ExecutionRewound: rewound},
-	}
 }
