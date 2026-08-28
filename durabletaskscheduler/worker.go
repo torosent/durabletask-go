@@ -37,6 +37,7 @@ func NewWorker(
 	configuredOptions := []durabletaskclient.TaskHubGrpcWorkerOption{
 		durabletaskclient.WithWorkerHelloTimeout(prepared.HelloTimeout),
 		durabletaskclient.WithWorkerDataConverter(prepared.DataConverter),
+		durabletaskclient.WithMaximumTimerInterval(prepared.MaximumTimerInterval),
 	}
 	if prepared.LargePayloads != nil {
 		configuredOptions = append(

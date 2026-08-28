@@ -91,7 +91,18 @@ func WithOrchestratorNotFoundStrategy(strategy OrchestratorNotFoundStrategy) Tas
 // WithOrchestrationOptions configures deterministic orchestration engine policies.
 func WithOrchestrationOptions(options OrchestrationOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
-		executor.orchestrationOptions = options
+		executor.orchestrationOptions = normalizeOrchestrationOptions(options)
+	}
+}
+
+// WithMaximumTimerInterval configures the maximum duration of one physical
+// durable timer action. Zero restores [DefaultMaximumTimerInterval]. A negative
+// interval panics when the option is applied.
+func WithMaximumTimerInterval(interval time.Duration) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		options := executor.orchestrationOptions
+		options.MaximumTimerInterval = interval
+		executor.orchestrationOptions = normalizeOrchestrationOptions(options)
 	}
 }
 
@@ -122,9 +133,10 @@ func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 // NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
 func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
 	executor := &taskExecutor{
-		Registry:  registry,
-		logger:    slog.Default(),
-		converter: api.DefaultDataConverter(),
+		Registry:             registry,
+		orchestrationOptions: normalizeOrchestrationOptions(OrchestrationOptions{}),
+		logger:               slog.Default(),
+		converter:            api.DefaultDataConverter(),
 	}
 	for _, configure := range opts {
 		configure(executor)

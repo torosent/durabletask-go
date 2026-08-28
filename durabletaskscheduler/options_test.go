@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,6 +85,7 @@ func TestNewOptionsFromConnectionString(t *testing.T) {
 			require.Equal(t, tt.wantAuth, options.Authentication)
 			require.Equal(t, tt.wantUnsafe, options.AllowInsecureConnection)
 			require.Equal(t, DefaultResourceID, options.ResourceID)
+			require.Equal(t, task.DefaultMaximumTimerInterval, options.MaximumTimerInterval)
 			require.Equal(t, tt.wantClientID, options.ClientID)
 			require.Equal(t, tt.wantTenantID, options.TenantID)
 			require.Equal(t, tt.wantTokenFile, options.TokenFilePath)
@@ -141,6 +143,7 @@ func TestPrepareOptionsAppliesDefaultsAndCopiesTenants(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DefaultResourceID, prepared.ResourceID)
 	require.Equal(t, 30*time.Second, prepared.HelloTimeout)
+	require.Equal(t, task.DefaultMaximumTimerInterval, prepared.MaximumTimerInterval)
 	options.AdditionallyAllowedTenants[0] = "changed"
 	require.Equal(t, []string{"tenant"}, prepared.AdditionallyAllowedTenants)
 }
@@ -149,4 +152,10 @@ func TestOptionsValidateRejectsInvalidUserAgent(t *testing.T) {
 	options := NewOptions("scheduler.example.com", "hub")
 	options.UserAgent = "agent\r\ninjected"
 	require.ErrorContains(t, options.Validate(), "user agent")
+}
+
+func TestOptionsValidateRejectsNegativeMaximumTimerInterval(t *testing.T) {
+	options := NewOptions("scheduler.example.com", "hub")
+	options.MaximumTimerInterval = -time.Second
+	require.ErrorContains(t, options.Validate(), "maximum timer interval")
 }

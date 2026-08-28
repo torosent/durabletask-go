@@ -88,6 +88,67 @@ func Test_SingleTimer(t *testing.T) {
 	)
 }
 
+func Test_LongTimer(t *testing.T) {
+	const (
+		unit            = 2 * time.Second
+		delay           = 7 * unit
+		maximumInterval = 3 * unit
+		expectedTimers  = 3
+	)
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("LongTimer", func(ctx *task.OrchestrationContext) (any, error) {
+		return nil, ctx.CreateTimer(delay).Await(nil)
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	exporter := initTracing()
+	client, worker := initTaskHubWorkerWithExecutorOptions(
+		ctx,
+		registry,
+		[]task.TaskExecutorOption{task.WithMaximumTimerInterval(maximumInterval)},
+	)
+	defer func() {
+		if err := worker.Shutdown(context.Background()); err != nil {
+			t.Logf("shutdown: %v", err)
+		}
+	}()
+
+	id, err := client.ScheduleNewOrchestration(ctx, "LongTimer")
+	require.NoError(t, err)
+	metadata, err := client.WaitForOrchestrationCompletion(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	require.GreaterOrEqual(t, metadata.LastUpdatedAt, metadata.CreatedAt.Add(delay))
+
+	historyClient, ok := client.(interface {
+		GetOrchestrationHistory(context.Context, api.InstanceID, api.HistoryQuery) (*api.OrchestrationHistory, error)
+	})
+	require.True(t, ok)
+	history, err := historyClient.GetOrchestrationHistory(
+		ctx,
+		id,
+		api.HistoryQuery{ExecutionID: metadata.ExecutionID},
+	)
+	require.NoError(t, err)
+	timerCount := 0
+	for _, event := range history.Events {
+		if event.Type == api.HistoryEventTimerCreated {
+			timerCount++
+		}
+	}
+	require.Equal(t, expectedTimers, timerCount)
+	assertSpanSequence(
+		t,
+		exporter.GetSpans().Snapshots(),
+		assertOrchestratorCreated("LongTimer", id),
+		assertTimer(id),
+		assertTimer(id),
+		assertTimer(id),
+		assertOrchestratorExecuted("LongTimer", id, "COMPLETED"),
+	)
+}
+
 func Test_ConcurrentTimers(t *testing.T) {
 	// Registration
 	r := task.NewTaskRegistry()

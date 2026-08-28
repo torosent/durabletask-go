@@ -75,6 +75,7 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryMaxAttempts   int
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
+	maximumTimerInterval        *time.Duration
 	taskExecutorOptions         []task.TaskExecutorOption
 	versioning                  *task.VersioningOptions
 	capabilities                []WorkerCapability
@@ -187,6 +188,22 @@ func WithWorkerTransientRetryPolicy(maxAttempts int, baseDelay, maxDelay time.Du
 		options.transientRetryMaxAttempts = maxAttempts
 		options.transientRetryBaseDelay = baseDelay
 		options.transientRetryMaxDelay = maxDelay
+		return nil
+	}
+}
+
+// WithMaximumTimerInterval configures deterministic splitting of long durable
+// timers. Changing this value is replay-breaking for affected in-flight
+// orchestrations.
+func WithMaximumTimerInterval(interval time.Duration) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if interval < 0 {
+			return fmt.Errorf("maximum timer interval cannot be negative")
+		}
+		if interval == 0 {
+			interval = task.DefaultMaximumTimerInterval
+		}
+		options.maximumTimerInterval = &interval
 		return nil
 	}
 }
@@ -477,6 +494,9 @@ func newTaskHubGrpcWorker(
 // worker options are appended last so they consistently override generic ones.
 func (options taskHubGrpcWorkerOptions) executorOptions() []task.TaskExecutorOption {
 	executorOptions := slices.Clone(options.taskExecutorOptions)
+	if options.maximumTimerInterval != nil {
+		executorOptions = append(executorOptions, task.WithMaximumTimerInterval(*options.maximumTimerInterval))
+	}
 	if options.versioning != nil {
 		executorOptions = append(executorOptions, task.WithVersioning(*options.versioning))
 	}
