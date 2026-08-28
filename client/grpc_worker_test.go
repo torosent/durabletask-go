@@ -66,7 +66,21 @@ func (s *fakeHistoryStream) Recv() (*protos.HistoryChunk, error) {
 	return nil, io.EOF
 }
 
-type fakeSidecarClient struct {
+func TestMaximumTimerIntervalWorkerOption(t *testing.T) {
+	options := defaultTaskHubGrpcWorkerOptions()
+	require.Nil(t, options.maximumTimerInterval)
+	require.Empty(t, options.executorOptions())
+	require.NoError(t, WithTaskExecutorOptions(task.WithMaximumTimerInterval(time.Hour))(&options))
+	require.Len(t, options.executorOptions(), 1)
+	require.Error(t, WithMaximumTimerInterval(-time.Second)(&options))
+	require.NoError(t, WithMaximumTimerInterval(0)(&options))
+	require.Equal(t, task.DefaultMaximumTimerInterval, *options.maximumTimerInterval)
+	require.Len(t, options.executorOptions(), 2)
+	require.NoError(t, WithMaximumTimerInterval(2*time.Hour)(&options))
+	require.Equal(t, 2*time.Hour, *options.maximumTimerInterval)
+}
+
+type fakeSchedulerClient struct {
 	protos.TaskHubSidecarServiceClient
 
 	mu sync.Mutex
@@ -87,11 +101,11 @@ type fakeSidecarClient struct {
 	entityAbandonFailures    int
 }
 
-func (c *fakeSidecarClient) Hello(context.Context, *emptypb.Empty, ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *fakeSchedulerClient) Hello(context.Context, *emptypb.Empty, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, c.helloErr
 }
 
-func (c *fakeSidecarClient) GetWorkItems(
+func (c *fakeSchedulerClient) GetWorkItems(
 	ctx context.Context,
 	request *protos.GetWorkItemsRequest,
 	_ ...grpc.CallOption,
@@ -103,7 +117,7 @@ func (c *fakeSidecarClient) GetWorkItems(
 	return c.stream, nil
 }
 
-func (c *fakeSidecarClient) CompleteOrchestratorTask(
+func (c *fakeSchedulerClient) CompleteOrchestratorTask(
 	_ context.Context,
 	response *protos.OrchestratorResponse,
 	_ ...grpc.CallOption,
@@ -114,7 +128,7 @@ func (c *fakeSidecarClient) CompleteOrchestratorTask(
 	return &protos.CompleteTaskResponse{}, nil
 }
 
-func (c *fakeSidecarClient) CompleteActivityTask(
+func (c *fakeSchedulerClient) CompleteActivityTask(
 	_ context.Context,
 	response *protos.ActivityResponse,
 	_ ...grpc.CallOption,
@@ -125,7 +139,7 @@ func (c *fakeSidecarClient) CompleteActivityTask(
 	return &protos.CompleteTaskResponse{}, nil
 }
 
-func (c *fakeSidecarClient) CompleteEntityTask(
+func (c *fakeSchedulerClient) CompleteEntityTask(
 	_ context.Context,
 	response *protos.EntityBatchResult,
 	_ ...grpc.CallOption,
@@ -136,7 +150,7 @@ func (c *fakeSidecarClient) CompleteEntityTask(
 	return &protos.CompleteTaskResponse{}, nil
 }
 
-func (c *fakeSidecarClient) StreamInstanceHistory(
+func (c *fakeSchedulerClient) StreamInstanceHistory(
 	ctx context.Context,
 	_ *protos.StreamInstanceHistoryRequest,
 	_ ...grpc.CallOption,
@@ -144,7 +158,7 @@ func (c *fakeSidecarClient) StreamInstanceHistory(
 	return &fakeHistoryStream{ctx: ctx, chunks: c.history, block: c.historyBlocks}, nil
 }
 
-func (c *fakeSidecarClient) AbandonTaskOrchestratorWorkItem(
+func (c *fakeSchedulerClient) AbandonTaskOrchestratorWorkItem(
 	_ context.Context,
 	_ *protos.AbandonOrchestrationTaskRequest,
 	_ ...grpc.CallOption,
@@ -155,7 +169,7 @@ func (c *fakeSidecarClient) AbandonTaskOrchestratorWorkItem(
 	return &protos.AbandonOrchestrationTaskResponse{}, nil
 }
 
-func (c *fakeSidecarClient) AbandonTaskActivityWorkItem(
+func (c *fakeSchedulerClient) AbandonTaskActivityWorkItem(
 	_ context.Context,
 	_ *protos.AbandonActivityTaskRequest,
 	_ ...grpc.CallOption,
@@ -166,7 +180,7 @@ func (c *fakeSidecarClient) AbandonTaskActivityWorkItem(
 	return &protos.AbandonActivityTaskResponse{}, nil
 }
 
-func (c *fakeSidecarClient) AbandonTaskEntityWorkItem(
+func (c *fakeSchedulerClient) AbandonTaskEntityWorkItem(
 	context.Context,
 	*protos.AbandonEntityTaskRequest,
 	...grpc.CallOption,
@@ -214,7 +228,7 @@ func (e *recordingExecutor) ExecuteEntity(
 	return e.executeEntity(ctx, request)
 }
 
-func newFakeWorker(t *testing.T, client *fakeSidecarClient, opts ...TaskHubGrpcWorkerOption) *TaskHubGrpcWorker {
+func newFakeWorker(t *testing.T, client *fakeSchedulerClient, opts ...TaskHubGrpcWorkerOption) *TaskHubGrpcWorker {
 	t.Helper()
 	registry := task.NewTaskRegistry()
 	options := []TaskHubGrpcWorkerOption{
@@ -243,7 +257,7 @@ func newFakeWorkItemStream(buffer int) *fakeWorkItemsStream {
 
 func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.T) {
 	stream := newFakeWorkItemStream(2)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(
 		t,
 		client,
@@ -334,9 +348,42 @@ func TestStrictAutoFiltersPreserveAllowedUnversionedOrchestrator(t *testing.T) {
 		},
 		&task.VersioningOptions{Version: "1.0", MatchStrategy: task.VersionMatchStrict},
 		map[string]struct{}{"system": {}},
+		nil,
 	)
 	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "system", Versions: []string{""}})
 	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "application", Versions: []string{"1.0"}})
+}
+
+// TestStrictAutoFiltersPreserveAllowedUnversionedActivity keeps a system
+// component's unversioned activities routable under strict worker versioning.
+// An activity inherits its caller's version, so an unversioned system
+// orchestration schedules unversioned activities.
+func TestStrictAutoFiltersPreserveAllowedUnversionedActivity(t *testing.T) {
+	snapshot := task.TaskRegistrySnapshot{
+		Activities: []task.TaskRegistration{
+			{Name: "SystemActivity"},
+			{Name: "application", Version: "1.0"},
+		},
+	}
+	versioning := &task.VersioningOptions{Version: "1.0", MatchStrategy: task.VersionMatchStrict}
+
+	// Without the allow-list the worker demands its own version for the system
+	// activity, so the service never dispatches the unversioned work item.
+	blocked := workItemFiltersFromRegistry(snapshot, versioning, nil, nil)
+	require.Contains(t, blocked.Activities, WorkItemFilter{Name: "SystemActivity", Versions: []string{"1.0"}})
+
+	allowed := workItemFiltersFromRegistry(
+		snapshot, versioning, nil, map[string]struct{}{"systemactivity": {}})
+	require.Contains(t, allowed.Activities, WorkItemFilter{Name: "SystemActivity", Versions: []string{""}})
+	require.Contains(t, allowed.Activities, WorkItemFilter{Name: "application", Versions: []string{"1.0"}})
+}
+
+func TestWithUnversionedActivityNamesRejectsBlankNames(t *testing.T) {
+	options := defaultTaskHubGrpcWorkerOptions()
+	require.Error(t, WithUnversionedActivityNames("  ")(&options))
+	require.NoError(t, WithUnversionedActivityNames("Alpha", "beta")(&options))
+	require.Contains(t, options.unversionedActivities, "alpha")
+	require.Contains(t, options.unversionedActivities, "beta")
 }
 
 func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
@@ -354,7 +401,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 		return nil, nil
 	}))
 
-	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil, nil)
+	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil, nil, nil)
 	require.Equal(t, []WorkItemFilter{
 		{Name: "legacy", Versions: []string{}},
 		{Name: "mixed", Versions: []string{"", "v2"}},
@@ -364,7 +411,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 	strict := workItemFiltersFromRegistry(registry.Snapshot(), &task.VersioningOptions{
 		Version:       "v3",
 		MatchStrategy: task.VersionMatchStrict,
-	}, nil)
+	}, nil, nil)
 	require.Equal(t, []string{"v3"}, strict.Orchestrations[0].Versions)
 	require.Equal(t, []string{"v3"}, strict.Activities[0].Versions)
 	require.Error(t, validateStrictAutoFilters(registry.Snapshot(), &task.VersioningOptions{
@@ -377,7 +424,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 func TestWorkerVersioningOptionOverridesGenericExecutorVersioning(t *testing.T) {
 	worker := newFakeWorker(
 		t,
-		&fakeSidecarClient{},
+		&fakeSchedulerClient{},
 		WithTaskVersioning(task.VersioningOptions{
 			Version:         "1.0",
 			MatchStrategy:   task.VersionMatchStrict,
@@ -436,7 +483,7 @@ func TestStrictAutoFiltersValidateNamedRegistrationsWithWildcard(t *testing.T) {
 
 func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(
 		t,
 		client,
@@ -476,7 +523,7 @@ func TestTaskHubGrpcWorkerAdvertisesExplicitCapabilitiesAndFilters(t *testing.T)
 
 func TestTaskHubGrpcWorkerLocallyRejectsFilteredWorkItems(t *testing.T) {
 	stream := newFakeWorkItemStream(2)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(
 		t,
 		client,
@@ -554,7 +601,7 @@ func TestTaskHubGrpcWorkerHydratesAndExternalizesLargePayloads(t *testing.T) {
 	require.NoError(t, err)
 
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client, WithWorkerLargePayloads(options))
 	worker.executor = &recordingExecutor{
 		executeActivity: func(_ context.Context, _ api.InstanceID, event *protos.HistoryEvent) (*protos.HistoryEvent, error) {
@@ -601,7 +648,7 @@ func TestTaskHubGrpcWorkerStreamsRequiredHistory(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
 	pastEvent := &protos.HistoryEvent{EventId: 1}
 	newEvent := &protos.HistoryEvent{EventId: 2}
-	client := &fakeSidecarClient{
+	client := &fakeSchedulerClient{
 		stream:  stream,
 		history: []*protos.HistoryChunk{{Events: []*protos.HistoryEvent{pastEvent}}},
 	}
@@ -655,7 +702,7 @@ func TestTaskHubGrpcWorkerStreamsRequiredHistory(t *testing.T) {
 
 func TestTaskHubGrpcWorkerAbandonsSilentHistoryStream(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{
+	client := &fakeSchedulerClient{
 		stream:        stream,
 		historyBlocks: true,
 	}
@@ -696,7 +743,7 @@ func TestTaskHubGrpcWorkerAbandonsSilentHistoryStream(t *testing.T) {
 
 func TestTaskHubGrpcWorkerAppliesActivityBackpressure(t *testing.T) {
 	stream := newFakeWorkItemStream(2)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client, WithMaxConcurrentActivityWorkItems(1))
 
 	started := make(chan int32, 2)
@@ -744,7 +791,7 @@ func TestTaskHubGrpcWorkerAppliesActivityBackpressure(t *testing.T) {
 
 func TestTaskHubGrpcWorkerCompletesLegacyAndV2EntityBatches(t *testing.T) {
 	stream := newFakeWorkItemStream(2)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client, WithMaxConcurrentEntityWorkItems(1))
 	worker.executor = &recordingExecutor{
 		executeEntity: func(_ context.Context, request *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
@@ -805,7 +852,7 @@ func TestTaskHubGrpcWorkerCompletesLegacyAndV2EntityBatches(t *testing.T) {
 
 func TestTaskHubGrpcWorkerAbandonsInvalidV2EntityWithBoundedRetry(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{stream: stream, entityAbandonFailures: 2}
+	client := &fakeSchedulerClient{stream: stream, entityAbandonFailures: 2}
 	worker := newFakeWorker(t, client)
 	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
 		Request: &protos.WorkItem_EntityRequestV2{EntityRequestV2: &protos.EntityRequest{
@@ -835,7 +882,7 @@ func TestTaskHubGrpcWorkerAbandonsInvalidV2EntityWithBoundedRetry(t *testing.T) 
 
 func TestTaskHubGrpcWorkerRejectsMismatchedTaskVersion(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client, WithTaskExecutorOptions(task.WithVersioning(task.VersioningOptions{
 		Version:         "1.0",
 		MatchStrategy:   task.VersionMatchStrict,
@@ -875,7 +922,7 @@ func TestTaskHubGrpcWorkerRecreatesConnectionAfterTransientDisconnect(t *testing
 	secondStream.results <- fakeWorkItemResult{item: &protos.WorkItem{
 		Request: &protos.WorkItem_HealthPing{HealthPing: &protos.HealthPing{}},
 	}}
-	clients := []*fakeSidecarClient{
+	clients := []*fakeSchedulerClient{
 		{stream: firstStream},
 		{stream: secondStream},
 	}
@@ -910,7 +957,7 @@ func TestTaskHubGrpcWorkerRecreatesConnectionAfterTransientDisconnect(t *testing
 func TestTaskHubGrpcWorkerStopsOnAuthenticationError(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
 	stream.results <- fakeWorkItemResult{err: status.Error(codes.Unauthenticated, "bad token")}
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client)
 
 	require.NoError(t, worker.Start(context.Background()))
@@ -923,7 +970,7 @@ func TestTaskHubGrpcWorkerStopsOnAuthenticationError(t *testing.T) {
 
 func TestTaskHubGrpcWorkerGracefulDrainKeepsCompletionContextAlive(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
-	client := &fakeSidecarClient{stream: stream}
+	client := &fakeSchedulerClient{stream: stream}
 	worker := newFakeWorker(t, client, WithMaxConcurrentActivityWorkItems(1))
 
 	started := make(chan struct{})
@@ -965,7 +1012,7 @@ func TestTaskHubGrpcWorkerGracefulDrainKeepsCompletionContextAlive(t *testing.T)
 }
 
 func TestTaskHubGrpcWorkerHelloFailsFast(t *testing.T) {
-	client := &fakeSidecarClient{
+	client := &fakeSchedulerClient{
 		stream:   newFakeWorkItemStream(0),
 		helloErr: status.Error(codes.PermissionDenied, "forbidden"),
 	}

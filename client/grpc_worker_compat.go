@@ -9,6 +9,9 @@ import (
 
 // StartWorkItemListener preserves the original client API. New applications
 // should create a dedicated TaskHubGrpcWorker, ideally with its own connection.
+//
+// The listener borrows the client's connection, so it inherits the connection
+// ownership limitations documented on [NewTaskHubGrpcWorker].
 func (c *TaskHubGrpcClient) StartWorkItemListener(
 	ctx context.Context,
 	registry *task.TaskRegistry,

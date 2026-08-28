@@ -10,29 +10,28 @@ import (
 )
 
 func TestGrpcClientDefaultVersionAndExplicitUnversionedOverride(t *testing.T) {
-	sidecar := new(largePayloadSidecarClient)
+	scheduler := new(largePayloadSchedulerClient)
 	client := &TaskHubGrpcClient{
-		client:         sidecar,
+		client:         scheduler,
 		defaultVersion: "v2",
 	}
 
 	_, err := client.ScheduleNewOrchestration(context.Background(), "orchestration")
 	require.NoError(t, err)
-	require.Equal(t, "v2", sidecar.start.GetVersion().GetValue())
+	require.Equal(t, "v2", scheduler.start.GetVersion().GetValue())
 
 	_, err = client.ScheduleNewOrchestration(context.Background(), "orchestration", api.WithVersion(""))
 	require.NoError(t, err)
-	require.NotNil(t, sidecar.start.Version)
-	require.Empty(t, sidecar.start.GetVersion().GetValue())
+	require.NotNil(t, scheduler.start.Version)
+	require.Empty(t, scheduler.start.GetVersion().GetValue())
 }
 
 func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
 	tests := []struct {
-		name        string
-		action      api.CreateOrchestrationAction
-		allowLegacy bool
-		wantPolicy  bool
-		wantErr     bool
+		name       string
+		action     api.CreateOrchestrationAction
+		wantPolicy bool
+		wantErr    bool
 	}{
 		{
 			name:       "terminate maps to replaceable statuses",
@@ -45,15 +44,11 @@ func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
 			wantPolicy: false,
 		},
 		{
-			name:    "ignore fails closed for current wire",
+			// DTS reads the shared status field as a replacement policy, so
+			// IGNORE cannot be expressed on the wire and must fail closed.
+			name:    "ignore fails closed for the DTS wire contract",
 			action:  api.REUSE_ID_ACTION_IGNORE,
 			wantErr: true,
-		},
-		{
-			name:        "ignore is available for known legacy sidecars",
-			action:      api.REUSE_ID_ACTION_IGNORE,
-			allowLegacy: true,
-			wantPolicy:  true,
 		},
 	}
 
@@ -66,7 +61,7 @@ func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
 			})
 			require.NoError(t, configure(req, api.DefaultDataConverter()))
 
-			c := &TaskHubGrpcClient{allowLegacyIDReusePolicyWire: tt.allowLegacy}
+			c := &TaskHubGrpcClient{}
 			err := c.prepareOrchestrationIDReusePolicy(req)
 			if tt.wantErr {
 				require.ErrorIs(t, err, ErrUnsupportedOrchestrationIDReusePolicy)

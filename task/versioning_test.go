@@ -226,6 +226,45 @@ func TestAllowedUnversionedSystemOrchestratorBypassesStrictVersionMatch(t *testi
 	}
 }
 
+// TestAllowedUnversionedSystemActivityBypassesStrictVersionMatch covers the
+// activity half of the same contract: a system orchestration runs unversioned,
+// and an activity inherits its caller's version, so its work item arrives
+// unversioned and would otherwise be rejected by a strict worker.
+func TestAllowedUnversionedSystemActivityBypassesStrictVersionMatch(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddActivityN("SystemActivity", func(ActivityContext) (any, error) {
+		return "ok", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := helpers.NewTaskScheduledEvent(1, "SystemActivity", wrapperspb.String(""), nil, nil)
+	versioning := VersioningOptions{Version: "1.0", MatchStrategy: VersionMatchStrict}
+
+	rejected := NewTaskExecutor(registry, WithVersioning(versioning))
+	if _, err := rejected.ExecuteActivity(context.Background(), "system-instance", scheduled); err == nil {
+		t.Fatal("expected a strict version mismatch without the allow-list")
+	}
+
+	allowed := NewTaskExecutor(
+		registry,
+		WithVersioning(versioning),
+		WithUnversionedActivityNames("systemactivity"),
+	)
+	response, err := allowed.ExecuteActivity(context.Background(), "system-instance", scheduled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetTaskCompleted() == nil {
+		t.Fatalf("system activity did not complete: %#v", response)
+	}
+
+	// A versioned work item for the same name is still version-checked.
+	versionedScheduled := helpers.NewTaskScheduledEvent(2, "SystemActivity", wrapperspb.String("9.9"), nil, nil)
+	if _, err := allowed.ExecuteActivity(context.Background(), "system-instance", versionedScheduled); err == nil {
+		t.Fatal("expected a strict version mismatch for a versioned work item")
+	}
+}
+
 func TestSubOrchestrationOptionsAddTagsAndContextFields(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorN("parent", func(ctx *OrchestrationContext) (any, error) {

@@ -1038,6 +1038,59 @@ func TestDTSEmulatorSendEventReplay(t *testing.T) {
 	require.Equal(t, `"pong"`, receiver.SerializedOutput)
 }
 
+func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
+	const (
+		unit            = 2 * time.Second
+		delay           = 7 * unit
+		maximumInterval = 3 * unit
+		expectedTimers  = 3
+	)
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("DTSLongTimer", func(ctx *task.OrchestrationContext) (any, error) {
+		return nil, ctx.CreateTimer(delay).Await(nil)
+	}))
+	options := emulatorOptions(t)
+	options.MaximumTimerInterval = maximumInterval
+	logger := backend.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSLongTimer",
+		api.WithInstanceID(uniqueInstanceID("go-long-timer")),
+	)
+	require.NoError(t, err)
+	metadata, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+
+	history, err := managementClient.GetOrchestrationHistory(
+		ctx,
+		instanceID,
+		api.HistoryQuery{ExecutionID: metadata.ExecutionID},
+	)
+	require.NoError(t, err)
+	timerCount := 0
+	for _, event := range history.Events {
+		if event.Type == api.HistoryEventTimerCreated {
+			timerCount++
+		}
+	}
+	require.Equal(t, expectedTimers, timerCount)
+}
+
 func TestDTSEmulatorSubOrchestrationRetryAndContinueAsNew(t *testing.T) {
 	var attempts atomic.Int32
 	registry := task.NewTaskRegistry()

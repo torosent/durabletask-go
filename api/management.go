@@ -30,10 +30,9 @@ type OrchestrationQuery struct {
 	ContinuationToken     string
 	InstanceIDPrefix      string
 	FetchInputsAndOutputs bool
-	// Tags are exact-match filters. Embedded backends evaluate them in storage.
-	// The current gRPC wire contract lacks tag filters, so remote clients scan a
-	// bounded number of pages locally and can return a partial page with a
-	// continuation token.
+	// Tags are exact-match filters. The gRPC wire contract has no tag filter, so
+	// the client scans a bounded number of service pages locally and can return a
+	// partial page with a continuation token to resume from.
 	Tags map[string]string
 }
 

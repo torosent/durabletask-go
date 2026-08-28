@@ -30,6 +30,7 @@ type taskExecutor struct {
 	errorProperties          api.ErrorPropertiesProvider
 	converter                api.DataConverter
 	unversionedOrchestrators map[string]struct{}
+	unversionedActivities    map[string]struct{}
 }
 
 // TaskExecutorOption configures the in-memory task executor.
@@ -56,15 +57,37 @@ func WithVersioning(options VersioningOptions) TaskExecutorOption {
 // worker version matching when their work item explicitly selects no version.
 func WithUnversionedOrchestratorNames(names ...string) TaskExecutorOption {
 	return func(executor *taskExecutor) {
-		if executor.unversionedOrchestrators == nil {
-			executor.unversionedOrchestrators = make(map[string]struct{}, len(names))
-		}
-		for _, name := range names {
-			if name = strings.TrimSpace(name); name != "" {
-				executor.unversionedOrchestrators[strings.ToLower(name)] = struct{}{}
-			}
+		addUnversionedTaskNames(&executor.unversionedOrchestrators, names)
+	}
+}
+
+// WithUnversionedActivityNames allows named system activities to bypass worker
+// version matching when their work item explicitly selects no version. System
+// orchestrations run unversioned, and an activity inherits its caller's version,
+// so their activities are dispatched unversioned as well.
+func WithUnversionedActivityNames(names ...string) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		addUnversionedTaskNames(&executor.unversionedActivities, names)
+	}
+}
+
+func addUnversionedTaskNames(allowed *map[string]struct{}, names []string) {
+	if *allowed == nil {
+		*allowed = make(map[string]struct{}, len(names))
+	}
+	for _, name := range names {
+		if name = strings.TrimSpace(name); name != "" {
+			(*allowed)[strings.ToLower(name)] = struct{}{}
 		}
 	}
+}
+
+func allowsUnversionedTask(allowed map[string]struct{}, name, version string) bool {
+	if version != "" {
+		return false
+	}
+	_, ok := allowed[strings.ToLower(name)]
+	return ok
 }
 
 // WithErrorPropertiesProvider configures custom durable failure properties.
@@ -88,10 +111,22 @@ func WithOrchestratorNotFoundStrategy(strategy OrchestratorNotFoundStrategy) Tas
 	}
 }
 
-// WithOrchestrationOptions configures deterministic orchestration engine policies.
+// WithOrchestrationOptions configures deterministic orchestration engine
+// policies. It panics when MaximumTimerInterval is negative.
 func WithOrchestrationOptions(options OrchestrationOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
-		executor.orchestrationOptions = options
+		executor.orchestrationOptions = normalizeOrchestrationOptions(options)
+	}
+}
+
+// WithMaximumTimerInterval configures the maximum duration of one physical
+// durable timer action. Zero restores [DefaultMaximumTimerInterval]. A negative
+// interval panics when the option is applied.
+func WithMaximumTimerInterval(interval time.Duration) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		options := executor.orchestrationOptions
+		options.MaximumTimerInterval = interval
+		executor.orchestrationOptions = normalizeOrchestrationOptions(options)
 	}
 }
 
@@ -104,7 +139,7 @@ func WithLogger(logger *slog.Logger) TaskExecutorOption {
 	}
 }
 
-// WithMetricsHooks configures optional backend-neutral metric callbacks.
+// WithMetricsHooks configures optional transport-neutral metric callbacks.
 func WithMetricsHooks(hooks backend.MetricsHooks) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.metrics = hooks
@@ -122,9 +157,10 @@ func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 // NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
 func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
 	executor := &taskExecutor{
-		Registry:  registry,
-		logger:    slog.Default(),
-		converter: api.DefaultDataConverter(),
+		Registry:             registry,
+		orchestrationOptions: normalizeOrchestrationOptions(OrchestrationOptions{}),
+		logger:               slog.Default(),
+		converter:            api.DefaultDataConverter(),
 	}
 	for _, configure := range opts {
 		configure(executor)
@@ -139,7 +175,9 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 		// No clean way to deal with this other than to abandon it
 		return nil, fmt.Errorf("unexpected event type for ExecuteActivity: %v", e.EventType)
 	}
-	if versionErr := te.versioning.check(ts.GetVersion().GetValue()); versionErr != nil {
+	activityVersion := ts.GetVersion().GetValue()
+	if versionErr := te.versioning.check(activityVersion); versionErr != nil &&
+		!allowsUnversionedTask(te.unversionedActivities, ts.GetName(), activityVersion) {
 		if te.versioning.FailureStrategy == VersionFailureReject {
 			return nil, versionErr
 		}
@@ -218,12 +256,8 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 	started := startedEvent(oldEvents, newEvents)
 	name := started.GetName()
 	version := started.GetVersion().GetValue()
-	// Explicitly unversioned system orchestrators bypass worker version matching.
-	allowUnversioned := false
-	if version == "" {
-		_, allowUnversioned = te.unversionedOrchestrators[strings.ToLower(name)]
-	}
-	if versionErr := te.versioning.check(version); versionErr != nil && !allowUnversioned {
+	if versionErr := te.versioning.check(version); versionErr != nil &&
+		!allowsUnversionedTask(te.unversionedOrchestrators, name, version) {
 		if te.versioning.FailureStrategy == VersionFailureReject {
 			return nil, versionErr
 		}

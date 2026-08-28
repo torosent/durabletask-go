@@ -73,7 +73,16 @@ func (w *TaskHubGrpcWorker) receiveWorkItem(connection *grpcWorkerConnection) (*
 
 // recvBeforeSilenceTimeout receives one message from a server stream, canceling
 // the stream and reporting errSilentDisconnect if nothing arrives before the
-// configured silent disconnect timeout.
+// configured silent disconnect timeout. A message that is delivered
+// concurrently with the timeout is still returned: the stream is already
+// canceled and the following receive reports the disconnect, so the caller
+// never silently drops a delivered work item that the service considers
+// dispatched.
+//
+// A terminal error that races the timeout is only rewritten to
+// errSilentDisconnect when it is the cancellation the timer itself induced.
+// Any other status, such as Unauthenticated or PermissionDenied, is propagated
+// so a genuinely non-retryable failure is never masked as a retryable silence.
 func recvBeforeSilenceTimeout[T any](recv func() (T, error), cancelStream context.CancelFunc, timeout time.Duration) (T, error) {
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(timeout, func() {
@@ -81,12 +90,25 @@ func recvBeforeSilenceTimeout[T any](recv func() (T, error), cancelStream contex
 		close(timedOut)
 	})
 	message, err := recv()
-	if !timer.Stop() {
-		<-timedOut
-		var zero T
-		return zero, errSilentDisconnect
+	if timer.Stop() {
+		return message, err
 	}
-	return message, err
+	<-timedOut
+	if err == nil {
+		return message, nil
+	}
+	if !isStreamCancellation(err) {
+		return message, err
+	}
+	var zero T
+	return zero, errSilentDisconnect
+}
+
+// isStreamCancellation reports whether err is the context cancellation that
+// canceling the stream produces, as opposed to a status the service returned on
+// its own.
+func isStreamCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }
 
 func (w *TaskHubGrpcWorker) dispatchOrchestration(
@@ -187,7 +209,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		name, version, ok := orchestrationWorkItemIdentity(pastEvents, request.NewEvents)
 		if ok && !matchesWorkItemFilters(w.options.workItemFilters, true, name, version) {
 			w.logger.Warnf("%s: orchestration work item does not match configured filters; abandoning it", request.InstanceId)
-			_ = waitForRetry(ctx, w.options.reconnectBaseDelay)
+			_ = w.wait(ctx, w.options.reconnectBaseDelay)
 			w.abandonOrchestration(ctx, client, completionToken)
 			return
 		}
@@ -197,7 +219,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	var delayed backend.WorkItemAbandonDelayError
 	if errors.As(err, &delayed) {
 		w.logger.Warnf("%s: orchestration work item rejected; abandoning it: %v", request.InstanceId, err)
-		_ = waitForRetry(ctx, delayed.WorkItemAbandonDelay())
+		_ = w.wait(ctx, delayed.WorkItemAbandonDelay())
 		w.abandonOrchestration(ctx, client, completionToken)
 		return
 	}
@@ -317,7 +339,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 			request.Name,
 			request.TaskId,
 		)
-		_ = waitForRetry(ctx, w.options.reconnectBaseDelay)
+		_ = w.wait(ctx, w.options.reconnectBaseDelay)
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
@@ -340,7 +362,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 			request.TaskId,
 			err,
 		)
-		_ = waitForRetry(ctx, delayed.WorkItemAbandonDelay())
+		_ = w.wait(ctx, delayed.WorkItemAbandonDelay())
 		w.abandonActivity(ctx, client, completionToken)
 		return
 	}
@@ -606,23 +628,23 @@ func (w *TaskHubGrpcWorker) executeRPCWithRetry(
 		if attempt == w.options.transientRetryMaxAttempts {
 			break
 		}
-		if err := waitForRetry(ctx, w.retryDelay(attempt)); err != nil {
+		if err := w.wait(ctx, w.retryDelay(attempt)); err != nil {
 			return err
 		}
 	}
 	return fmt.Errorf("%s failed after %d attempts: %w", operation, w.options.transientRetryMaxAttempts, lastErr)
 }
 
+// retryDelay returns the deterministic delay before the given attempt. Delays
+// double from the configured base and never leave [base, max].
 func (w *TaskHubGrpcWorker) retryDelay(attempt int) time.Duration {
 	delay := w.options.transientRetryBaseDelay
-	for i := 1; i < attempt && delay < w.options.transientRetryMaxDelay; i++ {
-		if delay > w.options.transientRetryMaxDelay/2 {
-			return w.options.transientRetryMaxDelay
+	for i := 1; i < attempt; i++ {
+		next := doubleDurationBounded(delay, w.options.transientRetryMaxDelay)
+		if next == delay {
+			break
 		}
-		delay *= 2
-	}
-	if delay > w.options.transientRetryMaxDelay {
-		return w.options.transientRetryMaxDelay
+		delay = next
 	}
 	return delay
 }

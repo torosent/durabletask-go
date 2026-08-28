@@ -62,10 +62,34 @@ type AzureBlobStore struct {
 	compressionEnabled bool
 	maxPayloadBytes    int
 
-	containerMu         sync.Mutex
-	containerGeneration uint64
-	containerInit       chan struct{}
+	containerMu sync.Mutex
+	// containerGeneration is the initialization currently believed valid, or
+	// zero when the container still needs to be created. Generations are never
+	// reused, so a stale upload cannot invalidate a newer initialization.
+	containerGeneration     uint64
+	nextContainerGeneration uint64
+	containerInitDone       chan struct{}
+
+	// Narrow hooks stand in for the individual *azblob.Client calls and the
+	// backoff wait rather than for the client as a whole: azblob.Client is a
+	// concrete struct, so the only alternatives are an HTTP-level fake, which
+	// would test the SDK instead of this file, or a wrapper interface far wider
+	// than the three operations whose ordering and retry behavior matter here.
+	// Every hook is nil in production, where the real client is used.
+	createContainerHook func(ctx context.Context) error
+	uploadBlobHook      func(ctx context.Context, name string, body []byte, options *azblob.UploadBufferOptions) error
+	waitHook            func(ctx context.Context, d time.Duration) error
 }
+
+// Azure keeps a deleted container's name reserved until the delete finishes,
+// rejecting recreation with ContainerBeingDeleted for anywhere up to about
+// half a minute. Recreation therefore retries with a capped exponential
+// backoff instead of failing the payload write.
+const (
+	containerBeingDeletedAttempts       = 9
+	containerBeingDeletedInitialBackoff = 250 * time.Millisecond
+	containerBeingDeletedMaxBackoff     = 8 * time.Second
+)
 
 var (
 	_ api.LargePayloadStore              = (*AzureBlobStore)(nil)
@@ -217,7 +241,7 @@ func (s *AzureBlobStore) Store(ctx context.Context, payload []byte) (string, err
 		if err != nil {
 			return "", err
 		}
-		_, err = s.client.UploadBuffer(ctx, s.container, name, body, &azblob.UploadBufferOptions{
+		err = s.uploadBlob(ctx, name, body, &azblob.UploadBufferOptions{
 			HTTPHeaders: headers,
 			Metadata:    metadata,
 		})
@@ -354,38 +378,57 @@ func (s *AzureBlobStore) download(ctx context.Context, ref azureBlobReference) (
 	return payload, nil
 }
 
+// ensureContainer creates the payload container once and caches the result.
+// The returned generation identifies the initialization the caller relied on so
+// a later ContainerNotFound failure can invalidate exactly that generation.
 func (s *AzureBlobStore) ensureContainer(ctx context.Context) (uint64, error) {
-	s.containerMu.Lock()
-	if s.containerGeneration != 0 {
-		generation := s.containerGeneration
+	for {
+		s.containerMu.Lock()
+		if s.containerGeneration != 0 {
+			generation := s.containerGeneration
+			s.containerMu.Unlock()
+			return generation, nil
+		}
+		if done := s.containerInitDone; done != nil {
+			s.containerMu.Unlock()
+			// Checking ctx before the select is load bearing: when done is
+			// already closed, select would otherwise pick pseudo-randomly
+			// between the two ready cases and an already cancelled caller
+			// could still be reported as successful.
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			// Waiting is cancellable, but a waiter's cancellation must never
+			// cancel the in-flight initializer or the work it is creating for.
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-done:
+			}
+			continue
+		}
+		done := make(chan struct{})
+		s.containerInitDone = done
 		s.containerMu.Unlock()
+
+		err := s.createContainerWithRetry(ctx)
+
+		s.containerMu.Lock()
+		s.containerInitDone = nil
+		if err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
+			// A failed or cancelled initializer publishes no generation, so the
+			// next caller retries initialization with its own context.
+			s.containerMu.Unlock()
+			close(done)
+			return 0, fmt.Errorf("create Azure Blob payload container: %w", err)
+		}
+		s.nextContainerGeneration++
+		generation := s.nextContainerGeneration
+		s.containerGeneration = generation
+		s.containerMu.Unlock()
+		close(done)
 		return generation, nil
 	}
-	if done := s.containerInit; done != nil {
-		s.containerMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-done:
-			return s.ensureContainer(ctx)
-		}
-	}
-	done := make(chan struct{})
-	s.containerInit = done
-	s.containerMu.Unlock()
-
-	_, err := s.client.CreateContainer(ctx, s.container, nil)
-	s.containerMu.Lock()
-	s.containerInit = nil
-	close(done)
-	if err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
-		s.containerMu.Unlock()
-		return 0, fmt.Errorf("create Azure Blob payload container: %w", err)
-	}
-	s.containerGeneration++
-	generation := s.containerGeneration
-	s.containerMu.Unlock()
-	return generation, nil
 }
 
 func (s *AzureBlobStore) invalidateContainer(generation uint64) {
@@ -393,6 +436,62 @@ func (s *AzureBlobStore) invalidateContainer(generation uint64) {
 	defer s.containerMu.Unlock()
 	if s.containerGeneration == generation {
 		s.containerGeneration = 0
+	}
+}
+
+// createContainerWithRetry creates the container, waiting out an in-progress
+// delete of a container with the same name. Any other outcome, including
+// cancellation and ContainerAlreadyExists, is returned to the caller
+// unchanged on the first attempt.
+func (s *AzureBlobStore) createContainerWithRetry(ctx context.Context) error {
+	backoff := containerBeingDeletedInitialBackoff
+	for attempt := 1; ; attempt++ {
+		err := s.createContainer(ctx)
+		if attempt == containerBeingDeletedAttempts ||
+			!bloberror.HasCode(err, bloberror.ContainerBeingDeleted) {
+			return err
+		}
+		if waitErr := s.waitForRetry(ctx, backoff); waitErr != nil {
+			return waitErr
+		}
+		backoff = min(backoff*2, containerBeingDeletedMaxBackoff)
+	}
+}
+
+func (s *AzureBlobStore) createContainer(ctx context.Context) error {
+	if s.createContainerHook != nil {
+		return s.createContainerHook(ctx)
+	}
+	_, err := s.client.CreateContainer(ctx, s.container, nil)
+	return err
+}
+
+func (s *AzureBlobStore) uploadBlob(
+	ctx context.Context,
+	name string,
+	body []byte,
+	options *azblob.UploadBufferOptions,
+) error {
+	if s.uploadBlobHook != nil {
+		return s.uploadBlobHook(ctx, name, body, options)
+	}
+	_, err := s.client.UploadBuffer(ctx, s.container, name, body, options)
+	return err
+}
+
+// waitForRetry waits for d, reporting cancellation instead of blocking through
+// it.
+func (s *AzureBlobStore) waitForRetry(ctx context.Context, d time.Duration) error {
+	if s.waitHook != nil {
+		return s.waitHook(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

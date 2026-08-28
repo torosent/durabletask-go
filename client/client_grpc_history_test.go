@@ -16,14 +16,14 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-type historySidecarClient struct {
+type historySchedulerClient struct {
 	protos.TaskHubSidecarServiceClient
 	request *protos.StreamInstanceHistoryRequest
 	stream  protos.TaskHubSidecarService_StreamInstanceHistoryClient
 	err     error
 }
 
-func (c *historySidecarClient) StreamInstanceHistory(
+func (c *historySchedulerClient) StreamInstanceHistory(
 	_ context.Context,
 	request *protos.StreamInstanceHistoryRequest,
 	_ ...grpc.CallOption,
@@ -52,7 +52,7 @@ func (s *historyClientStream) Recv() (*protos.HistoryChunk, error) {
 }
 
 func TestTaskHubGrpcClientStreamsHistoryInOrder(t *testing.T) {
-	sidecar := &historySidecarClient{stream: &historyClientStream{
+	scheduler := &historySchedulerClient{stream: &historyClientStream{
 		chunks: []*protos.HistoryChunk{
 			{Events: []*protos.HistoryEvent{historyGenericEvent(1, `"one"`)}},
 			{},
@@ -60,7 +60,7 @@ func TestTaskHubGrpcClientStreamsHistoryInOrder(t *testing.T) {
 		},
 	}}
 	client := &TaskHubGrpcClient{
-		client:    sidecar,
+		client:    scheduler,
 		logger:    backend.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
@@ -78,21 +78,21 @@ func TestTaskHubGrpcClientStreamsHistoryInOrder(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, []string{"one", "two"}, values)
-	require.Equal(t, "instance", sidecar.request.InstanceId)
-	require.Equal(t, "execution", sidecar.request.ExecutionId.GetValue())
-	require.False(t, sidecar.request.ForWorkItemProcessing)
+	require.Equal(t, "instance", scheduler.request.InstanceId)
+	require.Equal(t, "execution", scheduler.request.ExecutionId.GetValue())
+	require.False(t, scheduler.request.ForWorkItemProcessing)
 }
 
 func TestTaskHubGrpcClientHistoryLimitAndErrors(t *testing.T) {
 	tests := []struct {
-		name     string
-		sidecar  *historySidecarClient
-		query    api.HistoryQuery
-		expected error
+		name      string
+		scheduler *historySchedulerClient
+		query     api.HistoryQuery
+		expected  error
 	}{
 		{
 			name: "limit",
-			sidecar: &historySidecarClient{stream: &historyClientStream{chunks: []*protos.HistoryChunk{
+			scheduler: &historySchedulerClient{stream: &historyClientStream{chunks: []*protos.HistoryChunk{
 				{Events: []*protos.HistoryEvent{historyGenericEvent(1, "one"), historyGenericEvent(2, "two")}},
 			}}},
 			query:    api.HistoryQuery{MaxEvents: 1},
@@ -100,27 +100,27 @@ func TestTaskHubGrpcClientHistoryLimitAndErrors(t *testing.T) {
 		},
 		{
 			name: "byte limit",
-			sidecar: &historySidecarClient{stream: &historyClientStream{chunks: []*protos.HistoryChunk{
+			scheduler: &historySchedulerClient{stream: &historyClientStream{chunks: []*protos.HistoryChunk{
 				{Events: []*protos.HistoryEvent{historyGenericEvent(1, "payload")}},
 			}}},
 			query:    api.HistoryQuery{MaxBytes: 1},
 			expected: api.ErrHistoryLimitExceeded,
 		},
 		{
-			name:     "not found",
-			sidecar:  &historySidecarClient{err: status.Error(codes.NotFound, "missing")},
-			expected: api.ErrInstanceNotFound,
+			name:      "not found",
+			scheduler: &historySchedulerClient{err: status.Error(codes.NotFound, "missing")},
+			expected:  api.ErrInstanceNotFound,
 		},
 		{
-			name:     "unimplemented",
-			sidecar:  &historySidecarClient{err: status.Error(codes.Unimplemented, "unsupported")},
-			expected: api.ErrFeatureNotSupported,
+			name:      "unimplemented",
+			scheduler: &historySchedulerClient{err: status.Error(codes.Unimplemented, "unsupported")},
+			expected:  api.ErrFeatureNotSupported,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			client := &TaskHubGrpcClient{
-				client:    test.sidecar,
+				client:    test.scheduler,
 				logger:    backend.DefaultLogger(),
 				converter: api.DefaultDataConverter(),
 			}
@@ -132,7 +132,7 @@ func TestTaskHubGrpcClientHistoryLimitAndErrors(t *testing.T) {
 
 func TestTaskHubGrpcClientHistoryValidationAndCallbackError(t *testing.T) {
 	client := &TaskHubGrpcClient{
-		client:    &historySidecarClient{},
+		client:    &historySchedulerClient{},
 		logger:    backend.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
@@ -145,10 +145,10 @@ func TestTaskHubGrpcClientHistoryValidationAndCallbackError(t *testing.T) {
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 
 	callbackErr := errors.New("stop")
-	sidecar := &historySidecarClient{stream: &historyClientStream{
+	scheduler := &historySchedulerClient{stream: &historyClientStream{
 		chunks: []*protos.HistoryChunk{{Events: []*protos.HistoryEvent{historyGenericEvent(1, "one")}}},
 	}}
-	client.client = sidecar
+	client.client = scheduler
 	err = client.StreamOrchestrationHistory(
 		context.Background(),
 		"instance",
@@ -161,11 +161,11 @@ func TestTaskHubGrpcClientHistoryValidationAndCallbackError(t *testing.T) {
 func TestTaskHubGrpcClientHistoryMapsCanceledReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	sidecar := &historySidecarClient{stream: &historyClientStream{
+	scheduler := &historySchedulerClient{stream: &historyClientStream{
 		err: status.Error(codes.Canceled, "canceled"),
 	}}
 	client := &TaskHubGrpcClient{
-		client:    sidecar,
+		client:    scheduler,
 		logger:    backend.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
