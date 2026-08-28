@@ -90,6 +90,8 @@ func TestNewOptionsFromConnectionString(t *testing.T) {
 			require.Equal(t, tt.wantTenantID, options.TenantID)
 			require.Equal(t, tt.wantTokenFile, options.TokenFilePath)
 			require.Equal(t, tt.wantTenants, options.AdditionallyAllowedTenants)
+			require.Equal(t, 5, options.ChannelRecreateFailureThreshold)
+			require.Equal(t, 30*time.Second, options.ChannelRecreateMinInterval)
 		})
 	}
 }
@@ -158,4 +160,10 @@ func TestOptionsValidateRejectsNegativeMaximumTimerInterval(t *testing.T) {
 	options := NewOptions("scheduler.example.com", "hub")
 	options.MaximumTimerInterval = -time.Second
 	require.ErrorContains(t, options.Validate(), "maximum timer interval")
+}
+
+func TestOptionsValidateRejectsNegativeChannelRecreateInterval(t *testing.T) {
+	options := NewOptions("scheduler.example.com", "hub")
+	options.ChannelRecreateMinInterval = -time.Second
+	require.ErrorContains(t, options.Validate(), "channel recreate minimum interval")
 }
