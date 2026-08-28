@@ -6,8 +6,8 @@
 // plugging in a custom storage backend: DTS owns durable state, dispatch, and
 // recovery. What remains here is only the small set of contracts those three
 // pieces need to talk to each other — a logger, metric hooks, the executor
-// interface, orchestration runtime-state and history helpers, entity batch
-// conversion, and the error sentinels used for gRPC status mapping.
+// interface, the history event alias, entity batch conversion, and the error
+// sentinels used for gRPC status mapping.
 package backend
 
 import (
