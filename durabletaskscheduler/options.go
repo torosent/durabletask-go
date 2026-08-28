@@ -13,6 +13,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/task"
+	"google.golang.org/grpc"
 )
 
 const DefaultResourceID = "https://durabletask.io"
@@ -60,6 +61,20 @@ type Options struct {
 	// timers are split deterministically. Zero uses the three-day default.
 	MaximumTimerInterval time.Duration
 
+	// ChannelRecreateFailureThreshold controls how many consecutive transport
+	// failures cause the owned management client to create a new gRPC channel.
+	// A non-positive value disables recreation. NewOptions defaults to 5.
+	ChannelRecreateFailureThreshold int
+
+	// ChannelRecreateMinInterval limits how often the owned management client
+	// attempts channel recreation. NewOptions defaults to 30 seconds.
+	ChannelRecreateMinInterval time.Duration
+
+	// UnaryInterceptors and StreamInterceptors are applied in order to every
+	// gRPC channel created for clients and workers, including replacements.
+	UnaryInterceptors  []grpc.UnaryClientInterceptor
+	StreamInterceptors []grpc.StreamClientInterceptor
+
 	// LargePayloads enables external payload references for clients and workers.
 	LargePayloads *api.LargePayloadOptions
 
@@ -75,12 +90,14 @@ type Options struct {
 
 func NewOptions(endpointAddress, taskHubName string) *Options {
 	return &Options{
-		EndpointAddress:      endpointAddress,
-		TaskHubName:          taskHubName,
-		Authentication:       AuthenticationDefaultAzure,
-		ResourceID:           DefaultResourceID,
-		HelloTimeout:         30 * time.Second,
-		MaximumTimerInterval: task.DefaultMaximumTimerInterval,
+		EndpointAddress:                 endpointAddress,
+		TaskHubName:                     taskHubName,
+		Authentication:                  AuthenticationDefaultAzure,
+		ResourceID:                      DefaultResourceID,
+		HelloTimeout:                    30 * time.Second,
+		MaximumTimerInterval:            task.DefaultMaximumTimerInterval,
+		ChannelRecreateFailureThreshold: 5,
+		ChannelRecreateMinInterval:      30 * time.Second,
 	}
 }
 
@@ -203,6 +220,9 @@ func (o *Options) Validate() error {
 	}
 	if o.MaximumTimerInterval < 0 {
 		return fmt.Errorf("DTS maximum timer interval cannot be negative")
+	}
+	if o.ChannelRecreateMinInterval < 0 {
+		return fmt.Errorf("DTS channel recreate minimum interval cannot be negative")
 	}
 	if _, err := api.NormalizeLargePayloadOptions(o.LargePayloads); err != nil {
 		return fmt.Errorf("invalid DTS large payload options: %w", err)

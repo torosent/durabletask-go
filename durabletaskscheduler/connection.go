@@ -153,6 +153,8 @@ func prepareOptions(options *Options) (Options, error) {
 	}
 	prepared := *options
 	prepared.AdditionallyAllowedTenants = slices.Clone(options.AdditionallyAllowedTenants)
+	prepared.UnaryInterceptors = slices.Clone(options.UnaryInterceptors)
+	prepared.StreamInterceptors = slices.Clone(options.StreamInterceptors)
 	if options.Versioning != nil {
 		versioning := *options.Versioning
 		prepared.Versioning = &versioning
@@ -227,6 +229,12 @@ func connect(
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithPerRPCCredentials(perRPCCredentials),
+	}
+	if len(options.UnaryInterceptors) > 0 {
+		dialOptions = append(dialOptions, grpc.WithChainUnaryInterceptor(options.UnaryInterceptors...))
+	}
+	if len(options.StreamInterceptors) > 0 {
+		dialOptions = append(dialOptions, grpc.WithChainStreamInterceptor(options.StreamInterceptors...))
 	}
 	if role == clientRole {
 		dialOptions = append(dialOptions, grpc.WithDefaultServiceConfig(retryServiceConfig))

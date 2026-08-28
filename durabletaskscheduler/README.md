@@ -29,6 +29,17 @@ keys include `ClientID`, `TenantID`, `TokenFilePath`, and
 `http://` endpoints are accepted only with `Authentication=None`.
 
 `NewClient` creates and owns a management connection; call `Close` when done.
+After five consecutive `Unavailable` responses (or unexpected unary
+`DeadlineExceeded` responses), it recreates the channel with a 30-second
+minimum interval. Successful and application-level responses reset the
+counter, while expected deadlines from instance start/completion long polls do
+not count. Configure the thresholds with
+`Options.ChannelRecreateFailureThreshold` and
+`Options.ChannelRecreateMinInterval`. Authentication, interceptors, large
+payload settings, and data conversion are preserved across replacements.
+
+`client.NewTaskHubGrpcClient` remains the lower-level borrowed-connection API:
+it never recreates or closes its caller-supplied `grpc.ClientConnInterface`.
 `NewWorker` creates a separate worker with its own connection factory. The
 worker recreates channels after transient disconnects and closes retired
 channels only after their in-flight completions have drained.

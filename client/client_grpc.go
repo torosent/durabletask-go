@@ -77,8 +77,9 @@ func WithDataConverter(converter api.DataConverter) TaskHubGrpcClientOption {
 	}
 }
 
-// NewTaskHubGrpcClient creates a client that can be used to manage orchestrations over a gRPC connection.
-// The gRPC connection must be to a task hub worker that understands the Durable Task gRPC protocol.
+// NewTaskHubGrpcClient creates a client that can be used to manage orchestrations over a borrowed gRPC connection.
+// The caller retains ownership of the connection; this client neither closes nor recreates it. DTS applications that
+// want an owned, resilient management channel should use durabletaskscheduler.NewClient.
 func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
 	c := &TaskHubGrpcClient{
 		client:     protos.NewTaskHubSidecarServiceClient(cc),

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Azure Blob large-payload storage with production Azure SDK configuration, gzip support, bounded and validated reads, legacy `blob:v1` reads, and interoperable self-describing .NET `blob:v2` tokens.
 - Added DTS recurring interval schedules with create/get/list and per-schedule describe, update, pause, resume, and delete operations, durable execution-token state, worker registration/capability helpers, versions, tags, context, retries, and converter-aware inputs.
 - Added deterministic long-timer splitting with a configurable three-day default across embedded, generic gRPC, and DTS workers.
+- Added failure-threshold-based gRPC channel recreation for the owned DTS management client, with long-poll deadline exemptions and in-flight protection.
 
 ### Changed
 
