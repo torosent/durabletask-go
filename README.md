@@ -303,6 +303,11 @@ func ExternalEventOrchestrator(ctx *task.OrchestrationContext) (any, error) {
 
 Sending an event to a waiting orchestration can be done using the `RaiseEvent` method of the task hub client. These events are durably buffered in the orchestration state and are consumed as soon as the target orchestration calls `WaitForSingleEvent` with a matching event name. The following code shows how to use the `RaiseEvent` method to send an event with a payload to a running orchestration. See [Managing local orchestrations](#managing-local-orchestrations) for more information on how to interact with local orchestrations in Go.
 
+When multiple live waits use the same event name, the newest waiter receives
+the next event (LIFO), matching the Durable Task .NET replay contract. Events
+that arrived before any waiter remain buffered and are consumed in arrival
+order (FIFO).
+
 ```go
 id, _ := client.ScheduleNewOrchestration(ctx, ExternalEventOrchestrator)
 
