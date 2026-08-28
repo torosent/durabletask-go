@@ -186,9 +186,7 @@ self-describing `blob:v2` tokens as the .NET SDK.
 
 > You can find code samples in the [samples](./samples/) directory.
 > Each one connects to the task hub named by `DTS_CONNECTION_STRING`; to run
-> them, set that variable and run `go run ./samples/<name>`. The
-> [`azurefunctions`](./samples/azurefunctions) sample is the exception: it is an
-> Azure Functions custom handler, hosted by the Durable Functions extension.
+> them, set that variable and run `go run ./samples/<name>`.
 > [`exporthistory`](./samples/exporthistory) also requires
 > `EXPORT_STORAGE_CONNECTION_STRING` and optionally accepts `EXPORT_CONTAINER`.
 
