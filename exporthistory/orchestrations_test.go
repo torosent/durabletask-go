@@ -8,6 +8,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
@@ -97,12 +98,14 @@ func (d *orchestrationDriver) foldActions(
 	d.completion = nil
 	d.continuedAsNew = false
 
+	started := latestExecutionStarted(d.t, history)
 	for _, action := range actions {
 		switch {
 		case action.GetScheduleTask() != nil:
 			scheduled := action.GetScheduleTask()
 			event := helpers.NewTaskScheduledEvent(
 				action.GetId(), scheduled.GetName(), scheduled.GetVersion(), scheduled.GetInput(), nil)
+			event.GetTaskScheduled().Tags = contextprop.Clone(scheduled.GetTags())
 			d.newEvents = append(d.newEvents, event)
 			d.pendingTasks = append(d.pendingTasks, event)
 
@@ -114,14 +117,14 @@ func (d *orchestrationDriver) foldActions(
 			d.pendingTimers = append(d.pendingTimers, helpers.NewTimerFiredEvent(action.GetId(), fireAt, nil))
 
 		case action.GetSendEntityMessage().GetEntityOperationCalled() != nil:
-			d.foldEntityCall(action)
+			d.foldEntityCall(action, started)
 
 		case action.GetCompleteOrchestration() != nil:
 			complete := action.GetCompleteOrchestration()
 			d.completion = complete
 			if complete.GetOrchestrationStatus() == protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW {
 				d.continuedAsNew = true
-				d.restart(history, complete)
+				d.restart(started, complete)
 				return
 			}
 			d.newEvents = append(d.newEvents, &protos.HistoryEvent{
@@ -142,20 +145,39 @@ func (d *orchestrationDriver) foldActions(
 	}
 }
 
+// latestExecutionStarted returns the start event of the execution the next turn
+// belongs to, which is the last one in history after any ContinueAsNew.
+func latestExecutionStarted(t *testing.T, history []*protos.HistoryEvent) *protos.ExecutionStartedEvent {
+	t.Helper()
+	var started *protos.ExecutionStartedEvent
+	for _, event := range history {
+		if candidate := event.GetExecutionStarted(); candidate != nil {
+			started = candidate
+		}
+	}
+	require.NotNil(t, started, "history has no ExecutionStarted event")
+	return started
+}
+
 // foldEntityCall mirrors how the scheduler splits an entity call: the caller's
 // history keeps the target instance ID, while the message delivered to the entity
-// drops it and carries the caller's instance ID instead.
-func (d *orchestrationDriver) foldEntityCall(action *protos.OrchestratorAction) {
+// drops it and carries the calling execution's identity instead.
+func (d *orchestrationDriver) foldEntityCall(
+	action *protos.OrchestratorAction,
+	started *protos.ExecutionStartedEvent,
+) {
 	d.t.Helper()
 	historyValue := proto.Clone(
 		action.GetSendEntityMessage().GetEntityOperationCalled()).(*protos.EntityOperationCalledEvent)
 	target := historyValue.GetTargetInstanceId().GetValue()
+	require.NotEmpty(d.t, target, "entity call has no target instance ID")
 	historyValue.ParentInstanceId = nil
 	historyValue.ParentExecutionId = nil
 
 	messageValue := proto.Clone(historyValue).(*protos.EntityOperationCalledEvent)
 	messageValue.TargetInstanceId = nil
 	messageValue.ParentInstanceId = wrapperspb.String(string(d.instanceID))
+	messageValue.ParentExecutionId = started.GetOrchestrationInstance().GetExecutionId()
 
 	timestamp := timestamppb.Now()
 	d.newEvents = append(d.newEvents, &protos.HistoryEvent{
@@ -175,35 +197,36 @@ func (d *orchestrationDriver) foldEntityCall(action *protos.OrchestratorAction) 
 
 // restart truncates history the way the scheduler does for ContinueAsNew: the new
 // execution starts from a fresh start event carrying the previous execution's
-// identity, the new input, and any carryover events.
+// identity, the new input, and any carryover events. Work scheduled earlier in
+// the same action batch does not survive the execution boundary.
 func (d *orchestrationDriver) restart(
-	history []*protos.HistoryEvent,
+	started *protos.ExecutionStartedEvent,
 	complete *protos.CompleteOrchestrationAction,
 ) {
 	d.t.Helper()
-	var started *protos.ExecutionStartedEvent
-	for _, event := range history {
-		if candidate := event.GetExecutionStarted(); candidate != nil {
-			started = candidate
-		}
-	}
-	require.NotNil(d.t, started, "history has no ExecutionStarted event")
+	d.pendingTasks = nil
+	d.pendingTimers = nil
+	d.createdTimers = nil
+	d.pendingEntities = nil
 
 	version := started.GetVersion()
 	if complete.GetNewVersion() != nil {
 		version = complete.GetNewVersion()
 	}
+	startEvent := helpers.NewExecutionStartedEvent(
+		started.GetName(),
+		string(d.instanceID),
+		complete.GetResult(),
+		started.GetParentInstance(),
+		started.GetParentTraceContext(),
+		nil,
+		version)
+	startEvent.GetExecutionStarted().Tags = contextprop.Clone(started.GetTags())
+
 	d.oldEvents = nil
 	d.newEvents = append([]*protos.HistoryEvent{
 		helpers.NewOrchestratorStartedEvent(),
-		helpers.NewExecutionStartedEvent(
-			started.GetName(),
-			string(d.instanceID),
-			complete.GetResult(),
-			started.GetParentInstance(),
-			started.GetParentTraceContext(),
-			nil,
-			version),
+		startEvent,
 	}, complete.GetCarryoverEvents()...)
 }
 
@@ -327,8 +350,8 @@ func (d *orchestrationDriver) activityInput(name string, target any) {
 }
 
 // assertDelay compares a durable timer delay allowing for the small skew between
-// the orchestrator's deterministic clock and the timestamp the runtime state
-// stamps on the emitted history event.
+// the orchestrator's deterministic clock and the timestamp the driver stamps on
+// the emitted TimerCreated event.
 func assertDelay(t *testing.T, expected, actual time.Duration) {
 	t.Helper()
 	assert.InDelta(t, expected.Seconds(), actual.Seconds(), 1, "expected a %s timer", expected)
