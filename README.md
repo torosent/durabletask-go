@@ -419,13 +419,20 @@ mockery --dir ./backend --name="^Backend|^Executor|^TaskWorker" --output ./tests
 
 ## Running tests
 
-All automated tests are under `./tests`. A separate test package hierarchy was chosen intentionally to prioritize [black box testing](https://en.wikipedia.org/wiki/Black-box_testing). This strategy also makes it easier to catch accidental breaking API changes.
+Package tests live alongside the code they exercise, while the `./tests`
+hierarchy provides [black box testing](https://en.wikipedia.org/wiki/Black-box_testing)
+that helps catch accidental breaking API changes.
 
-Run tests with the following command.
+Run the complete repository test suite with the following command.
 
 ```bash
-go test ./tests/... -coverpkg ./api,./task,./client,./backend/...,./internal/helpers
+go test ./... -count=1 -coverpkg=./api,./task,./client,./backend/...,./durabletaskscheduler,./payload,./internal/analysis/orchestratorgo,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
 ```
+
+Postgres, Durable Task Scheduler emulator, and Azurite tests are enabled when
+their documented environment variables and local services are available. PR
+validation runs the complete suite against all three services and repeats it
+with the race detector on the latest supported Go version.
 
 ### Checking orchestrator goroutines
 

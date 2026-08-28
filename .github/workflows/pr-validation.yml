@@ -24,9 +24,19 @@ jobs:
   # This workflow contains a single job called "build"
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [ '1.24.x', '1.23.x' ]
+        include:
+          - go-version: '1.23.x'
+            test-kind: coverage
+            test-command: >-
+              go test ./... -count=1 -timeout=20m
+              -coverpkg=./api,./task,./client,./backend/...,./durabletaskscheduler,./payload,./internal/analysis/orchestratorgo,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
+          - go-version: '1.24.x'
+            test-kind: race
+            test-command: go test -race ./... -count=1 -timeout=30m
 
     # Boot up a local, clean postgres instance for the postgres tests
     services:
@@ -55,7 +65,12 @@ jobs:
         ports:
           - 8080:8080
           - 8082:8082
-        
+
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+        ports:
+          - 10000:10000
+
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -94,12 +109,18 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
 
-      - name: Wait for DTS emulator
-        run: curl --fail --retry 30 --retry-delay 1 --retry-all-errors http://127.0.0.1:8082/
+      - name: Wait for service emulators
+        run: |
+          curl --fail --retry 30 --retry-delay 1 --retry-all-errors http://127.0.0.1:8082/
+          timeout 60 bash -c 'until </dev/tcp/127.0.0.1/8080; do sleep 1; done'
+          timeout 60 bash -c 'until </dev/tcp/127.0.0.1/10000; do sleep 1; done'
 
-      - name: Run integration tests
+      # The race run also executes every test on the latest Go version, so only
+      # the minimum supported Go version needs a separate non-race execution.
+      - name: Run full repository ${{ matrix.test-kind }} tests
         env:
           POSTGRES_ENABLED: "true"
           DTS_EMULATOR_ENDPOINT: "http://127.0.0.1:8080"
           DTS_TASK_HUB: "default"
-        run: go test ./tests/... -coverpkg ./api,./task,./client,./backend/...,./internal/helpers
+          AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<azurite-account-key>;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+        run: ${{ matrix.test-command }}
