@@ -30,7 +30,9 @@ Go orchestrations and activities to Durable Task Scheduler (DTS) without
 pretending that the remote service is a local storage backend. It provides
 validated connection-string configuration, Azure token credentials, separately
 owned management and worker connections, resilient worker streaming, and
-environment-gated emulator tests.
+environment-gated emulator tests. DTS management clients also expose
+API-owned orchestration history and recurring interval schedules without
+leaking generated protobuf messages.
 
 See the [DTS transport guide and feature matrix](./durabletaskscheduler/README.md)
 and the [environment-driven sample](./samples/durabletaskscheduler).
@@ -108,9 +110,13 @@ See the complete [durable entities sample](./samples/entity).
 
 Advanced management includes bounded queries and ID listing, restart/rewind,
 batch and filtered purge, immediate termination, tags, and explicit worker
-capabilities. Large payloads can be externalized without a cloud dependency by
-configuring an `api.LargePayloadOptions` store/resolver on DTS clients/workers
-or by wrapping an embedded backend with `backend.NewLargePayloadBackend`.
+capabilities. History can be buffered with a validated event cap or consumed
+incrementally with `StreamOrchestrationHistory`. Large payloads can be
+externalized without a cloud dependency by configuring an
+`api.LargePayloadOptions` store/resolver on DTS clients/workers or by wrapping
+an embedded backend with `backend.NewLargePayloadBackend`. The `payload`
+package also includes production Azure Blob support that emits the same
+self-describing `blob:v2` tokens as the .NET SDK.
 Destructive task-hub lifecycle RPCs on an embedded gRPC server require the
 explicit `backend.WithTaskHubLifecycleManagement()` executor option.
 

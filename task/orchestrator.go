@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -95,7 +96,9 @@ type callSubOrchestratorOptions struct {
 	rawInput   *wrapperspb.StringValue
 	version    *wrapperspb.StringValue
 
-	retryPolicy *RetryPolicy
+	retryPolicy   *RetryPolicy
+	tags          map[string]string
+	contextFields api.ContextFields
 }
 
 func (options *callSubOrchestratorOptions) versionOrDefault(defaultVersion string) *wrapperspb.StringValue {
@@ -108,8 +111,8 @@ func (options *callSubOrchestratorOptions) versionOrDefault(defaultVersion strin
 	return wrapperspb.String(defaultVersion)
 }
 
-// subOrchestratorOption is a functional option type for the CallSubOrchestrator orchestrator method.
-type subOrchestratorOption func(*callSubOrchestratorOptions, api.DataConverter) error
+// SubOrchestratorOption configures [OrchestrationContext.CallSubOrchestrator].
+type SubOrchestratorOption func(*callSubOrchestratorOptions, api.DataConverter) error
 
 // ContinueAsNewOption is a functional option type for the ContinueAsNew orchestrator method.
 type ContinueAsNewOption func(*OrchestrationContext)
@@ -135,7 +138,7 @@ func WithContinueAsNewVersion(version string) ContinueAsNewOption {
 
 // WithSubOrchestratorInput is a functional option type for the CallSubOrchestrator
 // orchestrator method that serializes an input value with the configured converter.
-func WithSubOrchestratorInput(input any) subOrchestratorOption {
+func WithSubOrchestratorInput(input any) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, converter api.DataConverter) error {
 		bytes, err := marshalData(converter, input)
 		if err != nil {
@@ -148,7 +151,7 @@ func WithSubOrchestratorInput(input any) subOrchestratorOption {
 
 // WithRawSubOrchestratorInput is a functional option type for the CallSubOrchestrator
 // orchestrator method that takes a raw input value.
-func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
+func WithRawSubOrchestratorInput(input string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.rawInput = wrapperspb.String(input)
 		return nil
@@ -157,7 +160,7 @@ func WithRawSubOrchestratorInput(input string) subOrchestratorOption {
 
 // WithSubOrchestrationInstanceID is a functional option type for the CallSubOrchestrator
 // orchestrator method that specifies the instance ID of the sub-orchestration.
-func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
+func WithSubOrchestrationInstanceID(instanceID string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.instanceID = instanceID
 		return nil
@@ -165,14 +168,57 @@ func WithSubOrchestrationInstanceID(instanceID string) subOrchestratorOption {
 }
 
 // WithSubOrchestrationVersion configures the sub-orchestration version.
-func WithSubOrchestrationVersion(version string) subOrchestratorOption {
+func WithSubOrchestrationVersion(version string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
 		opts.version = wrapperspb.String(version)
 		return nil
 	}
 }
 
-func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) subOrchestratorOption {
+// WithSubOrchestrationTags adds user tags to a sub-orchestration.
+func WithSubOrchestrationTags(tags map[string]string) SubOrchestratorOption {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
+		for key := range tags {
+			if key == "" {
+				return errors.New("sub-orchestration tag key cannot be empty")
+			}
+			if err := checkUnreservedKey("tag", key); err != nil {
+				return err
+			}
+		}
+		opts.tags = maps.Clone(tags)
+		return nil
+	}
+}
+
+// WithSubOrchestrationContextFields adds immutable context fields to a
+// sub-orchestration.
+func WithSubOrchestrationContextFields(fields api.ContextFields) SubOrchestratorOption {
+	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
+		for key := range fields {
+			if key == "" {
+				return errors.New("sub-orchestration context field key cannot be empty")
+			}
+			if err := checkUnreservedKey("context field", key); err != nil {
+				return err
+			}
+		}
+		opts.contextFields = maps.Clone(fields)
+		return nil
+	}
+}
+
+// checkUnreservedKey rejects caller-supplied keys that collide with the
+// reserved prefixes used to carry orchestration context on the wire.
+func checkUnreservedKey(kind, key string) error {
+	if strings.HasPrefix(key, api.ReservedContextFieldPrefix) ||
+		strings.HasPrefix(key, tagcodec.UserTagPrefix) {
+		return fmt.Errorf("sub-orchestration %s %q uses a reserved prefix", kind, key)
+	}
+	return nil
+}
+
+func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) SubOrchestratorOption {
 	return func(opt *callSubOrchestratorOptions, _ api.DataConverter) error {
 		if policy == nil {
 			return nil
@@ -644,7 +690,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 	return task
 }
 
-func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...subOrchestratorOption) Task {
+func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...SubOrchestratorOption) Task {
 	engine := ctx.engineContext()
 	if engine.criticalSectionID != "" {
 		return ctx.newFailedTask(engine, fmt.Errorf("sub-orchestrations cannot be started while holding entity locks"))
@@ -695,8 +741,8 @@ func (ctx *OrchestrationContext) internalCallSubOrchestrator(
 			Version:          ctx.Version,
 			ParentInstanceID: ctx.parentInstanceID,
 		},
-		ctx.contextFields,
-		ctx.orchestrationTags,
+		mergeStringMaps(ctx.contextFields, options.contextFields),
+		mergeStringMaps(ctx.orchestrationTags, options.tags),
 	)
 	if createSubOrchestrationAction.GetCreateSubOrchestration().GetInstanceId() == "" {
 		createSubOrchestrationAction.GetCreateSubOrchestration().InstanceId = fmt.Sprintf(
@@ -1092,7 +1138,7 @@ func (ctx *OrchestrationContext) onExecutionStarted(es *protos.ExecutionStartedE
 	ctx.Version = es.GetVersion().GetValue()
 	ctx.executionID = es.GetOrchestrationInstance().GetExecutionId().GetValue()
 	_, fields := contextprop.Decode(es.GetTags())
-	ctx.contextFields = mergeContextFields(ctx.contextFields, fields)
+	ctx.contextFields = mergeStringMaps(ctx.contextFields, fields)
 	ctx.orchestrationTags = tagcodec.DecodeUserTagsOrPlain(es.GetTags())
 	if parent := es.GetParentInstance(); parent != nil {
 		ctx.parentInstanceID = api.InstanceID(parent.GetOrchestrationInstance().GetInstanceId())

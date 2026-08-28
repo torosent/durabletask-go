@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"runtime"
 	"slices"
 	"strings"
@@ -82,6 +83,7 @@ type taskHubGrpcWorkerOptions struct {
 	autoWorkItemFilters         bool
 	largePayloads               *api.LargePayloadOptions
 	converter                   api.DataConverter
+	unversionedOrchestrators    map[string]struct{}
 }
 
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
@@ -236,6 +238,39 @@ func WithWorkerCapabilities(capabilities ...WorkerCapability) TaskHubGrpcWorkerO
 func WithScheduledTaskCapability(enabled bool) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		options.capabilities = setWorkerCapability(options.capabilities, WorkerCapabilityScheduledTasks, enabled)
+		return nil
+	}
+}
+
+// CombineTaskHubGrpcWorkerOptions combines worker options into one option.
+func CombineTaskHubGrpcWorkerOptions(options ...TaskHubGrpcWorkerOption) TaskHubGrpcWorkerOption {
+	return func(target *taskHubGrpcWorkerOptions) error {
+		for _, configure := range options {
+			if configure == nil {
+				continue
+			}
+			if err := configure(target); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// WithUnversionedOrchestratorNames allows explicitly unversioned system
+// orchestrators to remain routable when strict worker versioning is enabled.
+func WithUnversionedOrchestratorNames(names ...string) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if options.unversionedOrchestrators == nil {
+			options.unversionedOrchestrators = make(map[string]struct{}, len(names))
+		}
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return errors.New("unversioned orchestrator name cannot be empty")
+			}
+			options.unversionedOrchestrators[strings.ToLower(name)] = struct{}{}
+		}
 		return nil
 	}
 }
@@ -424,7 +459,11 @@ func newTaskHubGrpcWorker(
 		if err := validateStrictAutoFilters(snapshot, options.versioning); err != nil {
 			return nil, err
 		}
-		options.workItemFilters = workItemFiltersFromRegistry(snapshot, options.versioning)
+		options.workItemFilters = workItemFiltersFromRegistry(
+			snapshot,
+			options.versioning,
+			options.unversionedOrchestrators,
+		)
 	}
 	return &TaskHubGrpcWorker{
 		clientFactory: factory,
@@ -444,20 +483,27 @@ func (options taskHubGrpcWorkerOptions) executorOptions() []task.TaskExecutorOpt
 	if options.converter != nil {
 		executorOptions = append(executorOptions, task.WithDataConverter(options.converter))
 	}
+	if len(options.unversionedOrchestrators) > 0 {
+		executorOptions = append(
+			executorOptions,
+			task.WithUnversionedOrchestratorNames(slices.Collect(maps.Keys(options.unversionedOrchestrators))...),
+		)
+	}
 	return executorOptions
 }
 
 func workItemFiltersFromRegistry(
 	snapshot task.TaskRegistrySnapshot,
 	versioning *task.VersioningOptions,
+	allowedUnversioned map[string]struct{},
 ) *WorkItemFilters {
 	entities := slices.Clone(snapshot.Entities)
 	if slices.Contains(entities, "*") {
 		entities = nil
 	}
 	return &WorkItemFilters{
-		Orchestrations:          taskRegistrationsToFilters(snapshot.Orchestrators, versioning),
-		Activities:              taskRegistrationsToFilters(snapshot.Activities, versioning),
+		Orchestrations:          taskRegistrationsToFilters(snapshot.Orchestrators, versioning, allowedUnversioned),
+		Activities:              taskRegistrationsToFilters(snapshot.Activities, versioning, nil),
 		Entities:                entities,
 		RejectAllOrchestrations: len(snapshot.Orchestrators) == 0,
 		RejectAllActivities:     len(snapshot.Activities) == 0,
@@ -560,6 +606,7 @@ func validateTaskFilterNames(
 func taskRegistrationsToFilters(
 	registrations []task.TaskRegistration,
 	versioning *task.VersioningOptions,
+	allowedUnversioned map[string]struct{},
 ) []WorkItemFilter {
 	type filterGroup struct {
 		name     string
@@ -581,6 +628,15 @@ func taskRegistrationsToFilters(
 	filters := make([]WorkItemFilter, 0, len(groups))
 	for _, group := range groups {
 		if versioning != nil && versioning.MatchStrategy == task.VersionMatchStrict {
+			if _, allowed := allowedUnversioned[strings.ToLower(group.name)]; allowed {
+				if unversioned, ok := group.versions[""]; ok {
+					filters = append(filters, WorkItemFilter{
+						Name:     group.name,
+						Versions: []string{unversioned},
+					})
+					continue
+				}
+			}
 			filters = append(filters, WorkItemFilter{
 				Name:     group.name,
 				Versions: []string{versioning.Version},
