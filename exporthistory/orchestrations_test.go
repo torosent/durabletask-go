@@ -13,15 +13,22 @@ import (
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// entityMessage is an entity-directed message the scheduler would deliver to the
+// target entity, paired with that target's instance ID.
+type entityMessage struct {
+	historyEvent     *protos.HistoryEvent
+	targetInstanceID string
+}
+
 // orchestrationDriver replays an orchestration turn by turn against synthesized
 // history, so timer-heavy paths such as batch retry backoff are covered without
-// waiting on the wall clock. Actions are folded back into history through the
-// production [backend.OrchestrationRuntimeState], keeping the driver faithful to
-// what the orchestration worker does.
+// waiting on the wall clock. Each turn's actions are folded back into history the
+// way the scheduler does, so replay stays faithful without a live service.
 type orchestrationDriver struct {
 	t          *testing.T
 	executor   backend.Executor
@@ -35,7 +42,7 @@ type orchestrationDriver struct {
 	// turn scheduled, which carry the requested delay; pendingTimers holds the
 	// matching TimerFired messages the service would deliver back.
 	createdTimers   []*protos.HistoryEvent
-	pendingEntities []backend.EntityMessage
+	pendingEntities []entityMessage
 	completion      *protos.CompleteOrchestrationAction
 	continuedAsNew  bool
 }
@@ -69,28 +76,135 @@ func (d *orchestrationDriver) turn() {
 	require.NoError(d.t, err)
 
 	history := append(append([]*protos.HistoryEvent{}, d.oldEvents...), d.newEvents...)
-	state := backend.NewOrchestrationRuntimeState(d.instanceID, history)
-	_, err = state.ApplyActions(results.Response.GetActions(), nil)
-	require.NoError(d.t, err)
-
 	d.oldEvents = history
-	d.newEvents = append([]*protos.HistoryEvent{}, state.NewEvents()...)
-	d.pendingTasks = state.PendingTasks()
-	d.pendingTimers = state.PendingTimers()
-	d.pendingEntities = state.PendingEntityMessages()
+	d.foldActions(results.Response.GetActions(), history)
+}
+
+// foldActions appends the history each action produces and records the messages
+// the scheduler would deliver back. Export orchestrations only schedule
+// activities, call entities, create timers, and complete, so any other action is
+// a gap in this harness rather than something to silently drop.
+func (d *orchestrationDriver) foldActions(
+	actions []*protos.OrchestratorAction,
+	history []*protos.HistoryEvent,
+) {
+	d.t.Helper()
+	d.newEvents = nil
+	d.pendingTasks = nil
+	d.pendingTimers = nil
+	d.pendingEntities = nil
 	d.createdTimers = nil
-	for _, event := range d.newEvents {
-		if event.GetTimerCreated() != nil {
-			d.createdTimers = append(d.createdTimers, event)
-		}
-	}
-	d.continuedAsNew = state.ContinuedAsNew()
 	d.completion = nil
-	for _, action := range results.Response.GetActions() {
-		if complete := action.GetCompleteOrchestration(); complete != nil {
+	d.continuedAsNew = false
+
+	for _, action := range actions {
+		switch {
+		case action.GetScheduleTask() != nil:
+			scheduled := action.GetScheduleTask()
+			event := helpers.NewTaskScheduledEvent(
+				action.GetId(), scheduled.GetName(), scheduled.GetVersion(), scheduled.GetInput(), nil)
+			d.newEvents = append(d.newEvents, event)
+			d.pendingTasks = append(d.pendingTasks, event)
+
+		case action.GetCreateTimer() != nil:
+			fireAt := action.GetCreateTimer().GetFireAt()
+			created := helpers.NewTimerCreatedEvent(action.GetId(), fireAt)
+			d.newEvents = append(d.newEvents, created)
+			d.createdTimers = append(d.createdTimers, created)
+			d.pendingTimers = append(d.pendingTimers, helpers.NewTimerFiredEvent(action.GetId(), fireAt, nil))
+
+		case action.GetSendEntityMessage().GetEntityOperationCalled() != nil:
+			d.foldEntityCall(action)
+
+		case action.GetCompleteOrchestration() != nil:
+			complete := action.GetCompleteOrchestration()
 			d.completion = complete
+			if complete.GetOrchestrationStatus() == protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW {
+				d.continuedAsNew = true
+				d.restart(history, complete)
+				return
+			}
+			d.newEvents = append(d.newEvents, &protos.HistoryEvent{
+				EventId:   action.GetId(),
+				Timestamp: timestamppb.Now(),
+				EventType: &protos.HistoryEvent_ExecutionCompleted{
+					ExecutionCompleted: &protos.ExecutionCompletedEvent{
+						OrchestrationStatus: complete.GetOrchestrationStatus(),
+						Result:              complete.GetResult(),
+						FailureDetails:      complete.GetFailureDetails(),
+					},
+				},
+			})
+
+		default:
+			require.FailNowf(d.t, "unsupported orchestrator action", "action %v", action)
 		}
 	}
+}
+
+// foldEntityCall mirrors how the scheduler splits an entity call: the caller's
+// history keeps the target instance ID, while the message delivered to the entity
+// drops it and carries the caller's instance ID instead.
+func (d *orchestrationDriver) foldEntityCall(action *protos.OrchestratorAction) {
+	d.t.Helper()
+	historyValue := proto.Clone(
+		action.GetSendEntityMessage().GetEntityOperationCalled()).(*protos.EntityOperationCalledEvent)
+	target := historyValue.GetTargetInstanceId().GetValue()
+	historyValue.ParentInstanceId = nil
+	historyValue.ParentExecutionId = nil
+
+	messageValue := proto.Clone(historyValue).(*protos.EntityOperationCalledEvent)
+	messageValue.TargetInstanceId = nil
+	messageValue.ParentInstanceId = wrapperspb.String(string(d.instanceID))
+
+	timestamp := timestamppb.Now()
+	d.newEvents = append(d.newEvents, &protos.HistoryEvent{
+		EventId:   action.GetId(),
+		Timestamp: timestamp,
+		EventType: &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: historyValue},
+	})
+	d.pendingEntities = append(d.pendingEntities, entityMessage{
+		historyEvent: &protos.HistoryEvent{
+			EventId:   -1,
+			Timestamp: timestamp,
+			EventType: &protos.HistoryEvent_EntityOperationCalled{EntityOperationCalled: messageValue},
+		},
+		targetInstanceID: target,
+	})
+}
+
+// restart truncates history the way the scheduler does for ContinueAsNew: the new
+// execution starts from a fresh start event carrying the previous execution's
+// identity, the new input, and any carryover events.
+func (d *orchestrationDriver) restart(
+	history []*protos.HistoryEvent,
+	complete *protos.CompleteOrchestrationAction,
+) {
+	d.t.Helper()
+	var started *protos.ExecutionStartedEvent
+	for _, event := range history {
+		if candidate := event.GetExecutionStarted(); candidate != nil {
+			started = candidate
+		}
+	}
+	require.NotNil(d.t, started, "history has no ExecutionStarted event")
+
+	version := started.GetVersion()
+	if complete.GetNewVersion() != nil {
+		version = complete.GetNewVersion()
+	}
+	d.oldEvents = nil
+	d.newEvents = append([]*protos.HistoryEvent{
+		helpers.NewOrchestratorStartedEvent(),
+		helpers.NewExecutionStartedEvent(
+			started.GetName(),
+			string(d.instanceID),
+			complete.GetResult(),
+			started.GetParentInstance(),
+			started.GetParentTraceContext(),
+			nil,
+			version),
+	}, complete.GetCarryoverEvents()...)
 }
 
 // nextTurn starts a new episode by appending the orchestrator-started marker
@@ -153,9 +267,9 @@ func (d *orchestrationDriver) pendingEntityMessage(
 ) (*protos.EntityOperationCalledEvent, string) {
 	d.t.Helper()
 	for _, message := range d.pendingEntities {
-		called := message.HistoryEvent.GetEntityOperationCalled()
+		called := message.historyEvent.GetEntityOperationCalled()
 		if called != nil && called.GetOperation() == operation {
-			return called, message.TargetInstanceID
+			return called, message.targetInstanceID
 		}
 	}
 	require.FailNowf(d.t, "no pending entity call", "operation %q", operation)

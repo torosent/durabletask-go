@@ -86,7 +86,7 @@ and the [environment-driven sample](./samples/durabletaskscheduler).
 | [`client`](./client) | Lower-level gRPC management client and worker over a caller-owned connection |
 | [`payload`](./payload) | Large payload stores (memory, file, Azure Blob Storage) |
 | [`exporthistory`](./exporthistory) | Preview history export to Azure Blob Storage |
-| [`backend`](./backend) | Internal runtime plumbing shared by the above — logger, metric hooks, executor contract, runtime state |
+| [`backend`](./backend) | Internal runtime plumbing shared by the above — logger, metric hooks, executor contract |
 
 DTS owns durable state, dispatch, and recovery, so this SDK has no task hub host
 and no pluggable storage. `backend` is shared runtime plumbing that appears in
