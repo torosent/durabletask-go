@@ -16,7 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-const referencePrefix = "durabletask-payload:v1:"
+const referencePrefix = api.DurableTaskPayloadReferencePrefix
 
 type reference struct {
 	Location string `json:"location"`
@@ -29,7 +29,7 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 		return value, nil
 	}
 	if options == nil {
-		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+		if isRecognizedReference(value.GetValue()) {
 			return nil, fmt.Errorf("%w: large payload reference requires a configured store and resolver", api.ErrFeatureNotSupported)
 		}
 		return value, nil
@@ -38,6 +38,13 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 	if err != nil {
 		return nil, err
 	}
+	isToken, err := isNativePayloadToken(normalized.TokenStore, value.GetValue())
+	if err != nil {
+		return nil, err
+	}
+	if isToken {
+		return value, nil
+	}
 	if _, ok, err := parseReference(value.GetValue(), normalized.MaxPayloadBytes); ok || err != nil {
 		return value, err
 	}
@@ -45,8 +52,18 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 	if len(payload) > normalized.MaxPayloadBytes {
 		return nil, fmt.Errorf("%w: %d bytes exceeds %d", api.ErrLargePayloadTooLarge, len(payload), normalized.MaxPayloadBytes)
 	}
-	if len(payload) <= normalized.ThresholdBytes {
+	if !exceedsThreshold(normalized, len(payload)) {
 		return value, nil
+	}
+	if normalized.TokenStore != nil {
+		token, err := normalized.TokenStore.StoreToken(ctx, append([]byte(nil), payload...))
+		if err != nil {
+			return nil, fmt.Errorf("failed to store large payload: %w", err)
+		}
+		if strings.TrimSpace(token) == "" {
+			return nil, errors.New("large payload store returned an empty token")
+		}
+		return wrapperspb.String(token), nil
 	}
 	location, err := normalized.Store.Store(ctx, append([]byte(nil), payload...))
 	if err != nil {
@@ -72,7 +89,7 @@ func Hydrate(ctx context.Context, options *api.LargePayloadOptions, value *wrapp
 		return value, nil
 	}
 	if options == nil {
-		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+		if isRecognizedReference(value.GetValue()) {
 			return nil, fmt.Errorf("%w: large payload reference requires a configured resolver", api.ErrFeatureNotSupported)
 		}
 		return value, nil
@@ -80,6 +97,20 @@ func Hydrate(ctx context.Context, options *api.LargePayloadOptions, value *wrapp
 	normalized, err := api.NormalizeLargePayloadOptions(options)
 	if err != nil {
 		return nil, err
+	}
+	isToken, err := isNativePayloadToken(normalized.TokenStore, value.GetValue())
+	if err != nil {
+		return nil, err
+	}
+	if isToken {
+		payload, err := normalized.TokenStore.ResolveToken(ctx, value.GetValue())
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve large payload: %w", err)
+		}
+		if len(payload) > normalized.MaxPayloadBytes {
+			return nil, fmt.Errorf("%w: %d bytes exceeds %d", api.ErrLargePayloadTooLarge, len(payload), normalized.MaxPayloadBytes)
+		}
+		return wrapperspb.String(string(payload)), nil
 	}
 	ref, ok, err := parseReference(value.GetValue(), normalized.MaxPayloadBytes)
 	if err != nil || !ok {
@@ -136,8 +167,16 @@ func TransformHistoryEvent(
 		target = &event.GetEventSent().Input
 	case event.GetEventRaised() != nil:
 		target = &event.GetEventRaised().Input
+	case event.GetGenericEvent() != nil:
+		target = &event.GetGenericEvent().Data
+	case event.GetHistoryState() != nil:
+		return transformHistoryState(ctx, options, event.GetHistoryState().OrchestrationState, externalize)
 	case event.GetContinueAsNew() != nil:
 		target = &event.GetContinueAsNew().Input
+	case event.GetExecutionSuspended() != nil:
+		target = &event.GetExecutionSuspended().Input
+	case event.GetExecutionResumed() != nil:
+		target = &event.GetExecutionResumed().Input
 	case event.GetExecutionRewound() != nil:
 		target = &event.GetExecutionRewound().Input
 	case event.GetEntityOperationSignaled() != nil:
@@ -155,6 +194,30 @@ func TransformHistoryEvent(
 	}
 	*target = transformed
 	return nil
+}
+
+func transformHistoryState(
+	ctx context.Context,
+	options *api.LargePayloadOptions,
+	state *protos.OrchestrationState,
+	externalize bool,
+) error {
+	if state == nil {
+		return nil
+	}
+	transform := Hydrate
+	if externalize {
+		transform = Externalize
+	}
+	var err error
+	if state.Input, err = transform(ctx, options, state.Input); err != nil {
+		return err
+	}
+	if state.Output, err = transform(ctx, options, state.Output); err != nil {
+		return err
+	}
+	state.CustomStatus, err = transform(ctx, options, state.CustomStatus)
+	return err
 }
 
 func TransformOrchestratorRequest(
@@ -354,4 +417,49 @@ func parseReference(value string, maxPayloadBytes int) (reference, bool, error) 
 		return reference{}, true, fmt.Errorf("%w: invalid SHA-256 digest", api.ErrLargePayloadReference)
 	}
 	return ref, true, nil
+}
+
+func isRecognizedReference(value string) bool {
+	return api.IsLargePayloadReference(value)
+}
+
+func isBlobReference(value string) bool {
+	return strings.HasPrefix(value, api.AzureBlobPayloadReferencePrefixV1) ||
+		strings.HasPrefix(value, api.AzureBlobPayloadReferencePrefixV2)
+}
+
+// isNativePayloadToken reports whether value is a native token that the
+// configured store can handle, validating it when the store supports
+// validation. Azure Blob tokens are rejected when no token store can resolve
+// them so they are never mistaken for opaque payload data.
+func isNativePayloadToken(store api.LargePayloadTokenStore, value string) (bool, error) {
+	if store == nil || !store.IsLargePayloadToken(value) {
+		if isBlobReference(value) {
+			return false, fmt.Errorf(
+				"%w: Azure Blob payload token requires an Azure Blob token store",
+				api.ErrFeatureNotSupported,
+			)
+		}
+		return false, nil
+	}
+	if validator, ok := store.(api.LargePayloadTokenValidator); ok {
+		if err := validator.ValidateLargePayloadToken(value); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// exceedsThreshold reports whether a payload is large enough to externalize.
+// Stores such as Azure Blob externalize payloads exactly at the threshold,
+// while the built-in reference store externalizes only above it.
+func exceedsThreshold(options *api.LargePayloadOptions, size int) bool {
+	if size > options.ThresholdBytes {
+		return true
+	}
+	if size < options.ThresholdBytes {
+		return false
+	}
+	policy, ok := options.Store.(api.InclusiveLargePayloadThreshold)
+	return ok && policy.UsesInclusiveLargePayloadThreshold()
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/helpers"
+	"github.com/microsoft/durabletask-go/internal/historyconv"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -42,6 +43,8 @@ type EntityTaskHubClient interface {
 
 type TaskHubManagementClient interface {
 	TaskHubClient
+	GetOrchestrationHistory(context.Context, api.InstanceID, api.HistoryQuery) (*api.OrchestrationHistory, error)
+	StreamOrchestrationHistory(context.Context, api.InstanceID, api.HistoryQuery, api.HistoryEventHandler) error
 	QueryInstances(context.Context, api.OrchestrationQuery) (*api.OrchestrationQueryResult, error)
 	ListInstanceIDs(context.Context, api.InstanceIDQuery) (*api.InstanceIDQueryResult, error)
 	RestartInstance(context.Context, api.InstanceID, ...api.RestartOptions) (api.InstanceID, error)
@@ -309,6 +312,60 @@ func (c *backendClient) QueryInstances(ctx context.Context, query api.Orchestrat
 		metadata.Converter = c.converter
 	}
 	return result, nil
+}
+
+func (c *backendClient) GetOrchestrationHistory(
+	ctx context.Context,
+	id api.InstanceID,
+	query api.HistoryQuery,
+) (*api.OrchestrationHistory, error) {
+	return historyconv.Collect(id, query, func(handler api.HistoryEventHandler) error {
+		return c.StreamOrchestrationHistory(ctx, id, query, handler)
+	})
+}
+
+func (c *backendClient) StreamOrchestrationHistory(
+	ctx context.Context,
+	id api.InstanceID,
+	query api.HistoryQuery,
+	handler api.HistoryEventHandler,
+) error {
+	normalized, err := historyconv.NormalizeStreamRequest(id, query, handler)
+	if err != nil {
+		return err
+	}
+	metadata, err := c.be.GetOrchestrationMetadata(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to fetch orchestration history metadata: %w", err)
+	}
+	if metadata == nil || normalized.ExecutionID != "" && metadata.ExecutionID != normalized.ExecutionID {
+		return api.ErrInstanceNotFound
+	}
+	state, err := c.be.GetOrchestrationRuntimeState(ctx, &OrchestrationWorkItem{InstanceID: id})
+	if err != nil {
+		return fmt.Errorf("failed to fetch orchestration history: %w", err)
+	}
+	if state == nil {
+		return api.ErrInstanceNotFound
+	}
+	converter := historyconv.New(c.converter)
+	eventCount := 0
+	for _, events := range [][]*HistoryEvent{state.OldEvents(), state.NewEvents()} {
+		for _, event := range events {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			converted, err := converter.Convert(event)
+			if err != nil {
+				return fmt.Errorf("failed to convert orchestration history event %d: %w", eventCount, err)
+			}
+			if err := handler(converted); err != nil {
+				return err
+			}
+			eventCount++
+		}
+	}
+	return nil
 }
 
 func (c *backendClient) ListInstanceIDs(ctx context.Context, query api.InstanceIDQuery) (*api.InstanceIDQueryResult, error) {

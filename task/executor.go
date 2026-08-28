@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -19,15 +20,16 @@ import (
 )
 
 type taskExecutor struct {
-	Registry             *TaskRegistry
-	versioning           *VersioningOptions
-	orchestratorNotFound OrchestratorNotFoundStrategy
-	orchestrationOptions OrchestrationOptions
-	logger               *slog.Logger
-	metrics              backend.MetricsHooks
-	contextFields        api.ContextFields
-	errorProperties      api.ErrorPropertiesProvider
-	converter            api.DataConverter
+	Registry                 *TaskRegistry
+	versioning               *VersioningOptions
+	orchestratorNotFound     OrchestratorNotFoundStrategy
+	orchestrationOptions     OrchestrationOptions
+	logger                   *slog.Logger
+	metrics                  backend.MetricsHooks
+	contextFields            api.ContextFields
+	errorProperties          api.ErrorPropertiesProvider
+	converter                api.DataConverter
+	unversionedOrchestrators map[string]struct{}
 }
 
 // TaskExecutorOption configures the in-memory task executor.
@@ -47,6 +49,21 @@ const (
 func WithVersioning(options VersioningOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.versioning = &options
+	}
+}
+
+// WithUnversionedOrchestratorNames allows named system orchestrators to bypass
+// worker version matching when their work item explicitly selects no version.
+func WithUnversionedOrchestratorNames(names ...string) TaskExecutorOption {
+	return func(executor *taskExecutor) {
+		if executor.unversionedOrchestrators == nil {
+			executor.unversionedOrchestrators = make(map[string]struct{}, len(names))
+		}
+		for _, name := range names {
+			if name = strings.TrimSpace(name); name != "" {
+				executor.unversionedOrchestrators[strings.ToLower(name)] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -199,8 +216,14 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 // ExecuteOrchestrator implements backend.Executor and executes an orchestrator function in the current goroutine.
 func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*backend.ExecutionResults, error) {
 	started := startedEvent(oldEvents, newEvents)
+	name := started.GetName()
 	version := started.GetVersion().GetValue()
-	if versionErr := te.versioning.check(version); versionErr != nil {
+	// Explicitly unversioned system orchestrators bypass worker version matching.
+	allowUnversioned := false
+	if version == "" {
+		_, allowUnversioned = te.unversionedOrchestrators[strings.ToLower(name)]
+	}
+	if versionErr := te.versioning.check(version); versionErr != nil && !allowUnversioned {
 		if te.versioning.FailureStrategy == VersionFailureReject {
 			return nil, versionErr
 		}
@@ -219,7 +242,6 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 			},
 		}, nil
 	}
-	name := started.GetName()
 	if te.orchestratorNotFound == OrchestratorNotFoundReject && name != "" {
 		if !te.Registry.hasOrchestrator(name, version) {
 			return nil, newTaskNotRegisteredError(

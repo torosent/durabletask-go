@@ -36,6 +36,11 @@ var emptyCompleteTaskResponse = &protos.CompleteTaskResponse{}
 
 var errShuttingDown error = status.Error(codes.Canceled, "shutting down")
 
+const (
+	historyChunkSize      = 100
+	historyChunkByteLimit = 2 * 1024 * 1024
+)
+
 type ExecutionResults struct {
 	Response        *protos.OrchestratorResponse
 	completionToken string
@@ -916,6 +921,85 @@ func (g *grpcExecutor) GetInstance(ctx context.Context, req *protos.GetInstanceR
 	}
 
 	return createGetInstanceResponse(req, metadata), nil
+}
+
+// StreamInstanceHistory implements protos.TaskHubSidecarServiceServer.
+func (g *grpcExecutor) StreamInstanceHistory(
+	req *protos.StreamInstanceHistoryRequest,
+	stream protos.TaskHubSidecarService_StreamInstanceHistoryServer,
+) error {
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "history request is required")
+	}
+	if req.GetInstanceId() == "" {
+		return status.Error(codes.InvalidArgument, "instance ID is required")
+	}
+	if err := helpers.ValidateOrchestrationInstanceID(req.GetInstanceId()); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	ctx := stream.Context()
+	instanceID := api.InstanceID(req.GetInstanceId())
+	historyBackend := historyStorageBackend(g.backend)
+	metadata, err := historyBackend.GetOrchestrationMetadata(ctx, instanceID)
+	if err != nil {
+		return managementRPCError(err, "failed to fetch orchestration history metadata")
+	}
+	if metadata == nil || req.GetExecutionId().GetValue() != "" &&
+		metadata.ExecutionID != req.GetExecutionId().GetValue() {
+		return managementRPCError(api.ErrInstanceNotFound, "failed to fetch orchestration history")
+	}
+	state, err := historyBackend.GetOrchestrationRuntimeState(ctx, &OrchestrationWorkItem{InstanceID: instanceID})
+	if err != nil {
+		return managementRPCError(err, "failed to fetch orchestration history")
+	}
+	if state == nil {
+		return managementRPCError(api.ErrInstanceNotFound, "failed to fetch orchestration history")
+	}
+
+	chunk := make([]*protos.HistoryEvent, 0, historyChunkSize)
+	chunkBytes := 0
+	sendChunk := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return managementRPCError(err, "failed to stream orchestration history")
+		}
+		if err := stream.Send(&protos.HistoryChunk{Events: chunk}); err != nil {
+			return err
+		}
+		chunk = make([]*protos.HistoryEvent, 0, historyChunkSize)
+		chunkBytes = 0
+		return nil
+	}
+	for _, events := range [][]*protos.HistoryEvent{state.OldEvents(), state.NewEvents()} {
+		for _, event := range events {
+			eventBytes := proto.Size(event)
+			if len(chunk) > 0 &&
+				(len(chunk) >= historyChunkSize || chunkBytes+eventBytes > historyChunkByteLimit) {
+				if err := sendChunk(); err != nil {
+					return err
+				}
+			}
+			chunk = append(chunk, event)
+			chunkBytes += eventBytes
+		}
+	}
+	return sendChunk()
+}
+
+func historyStorageBackend(be Backend) Backend {
+	type rawHistoryBackendProvider interface {
+		rawHistoryBackend() Backend
+	}
+	for depth := 0; be != nil && depth < 32; depth++ {
+		provider, ok := be.(rawHistoryBackendProvider)
+		if !ok {
+			return be
+		}
+		be = provider.rawHistoryBackend()
+	}
+	return be
 }
 
 // PurgeInstances implements protos.TaskHubSidecarServiceServer

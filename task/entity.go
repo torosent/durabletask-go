@@ -47,6 +47,34 @@ func (ctx *EntityContext) GetInput(v any) error {
 	return unmarshalData(ctx.converter, ctx.rawInput, v)
 }
 
+// SerializeInput serializes a value using the entity's configured data converter.
+// It is useful when an entity needs to persist input for a later operation.
+func (ctx *EntityContext) SerializeInput(value any) (string, error) {
+	payload, err := marshalData(ctx.converter, value)
+	if err != nil {
+		return "", err
+	}
+	return string(payload), nil
+}
+
+// GetRawState returns the entity's pre-serialized state and whether state is set.
+// Callers are responsible for deserializing the returned value.
+func (ctx *EntityContext) GetRawState() (string, bool) {
+	return string(ctx.state.value), ctx.state.hasValue
+}
+
+// SetRawState stores pre-serialized entity state. Callers are responsible for
+// producing data accepted by all readers of the entity state.
+func (ctx *EntityContext) SetRawState(state string) {
+	if state == "" {
+		ctx.DeleteState()
+		return
+	}
+	ctx.state.value = []byte(state)
+	ctx.state.hasValue = true
+	ctx.stateDirty = true
+}
+
 // HasState returns true if the entity has state set.
 func (ctx *EntityContext) HasState() bool {
 	return ctx.state.hasValue
@@ -152,7 +180,7 @@ func (ctx *EntityContext) signalEntity(entityID api.EntityID, operationName stri
 }
 
 // StartNewOrchestration schedules a new orchestration from within an entity operation.
-func (ctx *EntityContext) StartNewOrchestration(name string, opts ...entityStartOrchestrationOption) error {
+func (ctx *EntityContext) StartNewOrchestration(name string, opts ...EntityStartOrchestrationOption) error {
 	if name == "" {
 		return fmt.Errorf("orchestration name must not be empty")
 	}
@@ -201,11 +229,11 @@ type entityStartOrchestrationOptions struct {
 	scheduledTime time.Time
 }
 
-// entityStartOrchestrationOption is a functional option for StartNewOrchestration.
-type entityStartOrchestrationOption func(*entityStartOrchestrationOptions, api.DataConverter) error
+// EntityStartOrchestrationOption is a functional option for StartNewOrchestration.
+type EntityStartOrchestrationOption func(*entityStartOrchestrationOptions, api.DataConverter) error
 
 // WithEntityStartOrchestrationInput sets the input for the new orchestration.
-func WithEntityStartOrchestrationInput(input any) entityStartOrchestrationOption {
+func WithEntityStartOrchestrationInput(input any) EntityStartOrchestrationOption {
 	return func(opts *entityStartOrchestrationOptions, converter api.DataConverter) error {
 		bytes, err := marshalData(converter, input)
 		if err != nil {
@@ -216,8 +244,18 @@ func WithEntityStartOrchestrationInput(input any) entityStartOrchestrationOption
 	}
 }
 
+// WithRawEntityStartOrchestrationInput sets pre-serialized input for the new
+// orchestration. Callers are responsible for ensuring the payload is accepted
+// by the target orchestration's data converter.
+func WithRawEntityStartOrchestrationInput(input string) EntityStartOrchestrationOption {
+	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
+		opts.rawInput = wrapperspb.String(input)
+		return nil
+	}
+}
+
 // WithEntityStartOrchestrationInstanceID sets the instance ID for the new orchestration.
-func WithEntityStartOrchestrationInstanceID(instanceID string) entityStartOrchestrationOption {
+func WithEntityStartOrchestrationInstanceID(instanceID string) EntityStartOrchestrationOption {
 	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		opts.instanceID = instanceID
 		return nil
@@ -225,7 +263,7 @@ func WithEntityStartOrchestrationInstanceID(instanceID string) entityStartOrches
 }
 
 // WithEntityStartOrchestrationVersion sets the version for the new orchestration.
-func WithEntityStartOrchestrationVersion(version string) entityStartOrchestrationOption {
+func WithEntityStartOrchestrationVersion(version string) EntityStartOrchestrationOption {
 	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		opts.version = wrapperspb.String(version)
 		return nil
@@ -233,7 +271,7 @@ func WithEntityStartOrchestrationVersion(version string) entityStartOrchestratio
 }
 
 // WithEntityStartOrchestrationScheduledTime schedules the new orchestration.
-func WithEntityStartOrchestrationScheduledTime(scheduledTime time.Time) entityStartOrchestrationOption {
+func WithEntityStartOrchestrationScheduledTime(scheduledTime time.Time) EntityStartOrchestrationOption {
 	return func(opts *entityStartOrchestrationOptions, _ api.DataConverter) error {
 		if scheduledTime.IsZero() {
 			return fmt.Errorf("scheduled orchestration time must not be zero")

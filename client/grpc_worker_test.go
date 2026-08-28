@@ -324,6 +324,21 @@ func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
 	require.Equal(t, helpers.RejectAllWorkItemFilterName, wire.Entities[0].Name)
 }
 
+func TestStrictAutoFiltersPreserveAllowedUnversionedOrchestrator(t *testing.T) {
+	filters := workItemFiltersFromRegistry(
+		task.TaskRegistrySnapshot{
+			Orchestrators: []task.TaskRegistration{
+				{Name: "system"},
+				{Name: "application", Version: "1.0"},
+			},
+		},
+		&task.VersioningOptions{Version: "1.0", MatchStrategy: task.VersionMatchStrict},
+		map[string]struct{}{"system": {}},
+	)
+	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "system", Versions: []string{""}})
+	require.Contains(t, filters.Orchestrations, WorkItemFilter{Name: "application", Versions: []string{"1.0"}})
+}
+
 func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 	registry := task.NewTaskRegistry()
 	require.NoError(t, registry.AddOrchestratorN("legacy", func(*task.OrchestrationContext) (any, error) {
@@ -339,7 +354,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 		return nil, nil
 	}))
 
-	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil)
+	filters := workItemFiltersFromRegistry(registry.Snapshot(), nil, nil)
 	require.Equal(t, []WorkItemFilter{
 		{Name: "legacy", Versions: []string{}},
 		{Name: "mixed", Versions: []string{"", "v2"}},
@@ -349,7 +364,7 @@ func TestWorkItemFiltersFromRegistryMatchVersionedFallbackRules(t *testing.T) {
 	strict := workItemFiltersFromRegistry(registry.Snapshot(), &task.VersioningOptions{
 		Version:       "v3",
 		MatchStrategy: task.VersionMatchStrict,
-	})
+	}, nil)
 	require.Equal(t, []string{"v3"}, strict.Orchestrations[0].Versions)
 	require.Equal(t, []string{"v3"}, strict.Activities[0].Versions)
 	require.Error(t, validateStrictAutoFilters(registry.Snapshot(), &task.VersioningOptions{

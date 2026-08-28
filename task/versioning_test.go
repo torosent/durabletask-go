@@ -195,6 +195,75 @@ func TestVersionedRegistryDispatchAndSchedulingDefaults(t *testing.T) {
 	}
 }
 
+func TestAllowedUnversionedSystemOrchestratorBypassesStrictVersionMatch(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("system", func(*OrchestrationContext) (any, error) {
+		return "ok", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewTaskExecutor(
+		registry,
+		WithVersioning(VersioningOptions{
+			Version:       "1.0",
+			MatchStrategy: VersionMatchStrict,
+		}),
+		WithUnversionedOrchestratorNames("system"),
+	)
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		"system-instance",
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewExecutionStartedEvent("system", "system-instance", nil, nil, nil, nil, wrapperspb.String("")),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Response.Actions[len(result.Response.Actions)-1].GetCompleteOrchestration() == nil {
+		t.Fatalf("system orchestrator did not complete: %#v", result.Response.Actions)
+	}
+}
+
+func TestSubOrchestrationOptionsAddTagsAndContextFields(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("parent", func(ctx *OrchestrationContext) (any, error) {
+		ctx.CallSubOrchestrator(
+			"child",
+			WithSubOrchestrationTags(map[string]string{"schedule": "daily"}),
+			WithSubOrchestrationContextFields(api.ContextFields{"tenant": "north"}),
+		)
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewTaskExecutor(registry)
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		"parent-instance",
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range result.Response.Actions {
+		if created := action.GetCreateSubOrchestration(); created != nil {
+			if created.Tags["schedule"] != "daily" {
+				t.Fatalf("tags = %#v", created.Tags)
+			}
+			if created.Tags["__durabletask.context.field.tenant"] != "north" {
+				t.Fatalf("context tags = %#v", created.Tags)
+			}
+			return
+		}
+	}
+	t.Fatal("missing sub-orchestration action")
+}
+
 func TestExplicitUnversionedSchedulingOverridesDefaults(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {

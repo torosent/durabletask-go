@@ -10,11 +10,13 @@ import (
 
 type taskLoggerKey struct{}
 
-func mergeContextFields(base, overrides api.ContextFields) api.ContextFields {
+// mergeStringMaps returns base overlaid with overrides, or nil when both are
+// empty. The result never aliases either input.
+func mergeStringMaps[M ~map[string]string](base, overrides M) M {
 	if len(base) == 0 && len(overrides) == 0 {
 		return nil
 	}
-	merged := make(api.ContextFields, len(base)+len(overrides))
+	merged := make(M, len(base)+len(overrides))
 	maps.Copy(merged, base)
 	maps.Copy(merged, overrides)
 	return merged
