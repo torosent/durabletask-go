@@ -16,7 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-const referencePrefix = "durabletask-payload:v1:"
+const referencePrefix = api.DurableTaskPayloadReferencePrefix
 
 type reference struct {
 	Location string `json:"location"`
@@ -29,7 +29,7 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 		return value, nil
 	}
 	if options == nil {
-		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+		if isRecognizedReference(value.GetValue()) {
 			return nil, fmt.Errorf("%w: large payload reference requires a configured store and resolver", api.ErrFeatureNotSupported)
 		}
 		return value, nil
@@ -38,6 +38,13 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 	if err != nil {
 		return nil, err
 	}
+	isToken, err := isNativePayloadToken(normalized.TokenStore, value.GetValue())
+	if err != nil {
+		return nil, err
+	}
+	if isToken {
+		return value, nil
+	}
 	if _, ok, err := parseReference(value.GetValue(), normalized.MaxPayloadBytes); ok || err != nil {
 		return value, err
 	}
@@ -45,8 +52,18 @@ func Externalize(ctx context.Context, options *api.LargePayloadOptions, value *w
 	if len(payload) > normalized.MaxPayloadBytes {
 		return nil, fmt.Errorf("%w: %d bytes exceeds %d", api.ErrLargePayloadTooLarge, len(payload), normalized.MaxPayloadBytes)
 	}
-	if len(payload) <= normalized.ThresholdBytes {
+	if !exceedsThreshold(normalized, len(payload)) {
 		return value, nil
+	}
+	if normalized.TokenStore != nil {
+		token, err := normalized.TokenStore.StoreToken(ctx, append([]byte(nil), payload...))
+		if err != nil {
+			return nil, fmt.Errorf("failed to store large payload: %w", err)
+		}
+		if strings.TrimSpace(token) == "" {
+			return nil, errors.New("large payload store returned an empty token")
+		}
+		return wrapperspb.String(token), nil
 	}
 	location, err := normalized.Store.Store(ctx, append([]byte(nil), payload...))
 	if err != nil {
@@ -72,7 +89,7 @@ func Hydrate(ctx context.Context, options *api.LargePayloadOptions, value *wrapp
 		return value, nil
 	}
 	if options == nil {
-		if strings.HasPrefix(value.GetValue(), referencePrefix) {
+		if isRecognizedReference(value.GetValue()) {
 			return nil, fmt.Errorf("%w: large payload reference requires a configured resolver", api.ErrFeatureNotSupported)
 		}
 		return value, nil
@@ -80,6 +97,20 @@ func Hydrate(ctx context.Context, options *api.LargePayloadOptions, value *wrapp
 	normalized, err := api.NormalizeLargePayloadOptions(options)
 	if err != nil {
 		return nil, err
+	}
+	isToken, err := isNativePayloadToken(normalized.TokenStore, value.GetValue())
+	if err != nil {
+		return nil, err
+	}
+	if isToken {
+		payload, err := normalized.TokenStore.ResolveToken(ctx, value.GetValue())
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve large payload: %w", err)
+		}
+		if len(payload) > normalized.MaxPayloadBytes {
+			return nil, fmt.Errorf("%w: %d bytes exceeds %d", api.ErrLargePayloadTooLarge, len(payload), normalized.MaxPayloadBytes)
+		}
+		return wrapperspb.String(string(payload)), nil
 	}
 	ref, ok, err := parseReference(value.GetValue(), normalized.MaxPayloadBytes)
 	if err != nil || !ok {
@@ -109,12 +140,18 @@ func TransformHistoryEvent(
 	event *protos.HistoryEvent,
 	externalize bool,
 ) error {
-	if event == nil {
-		return nil
-	}
 	transform := Hydrate
 	if externalize {
 		transform = Externalize
+	}
+	plan := newTransformPlan(options, transform)
+	planHistoryEvent(plan, event)
+	return plan.run(ctx)
+}
+
+func planHistoryEvent(plan *transformPlan, event *protos.HistoryEvent) {
+	if event == nil {
+		return
 	}
 	var target **wrapperspb.StringValue
 	switch {
@@ -136,8 +173,17 @@ func TransformHistoryEvent(
 		target = &event.GetEventSent().Input
 	case event.GetEventRaised() != nil:
 		target = &event.GetEventRaised().Input
+	case event.GetGenericEvent() != nil:
+		target = &event.GetGenericEvent().Data
+	case event.GetHistoryState() != nil:
+		planOrchestrationState(plan, event.GetHistoryState().OrchestrationState)
+		return
 	case event.GetContinueAsNew() != nil:
 		target = &event.GetContinueAsNew().Input
+	case event.GetExecutionSuspended() != nil:
+		target = &event.GetExecutionSuspended().Input
+	case event.GetExecutionResumed() != nil:
+		target = &event.GetExecutionResumed().Input
 	case event.GetExecutionRewound() != nil:
 		target = &event.GetExecutionRewound().Input
 	case event.GetEntityOperationSignaled() != nil:
@@ -147,14 +193,18 @@ func TransformHistoryEvent(
 	case event.GetEntityOperationCompleted() != nil:
 		target = &event.GetEntityOperationCompleted().Output
 	default:
-		return nil
+		return
 	}
-	transformed, err := transform(ctx, options, *target)
-	if err != nil {
-		return err
+	plan.add(target)
+}
+
+func planOrchestrationState(plan *transformPlan, state *protos.OrchestrationState) {
+	if state == nil {
+		return
 	}
-	*target = transformed
-	return nil
+	plan.add(&state.Input)
+	plan.add(&state.Output)
+	plan.add(&state.CustomStatus)
 }
 
 func TransformOrchestratorRequest(
@@ -165,14 +215,13 @@ func TransformOrchestratorRequest(
 	if request == nil {
 		return nil
 	}
+	plan := newTransformPlan(options, Hydrate)
 	for _, events := range [][]*protos.HistoryEvent{request.PastEvents, request.NewEvents} {
 		for _, event := range events {
-			if err := TransformHistoryEvent(ctx, options, event, false); err != nil {
-				return err
-			}
+			planHistoryEvent(plan, event)
 		}
 	}
-	return nil
+	return plan.run(ctx)
 }
 
 func TransformOrchestratorResponse(
@@ -183,54 +232,38 @@ func TransformOrchestratorResponse(
 	if response == nil {
 		return nil
 	}
-	var err error
-	response.CustomStatus, err = Externalize(ctx, options, response.CustomStatus)
-	if err != nil {
-		return err
-	}
+	plan := newTransformPlan(options, Externalize)
+	plan.add(&response.CustomStatus)
 	for _, action := range response.Actions {
 		if action == nil {
 			continue
 		}
 		switch {
 		case action.GetScheduleTask() != nil:
-			action.GetScheduleTask().Input, err = Externalize(ctx, options, action.GetScheduleTask().Input)
+			plan.add(&action.GetScheduleTask().Input)
 		case action.GetCreateSubOrchestration() != nil:
-			action.GetCreateSubOrchestration().Input, err = Externalize(ctx, options, action.GetCreateSubOrchestration().Input)
+			plan.add(&action.GetCreateSubOrchestration().Input)
 		case action.GetSendEvent() != nil:
-			action.GetSendEvent().Data, err = Externalize(ctx, options, action.GetSendEvent().Data)
+			plan.add(&action.GetSendEvent().Data)
 		case action.GetCompleteOrchestration() != nil:
-			action.GetCompleteOrchestration().Result, err = Externalize(ctx, options, action.GetCompleteOrchestration().Result)
+			plan.add(&action.GetCompleteOrchestration().Result)
 		case action.GetTerminateOrchestration() != nil:
-			action.GetTerminateOrchestration().Reason, err = Externalize(ctx, options, action.GetTerminateOrchestration().Reason)
+			plan.add(&action.GetTerminateOrchestration().Reason)
 		case action.GetSendEntityMessage() != nil:
 			message := action.GetSendEntityMessage()
 			switch {
 			case message.GetEntityOperationSignaled() != nil:
-				message.GetEntityOperationSignaled().Input, err = Externalize(
-					ctx,
-					options,
-					message.GetEntityOperationSignaled().Input,
-				)
+				plan.add(&message.GetEntityOperationSignaled().Input)
 			case message.GetEntityOperationCalled() != nil:
-				message.GetEntityOperationCalled().Input, err = Externalize(
-					ctx,
-					options,
-					message.GetEntityOperationCalled().Input,
-				)
+				plan.add(&message.GetEntityOperationCalled().Input)
 			}
 		case action.GetRewindOrchestration() != nil:
 			for _, event := range action.GetRewindOrchestration().NewHistory {
-				if transformErr := TransformHistoryEvent(ctx, options, event, true); transformErr != nil {
-					return transformErr
-				}
+				planHistoryEvent(plan, event)
 			}
 		}
-		if err != nil {
-			return err
-		}
 	}
-	return nil
+	return plan.run(ctx)
 }
 
 func TransformActivityRequest(ctx context.Context, options *api.LargePayloadOptions, request *protos.ActivityRequest) error {
@@ -259,19 +292,15 @@ func TransformEntityBatchRequest(
 	if request == nil {
 		return nil
 	}
-	var err error
-	if request.EntityState, err = Hydrate(ctx, options, request.EntityState); err != nil {
-		return err
-	}
+	plan := newTransformPlan(options, Hydrate)
+	plan.add(&request.EntityState)
 	for _, operation := range request.Operations {
 		if operation == nil {
 			continue
 		}
-		if operation.Input, err = Hydrate(ctx, options, operation.Input); err != nil {
-			return err
-		}
+		plan.add(&operation.Input)
 	}
-	return nil
+	return plan.run(ctx)
 }
 
 func TransformEntityBatchResult(
@@ -282,21 +311,13 @@ func TransformEntityBatchResult(
 	if result == nil {
 		return nil
 	}
-	var err error
-	if result.EntityState, err = Externalize(ctx, options, result.EntityState); err != nil {
-		return err
-	}
+	plan := newTransformPlan(options, Externalize)
+	plan.add(&result.EntityState)
 	for _, operationResult := range result.Results {
 		if operationResult == nil || operationResult.GetSuccess() == nil {
 			continue
 		}
-		if operationResult.GetSuccess().Result, err = Externalize(
-			ctx,
-			options,
-			operationResult.GetSuccess().Result,
-		); err != nil {
-			return err
-		}
+		plan.add(&operationResult.GetSuccess().Result)
 	}
 	for _, action := range result.Actions {
 		if action == nil {
@@ -304,34 +325,18 @@ func TransformEntityBatchResult(
 		}
 		switch {
 		case action.GetSendSignal() != nil:
-			action.GetSendSignal().Input, err = Externalize(ctx, options, action.GetSendSignal().Input)
+			plan.add(&action.GetSendSignal().Input)
 		case action.GetStartNewOrchestration() != nil:
-			action.GetStartNewOrchestration().Input, err = Externalize(
-				ctx,
-				options,
-				action.GetStartNewOrchestration().Input,
-			)
-		}
-		if err != nil {
-			return err
+			plan.add(&action.GetStartNewOrchestration().Input)
 		}
 	}
-	return nil
+	return plan.run(ctx)
 }
 
 func TransformOrchestrationState(ctx context.Context, options *api.LargePayloadOptions, state *protos.OrchestrationState) error {
-	if state == nil {
-		return nil
-	}
-	var err error
-	if state.Input, err = Hydrate(ctx, options, state.Input); err != nil {
-		return err
-	}
-	if state.Output, err = Hydrate(ctx, options, state.Output); err != nil {
-		return err
-	}
-	state.CustomStatus, err = Hydrate(ctx, options, state.CustomStatus)
-	return err
+	plan := newTransformPlan(options, Hydrate)
+	planOrchestrationState(plan, state)
+	return plan.run(ctx)
 }
 
 func parseReference(value string, maxPayloadBytes int) (reference, bool, error) {
@@ -354,4 +359,49 @@ func parseReference(value string, maxPayloadBytes int) (reference, bool, error) 
 		return reference{}, true, fmt.Errorf("%w: invalid SHA-256 digest", api.ErrLargePayloadReference)
 	}
 	return ref, true, nil
+}
+
+func isRecognizedReference(value string) bool {
+	return api.IsLargePayloadReference(value)
+}
+
+func isBlobReference(value string) bool {
+	return strings.HasPrefix(value, api.AzureBlobPayloadReferencePrefixV1) ||
+		strings.HasPrefix(value, api.AzureBlobPayloadReferencePrefixV2)
+}
+
+// isNativePayloadToken reports whether value is a native token that the
+// configured store can handle, validating it when the store supports
+// validation. Azure Blob tokens are rejected when no token store can resolve
+// them so they are never mistaken for opaque payload data.
+func isNativePayloadToken(store api.LargePayloadTokenStore, value string) (bool, error) {
+	if store == nil || !store.IsLargePayloadToken(value) {
+		if isBlobReference(value) {
+			return false, fmt.Errorf(
+				"%w: Azure Blob payload token requires an Azure Blob token store",
+				api.ErrFeatureNotSupported,
+			)
+		}
+		return false, nil
+	}
+	if validator, ok := store.(api.LargePayloadTokenValidator); ok {
+		if err := validator.ValidateLargePayloadToken(value); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// exceedsThreshold reports whether a payload is large enough to externalize.
+// Stores such as Azure Blob externalize payloads exactly at the threshold,
+// while the built-in reference store externalizes only above it.
+func exceedsThreshold(options *api.LargePayloadOptions, size int) bool {
+	if size > options.ThresholdBytes {
+		return true
+	}
+	if size < options.ThresholdBytes {
+		return false
+	}
+	policy, ok := options.Store.(api.InclusiveLargePayloadThreshold)
+	return ok && policy.UsesInclusiveLargePayloadThreshold()
 }

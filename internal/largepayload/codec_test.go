@@ -73,11 +73,40 @@ func TestLargePayloadLimitAndMalformedReference(t *testing.T) {
 		ThresholdBytes:  1,
 		MaxPayloadBytes: 4,
 	}
+
 	_, err := Externalize(context.Background(), options, wrapperspb.String("oversized"))
 	require.ErrorIs(t, err, api.ErrLargePayloadTooLarge)
 
 	_, err = Hydrate(context.Background(), options, wrapperspb.String(referencePrefix+"not-base64"))
 	require.ErrorIs(t, err, api.ErrLargePayloadReference)
+}
+
+func TestNativeLargePayloadTokens(t *testing.T) {
+	store := nativeStore{}
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  4,
+		MaxPayloadBytes: 1024,
+	}
+	externalized, err := Externalize(context.Background(), options, wrapperspb.String("payload"))
+	require.NoError(t, err)
+	require.Equal(t, "blob:v2:https://account.example/payload", externalized.GetValue())
+
+	hydrated, err := Hydrate(context.Background(), options, externalized)
+	require.NoError(t, err)
+	require.Equal(t, "payload", hydrated.GetValue())
+	_, err = Hydrate(context.Background(), options, wrapperspb.String("blob:v2:malformed"))
+	require.ErrorIs(t, err, api.ErrLargePayloadReference)
+}
+
+func TestNativeLargePayloadThresholdIsInclusive(t *testing.T) {
+	store := inclusiveNativeStore{}
+	externalized, err := Externalize(context.Background(), &api.LargePayloadOptions{
+		Store: store, Resolver: store, ThresholdBytes: len("payload"), MaxPayloadBytes: 1024,
+	}, wrapperspb.String("payload"))
+	require.NoError(t, err)
+	require.Equal(t, "blob:v2:https://account.example/payload", externalized.GetValue())
 }
 
 func TestTransformOrchestratorResponsePayloadFields(t *testing.T) {
@@ -155,6 +184,33 @@ func TestTransformHistoryEventPayloadFields(t *testing.T) {
 			},
 		},
 		{
+			name: "generic data",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_GenericEvent{
+				GenericEvent: &protos.GenericEvent{Data: wrapperspb.String("generic")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetGenericEvent().Data
+			},
+		},
+		{
+			name: "execution suspended",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_ExecutionSuspended{
+				ExecutionSuspended: &protos.ExecutionSuspendedEvent{Input: wrapperspb.String("suspended")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetExecutionSuspended().Input
+			},
+		},
+		{
+			name: "execution resumed",
+			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_ExecutionResumed{
+				ExecutionResumed: &protos.ExecutionResumedEvent{Input: wrapperspb.String("resumed")},
+			}},
+			value: func(event *protos.HistoryEvent) *wrapperspb.StringValue {
+				return event.GetExecutionResumed().Input
+			},
+		},
+		{
 			name: "event sent",
 			event: &protos.HistoryEvent{EventType: &protos.HistoryEvent_EventSent{
 				EventSent: &protos.EventSentEvent{Input: wrapperspb.String("sent")},
@@ -218,6 +274,7 @@ func TestTransformHistoryEventPayloadFields(t *testing.T) {
 			},
 		},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			original := test.value(test.event).GetValue()
@@ -227,6 +284,29 @@ func TestTransformHistoryEventPayloadFields(t *testing.T) {
 			require.Equal(t, original, test.value(test.event).GetValue())
 		})
 	}
+}
+
+func TestTransformHistoryStateEventPayloadFields(t *testing.T) {
+	store := payload.NewMemoryStore()
+	options := &api.LargePayloadOptions{
+		Store:           store,
+		Resolver:        store,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}
+	state := &protos.OrchestrationState{
+		Input:        wrapperspb.String("input"),
+		Output:       wrapperspb.String("output"),
+		CustomStatus: wrapperspb.String("status"),
+	}
+	event := &protos.HistoryEvent{EventType: &protos.HistoryEvent_HistoryState{
+		HistoryState: &protos.HistoryStateEvent{OrchestrationState: state},
+	}}
+	require.NoError(t, TransformHistoryEvent(context.Background(), options, event, true))
+	require.NoError(t, TransformHistoryEvent(context.Background(), options, event, false))
+	require.Equal(t, "input", state.Input.GetValue())
+	require.Equal(t, "output", state.Output.GetValue())
+	require.Equal(t, "status", state.CustomStatus.GetValue())
 }
 
 func TestTransformEntityBatchPayloadFields(t *testing.T) {
@@ -307,3 +387,27 @@ func (r staticResolver) Resolve(context.Context, string) ([]byte, error) {
 func (staticResolver) Store(context.Context, []byte) (string, error) {
 	return "", errors.New("not implemented")
 }
+
+type nativeStore struct{}
+
+func (nativeStore) Store(context.Context, []byte) (string, error)   { return "", nil }
+func (nativeStore) Resolve(context.Context, string) ([]byte, error) { return []byte("payload"), nil }
+func (nativeStore) StoreToken(context.Context, []byte) (string, error) {
+	return "blob:v2:https://account.example/payload", nil
+}
+func (nativeStore) ResolveToken(context.Context, string) ([]byte, error) {
+	return []byte("payload"), nil
+}
+func (nativeStore) IsLargePayloadToken(value string) bool {
+	return len(value) >= len("blob:v2:") && value[:len("blob:v2:")] == "blob:v2:"
+}
+func (nativeStore) ValidateLargePayloadToken(value string) error {
+	if value != "blob:v2:https://account.example/payload" {
+		return api.ErrLargePayloadReference
+	}
+	return nil
+}
+
+type inclusiveNativeStore struct{ nativeStore }
+
+func (inclusiveNativeStore) UsesInclusiveLargePayloadThreshold() bool { return true }

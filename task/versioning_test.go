@@ -195,6 +195,114 @@ func TestVersionedRegistryDispatchAndSchedulingDefaults(t *testing.T) {
 	}
 }
 
+func TestAllowedUnversionedSystemOrchestratorBypassesStrictVersionMatch(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("system", func(*OrchestrationContext) (any, error) {
+		return "ok", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewTaskExecutor(
+		registry,
+		WithVersioning(VersioningOptions{
+			Version:       "1.0",
+			MatchStrategy: VersionMatchStrict,
+		}),
+		WithUnversionedOrchestratorNames("system"),
+	)
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		"system-instance",
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewExecutionStartedEvent("system", "system-instance", nil, nil, nil, nil, wrapperspb.String("")),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Response.Actions[len(result.Response.Actions)-1].GetCompleteOrchestration() == nil {
+		t.Fatalf("system orchestrator did not complete: %#v", result.Response.Actions)
+	}
+}
+
+// TestAllowedUnversionedSystemActivityBypassesStrictVersionMatch covers the
+// activity half of the same contract: a system orchestration runs unversioned,
+// and an activity inherits its caller's version, so its work item arrives
+// unversioned and would otherwise be rejected by a strict worker.
+func TestAllowedUnversionedSystemActivityBypassesStrictVersionMatch(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddActivityN("SystemActivity", func(ActivityContext) (any, error) {
+		return "ok", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := helpers.NewTaskScheduledEvent(1, "SystemActivity", wrapperspb.String(""), nil, nil)
+	versioning := VersioningOptions{Version: "1.0", MatchStrategy: VersionMatchStrict}
+
+	rejected := NewTaskExecutor(registry, WithVersioning(versioning))
+	if _, err := rejected.ExecuteActivity(context.Background(), "system-instance", scheduled); err == nil {
+		t.Fatal("expected a strict version mismatch without the allow-list")
+	}
+
+	allowed := NewTaskExecutor(
+		registry,
+		WithVersioning(versioning),
+		WithUnversionedActivityNames("systemactivity"),
+	)
+	response, err := allowed.ExecuteActivity(context.Background(), "system-instance", scheduled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetTaskCompleted() == nil {
+		t.Fatalf("system activity did not complete: %#v", response)
+	}
+
+	// A versioned work item for the same name is still version-checked.
+	versionedScheduled := helpers.NewTaskScheduledEvent(2, "SystemActivity", wrapperspb.String("9.9"), nil, nil)
+	if _, err := allowed.ExecuteActivity(context.Background(), "system-instance", versionedScheduled); err == nil {
+		t.Fatal("expected a strict version mismatch for a versioned work item")
+	}
+}
+
+func TestSubOrchestrationOptionsAddTagsAndContextFields(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("parent", func(ctx *OrchestrationContext) (any, error) {
+		ctx.CallSubOrchestrator(
+			"child",
+			WithSubOrchestrationTags(map[string]string{"schedule": "daily"}),
+			WithSubOrchestrationContextFields(api.ContextFields{"tenant": "north"}),
+		)
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewTaskExecutor(registry)
+	result, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		"parent-instance",
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range result.Response.Actions {
+		if created := action.GetCreateSubOrchestration(); created != nil {
+			if created.Tags["schedule"] != "daily" {
+				t.Fatalf("tags = %#v", created.Tags)
+			}
+			if created.Tags["__durabletask.context.field.tenant"] != "north" {
+				t.Fatalf("context tags = %#v", created.Tags)
+			}
+			return
+		}
+	}
+	t.Fatal("missing sub-orchestration action")
+}
+
 func TestExplicitUnversionedSchedulingOverridesDefaults(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {
