@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced protobuf failure details in public metadata with `api.FailureDetails`. `RetryPolicy.Handle` now receives deterministic `task.RetryContext`, and non-retriable or canceled failures bypass the handler.
 - `FetchEntityMetadata` now returns `api.ErrInstanceNotFound` when the entity does not exist.
 - Large-payload externalization now uses an inclusive threshold boundary to match the .NET Azure Blob payload extension.
+- Same-name live external-event waiters now use the Durable Task .NET LIFO replay contract, while events buffered before a waiter remain FIFO. This replay-contract change can reassign events for in-flight orchestrations that already have multiple concurrent same-name waits, so drain those instances before upgrading.
 
 ## [v0.6.0] - 2025-02-05
 

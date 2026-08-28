@@ -897,7 +897,9 @@ func (ctx *OrchestrationContext) createTimerInternal(
 // wait indefinitely for the event to be received.
 //
 // Orchestrators can wait for the same event name multiple times, so waiting for multiple events with the same name
-// is allowed. Each event received by an orchestrator will complete just one task returned by this method.
+// is allowed. Each event received by an orchestrator will complete just one task returned by this method. Live
+// waiters use LIFO ordering, so the newest waiter receives the next event. Events buffered before any waiter exists
+// retain FIFO arrival order. This ordering is part of the deterministic replay contract.
 //
 // Note that event names are case-insensitive.
 func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout time.Duration) Task {
@@ -921,11 +923,13 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 			engine.pendingExternalEventTasks[key] = taskList
 		}
 		taskElement := taskList.PushBack(task)
+		task.onCompleted(func() {
+			engine.removePendingEventTask(key, taskElement)
+		})
 
 		if timeout > 0 {
 			engine.createTimerInternal(timeout, ctx.scope).onCompleted(func() {
 				task.cancel()
-				engine.removePendingEventTask(key, taskElement)
 			})
 		}
 	}
@@ -1300,17 +1304,10 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) error {
 	er := e.GetEventRaised()
 	key := strings.ToUpper(er.GetName())
-	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok {
-		for pendingTasks.Len() > 0 {
-			elem := pendingTasks.Front()
-			task := elem.Value.(*completableTask)
-			ctx.removePendingEventTask(key, elem)
-			if task.isCompleted {
-				continue
-			}
-			task.complete([]byte(er.Input.GetValue()))
-			return nil
-		}
+	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok && pendingTasks.Len() > 0 {
+		task := pendingTasks.Back().Value.(*completableTask)
+		task.complete([]byte(er.Input.GetValue()))
+		return nil
 	}
 
 	// No live waiter consumed the event, so keep it for a future receiver.
