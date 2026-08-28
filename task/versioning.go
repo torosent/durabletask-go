@@ -86,8 +86,8 @@ func (*VersionMismatchError) Is(target error) bool {
 	return target == api.ErrVersionMismatch
 }
 
-// WorkItemAbandonDelay prevents local workers from immediately re-dequeuing
-// version-incompatible activity work items.
+// WorkItemAbandonDelay asks the worker to delay redelivery of a
+// version-incompatible activity work item instead of retrying it immediately.
 func (*VersionMismatchError) WorkItemAbandonDelay() time.Duration {
 	return time.Second
 }

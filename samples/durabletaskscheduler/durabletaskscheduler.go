@@ -1,3 +1,9 @@
+// Command durabletaskscheduler demonstrates the Durable Task Scheduler surface:
+// versioned registrations, tagged scheduling, orchestration history, and
+// recurring scheduled tasks.
+//
+//	export DTS_CONNECTION_STRING="Endpoint=http://localhost:8080;TaskHub=default;Authentication=None"
+//	go run ./samples/durabletaskscheduler
 package main
 
 import (
@@ -5,13 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
-	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
+	"github.com/microsoft/durabletask-go/samples/internal/dtssample"
 	"github.com/microsoft/durabletask-go/task"
 )
 
@@ -22,13 +26,9 @@ func main() {
 }
 
 func run() error {
-	connectionString := os.Getenv("DTS_CONNECTION_STRING")
-	if connectionString == "" {
-		return fmt.Errorf("DTS_CONNECTION_STRING is required")
-	}
-	options, err := durabletaskscheduler.NewOptionsFromConnectionString(connectionString)
+	options, err := dtssample.Options()
 	if err != nil {
-		return fmt.Errorf("invalid DTS connection string: %w", err)
+		return err
 	}
 	options.Versioning = &task.VersioningOptions{
 		DefaultVersion: "1.0",
@@ -46,40 +46,19 @@ func run() error {
 		return err
 	}
 
-	logger := backend.DefaultLogger()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	// Connect a client and worker to the Durable Task Scheduler task hub
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-
-	schedulerClient, err := durabletaskscheduler.NewClient(ctx, options, logger)
+	app, err := dtssample.StartWithOptions(ctx, options, registry, durabletaskscheduler.WithScheduledTasks())
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := schedulerClient.Close(); err != nil {
-			log.Printf("failed to close DTS client: %v", err)
+		if err := app.Shutdown(); err != nil {
+			log.Printf("Failed to shut down: %v", err)
 		}
 	}()
-
-	worker, err := durabletaskscheduler.NewWorker(
-		options,
-		registry,
-		logger,
-		durabletaskscheduler.WithScheduledTasks(),
-		durabletaskclient.WithAutoWorkItemFilters(),
-	)
-	if err != nil {
-		return err
-	}
-	if err := worker.Start(ctx); err != nil {
-		return err
-	}
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		if err := worker.Shutdown(shutdownCtx); err != nil {
-			log.Printf("failed to stop DTS worker: %v", err)
-		}
-	}()
+	schedulerClient := app.Client
 
 	instanceID, err := schedulerClient.ScheduleNewOrchestration(
 		ctx,

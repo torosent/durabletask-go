@@ -17,7 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-type largePayloadSidecarClient struct {
+type largePayloadSchedulerClient struct {
 	protos.TaskHubSidecarServiceClient
 	start     *protos.CreateInstanceRequest
 	event     *protos.RaiseEventRequest
@@ -26,7 +26,7 @@ type largePayloadSidecarClient struct {
 	state     *protos.OrchestrationState
 }
 
-func (c *largePayloadSidecarClient) StartInstance(
+func (c *largePayloadSchedulerClient) StartInstance(
 	_ context.Context,
 	req *protos.CreateInstanceRequest,
 	_ ...grpc.CallOption,
@@ -35,7 +35,7 @@ func (c *largePayloadSidecarClient) StartInstance(
 	return &protos.CreateInstanceResponse{InstanceId: req.InstanceId}, nil
 }
 
-func (c *largePayloadSidecarClient) RaiseEvent(
+func (c *largePayloadSchedulerClient) RaiseEvent(
 	_ context.Context,
 	req *protos.RaiseEventRequest,
 	_ ...grpc.CallOption,
@@ -44,7 +44,7 @@ func (c *largePayloadSidecarClient) RaiseEvent(
 	return &protos.RaiseEventResponse{}, nil
 }
 
-func (c *largePayloadSidecarClient) TerminateInstance(
+func (c *largePayloadSchedulerClient) TerminateInstance(
 	_ context.Context,
 	req *protos.TerminateRequest,
 	_ ...grpc.CallOption,
@@ -53,7 +53,7 @@ func (c *largePayloadSidecarClient) TerminateInstance(
 	return &protos.TerminateResponse{}, nil
 }
 
-func (c *largePayloadSidecarClient) SignalEntity(
+func (c *largePayloadSchedulerClient) SignalEntity(
 	_ context.Context,
 	req *protos.SignalEntityRequest,
 	_ ...grpc.CallOption,
@@ -62,7 +62,7 @@ func (c *largePayloadSidecarClient) SignalEntity(
 	return &protos.SignalEntityResponse{}, nil
 }
 
-func (c *largePayloadSidecarClient) GetInstance(
+func (c *largePayloadSchedulerClient) GetInstance(
 	context.Context,
 	*protos.GetInstanceRequest,
 	...grpc.CallOption,
@@ -100,7 +100,7 @@ func TestTaskHubGrpcClientLargePayloadManagementFields(t *testing.T) {
 		ThresholdBytes:  1,
 		MaxPayloadBytes: 1024,
 	}
-	fake := &largePayloadSidecarClient{}
+	fake := &largePayloadSchedulerClient{}
 	client := &TaskHubGrpcClient{
 		client:        fake,
 		logger:        backend.DefaultLogger(),
@@ -148,7 +148,7 @@ func TestTaskHubGrpcClientUsesConverterBeforeLargePayloadExternalization(t *test
 		ThresholdBytes:  1,
 		MaxPayloadBytes: 1024,
 	}
-	fake := &largePayloadSidecarClient{}
+	fake := &largePayloadSchedulerClient{}
 	converter := textDataConverter{}
 	client := &TaskHubGrpcClient{
 		client:        fake,

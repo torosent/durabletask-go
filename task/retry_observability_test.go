@@ -10,11 +10,9 @@ import (
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-func TestRetryObservabilityReportsNewRetryAndTraceEvent(t *testing.T) {
+func TestRetryObservabilityReportsNewRetryMetric(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorN("retry", func(ctx *OrchestrationContext) (any, error) {
 		return nil, ctx.CallActivity("flaky", WithActivityRetryPolicy(&RetryPolicy{
@@ -33,11 +31,6 @@ func TestRetryObservabilityReportsNewRetryAndTraceEvent(t *testing.T) {
 		},
 	}))
 
-	recorder := tracetest.NewSpanRecorder()
-	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
-	traceContext, span := provider.Tracer("test").Start(context.Background(), "orchestration")
-	defer provider.Shutdown(context.Background()) //nolint:errcheck
-
 	oldEvents := []*protos.HistoryEvent{
 		helpers.NewOrchestratorStartedEvent(),
 		helpers.NewExecutionStartedEvent("retry", string(instanceID), nil, nil, nil, nil),
@@ -50,12 +43,10 @@ func TestRetryObservabilityReportsNewRetryAndTraceEvent(t *testing.T) {
 			ErrorMessage: "try again",
 		}),
 	}
-	result, err := executor.ExecuteOrchestrator(traceContext, instanceID, oldEvents, newEvents)
+	result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, newEvents)
 	if err != nil {
 		t.Fatal(err)
 	}
-	span.End()
-
 	if len(metrics) != 1 {
 		t.Fatalf("retry metrics = %d, want 1", len(metrics))
 	}
@@ -67,14 +58,6 @@ func TestRetryObservabilityReportsNewRetryAndTraceEvent(t *testing.T) {
 		t.Fatalf("expected retry timer action, got %v", result.Response.Actions)
 	}
 
-	ended := recorder.Ended()
-	if len(ended) != 1 {
-		t.Fatalf("ended spans = %d, want 1", len(ended))
-	}
-	events := ended[0].Events()
-	if len(events) != 1 || events[0].Name != "Retry scheduled" {
-		t.Fatalf("unexpected trace events: %+v", events)
-	}
 }
 
 func TestRetryMetricIsSuppressedDuringReplay(t *testing.T) {

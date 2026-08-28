@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -271,7 +272,7 @@ func newOrchestrationContext(
 		errorProperties:           errorProperties,
 		logger:                    logger,
 		metrics:                   metrics,
-		orchestrationOptions:      options,
+		orchestrationOptions:      normalizeOrchestrationOptions(options),
 		defaultVersion:            defaultVersion,
 		converter:                 api.NormalizeDataConverter(converter),
 		registry:                  registry,
@@ -497,6 +498,11 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	defer ctx.syncDerivedContexts()
 	// Buffer certain events if we're in a suspended state
 	if ctx.isSuspended && (e.GetExecutionResumed() == nil && e.GetExecutionTerminated() == nil) {
+		if e.GetExecutionSuspended() != nil {
+			// A redundant suspend is a no-op. Buffering it would re-suspend the
+			// orchestration when the matching resume drains the buffer.
+			return nil
+		}
 		ctx.suspendedEvents = append(ctx.suspendedEvents, replayEvent{
 			event:       e,
 			isReplaying: ctx.IsReplaying,
@@ -553,7 +559,7 @@ func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
 	} else if oc := e.GetOrchestratorCompleted(); oc != nil {
 		// Nothing to do
 	} else if e.GetGenericEvent() != nil || e.GetExecutionRewound() != nil {
-		// Backend control markers are replay no-ops.
+		// Service control markers are replay no-ops.
 	} else {
 		err = fmt.Errorf("don't know how to handle event: %v", e)
 	}
@@ -878,7 +884,54 @@ func (ctx *OrchestrationContext) createTimerInternal(
 	if scope.isCanceled() {
 		return newTaskInScope(ctx, scope)
 	}
-	fireAt := ctx.CurrentTimeUtc.Add(delay)
+
+	logicalTimer := newTaskInScope(ctx, scope)
+	deadline := ctx.CurrentTimeUtc.Add(delay)
+	if err := timestamppb.New(deadline).CheckValid(); err != nil {
+		logicalTimer.failLocal(api.WrapInvalidArgument(fmt.Errorf("timer deadline %v is out of range: %w", deadline, err)))
+		return logicalTimer
+	}
+
+	var scheduleNextChunk func()
+	scheduleNextChunk = func() {
+		if logicalTimer.isCompleted {
+			return
+		}
+
+		fireAt := deadline
+		isFinalChunk := true
+		maximumInterval := ctx.orchestrationOptions.MaximumTimerInterval
+		if deadline.Sub(ctx.CurrentTimeUtc) > maximumInterval {
+			fireAt = ctx.CurrentTimeUtc.Add(maximumInterval)
+			isFinalChunk = false
+		}
+		chunk := ctx.createTimerAction(fireAt, scope)
+		chunk.onCompleted(func() {
+			if logicalTimer.isCompleted {
+				return
+			}
+			// A pre-splitting worker recorded the logical deadline as one timer.
+			// If replay reaches that historical TimerFired event, CurrentTimeUtc
+			// is already at or beyond the deadline and no intermediate chunk may
+			// consume the next sequence number.
+			if isFinalChunk ||
+				(!chunk.timerFireAt.IsZero() && !deadline.After(chunk.timerFireAt)) ||
+				!deadline.After(ctx.CurrentTimeUtc) ||
+				chunk.isCanceled || chunk.localErr != nil || chunk.failureDetails != nil {
+				logicalTimer.completeFrom(chunk, nil)
+				return
+			}
+			scheduleNextChunk()
+		})
+	}
+	scheduleNextChunk()
+	return logicalTimer
+}
+
+func (ctx *OrchestrationContext) createTimerAction(
+	fireAt time.Time,
+	scope *cancellationScope,
+) *completableTask {
 	timerAction := helpers.NewCreateTimerAction(ctx.getNextSequenceNumber(), fireAt)
 	ctx.pendingActions[timerAction.Id] = timerAction
 
@@ -897,7 +950,9 @@ func (ctx *OrchestrationContext) createTimerInternal(
 // wait indefinitely for the event to be received.
 //
 // Orchestrators can wait for the same event name multiple times, so waiting for multiple events with the same name
-// is allowed. Each event received by an orchestrator will complete just one task returned by this method.
+// is allowed. Each event received by an orchestrator will complete just one task returned by this method. Live
+// waiters use LIFO ordering, so the newest waiter receives the next event. Events buffered before any waiter exists
+// retain FIFO arrival order. This ordering is part of the deterministic replay contract.
 //
 // Note that event names are case-insensitive.
 func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout time.Duration) Task {
@@ -921,11 +976,13 @@ func (ctx *OrchestrationContext) WaitForSingleEvent(eventName string, timeout ti
 			engine.pendingExternalEventTasks[key] = taskList
 		}
 		taskElement := taskList.PushBack(task)
+		task.onCompleted(func() {
+			engine.removePendingEventTask(key, taskElement)
+		})
 
 		if timeout > 0 {
 			engine.createTimerInternal(timeout, ctx.scope).onCompleted(func() {
 				task.cancel()
-				engine.removePendingEventTask(key, taskElement)
 			})
 		}
 	}
@@ -1293,6 +1350,9 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 	delete(ctx.pendingTasks, timerID)
 
 	// completing a task will resume the corresponding Await() call
+	if tf.GetFireAt() != nil {
+		task.timerFireAt = tf.GetFireAt().AsTime()
+	}
 	task.complete(nil)
 	return nil
 }
@@ -1300,17 +1360,10 @@ func (ctx *OrchestrationContext) onTimerFired(tf *protos.TimerFiredEvent) error 
 func (ctx *OrchestrationContext) onExternalEventRaised(e *protos.HistoryEvent) error {
 	er := e.GetEventRaised()
 	key := strings.ToUpper(er.GetName())
-	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok {
-		for pendingTasks.Len() > 0 {
-			elem := pendingTasks.Front()
-			task := elem.Value.(*completableTask)
-			ctx.removePendingEventTask(key, elem)
-			if task.isCompleted {
-				continue
-			}
-			task.complete([]byte(er.Input.GetValue()))
-			return nil
-		}
+	if pendingTasks, ok := ctx.pendingExternalEventTasks[key]; ok && pendingTasks.Len() > 0 {
+		task := pendingTasks.Back().Value.(*completableTask)
+		task.complete([]byte(er.Input.GetValue()))
+		return nil
 	}
 
 	// No live waiter consumed the event, so keep it for a future receiver.
@@ -1416,6 +1469,14 @@ func (ctx *OrchestrationContext) onExecutionResumed(er *protos.ExecutionResumedE
 
 func (ctx *OrchestrationContext) onExecutionTerminated(et *protos.ExecutionTerminatedEvent) error {
 	ctx.isTerminated = true
+	// Termination wins over suspension: clearing the flag lets the completion
+	// action be emitted and discards events that can no longer be processed.
+	ctx.isSuspended = false
+	ctx.suspendedEvents = nil
+	// Termination can arrive in the same work item that lets the root coroutine
+	// complete naturally. Keep exactly one terminal action, with termination
+	// taking precedence over the pending natural completion.
+	ctx.clearCompletionActions()
 	return ctx.setCompleteInternal(et.Input, protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED, nil)
 }
 
