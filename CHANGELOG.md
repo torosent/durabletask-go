@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DTS authentication now caches access tokens and immutable gRPC metadata, honors credential `RefreshOn` guidance, and coalesces concurrent refreshes and failures. Previously credentials such as `AzureCLICredential` were invoked for every RPC, serializing high-throughput workers behind external token acquisition.
+- Disabled large-payload handling no longer builds transform closures, maps, and goroutines for ordinary payloads. Reserved payload-reference prefixes are still rejected when no store and resolver are configured.
+- Worker completion and abandon RPCs no longer retry `NotFound` responses ten times. A completion whose work item is already unavailable is dropped for normal DTS redelivery without a second, guaranteed-failing abandon RPC.
+- The gRPC worker no longer deep-clones freshly owned orchestrator and entity executor results before adding transport fields and externalizing payloads.
 - gRPC worker reconnect and transient RPC retry delays are now deterministic and always within the configured `[baseDelay, maxDelay]` bounds. The previous randomized exponential backoff could wait up to 50% less than the configured base delay and up to 50% longer than the configured maximum, and doubling now saturates instead of overflowing to a non-positive duration for very large configured maximums, which would have produced an unthrottled reconnect loop.
 - A work item that the service delivers concurrently with the gRPC worker's silent-disconnect timeout is now processed instead of dropped. Previously the racing message was discarded without being abandoned, so the service considered it dispatched and it could only be redelivered after its lock expired.
 - `client.WithMaxConcurrentOrchestrationWorkItems`, `WithMaxConcurrentActivityWorkItems`, and `WithMaxConcurrentEntityWorkItems` now reject limits above `math.MaxInt32`. Previously such a limit silently wrapped to a negative value in the 32-bit `GetWorkItems` fields advertised to the service.

@@ -154,6 +154,26 @@ func TestWorkerTransientRPCRetryFollowsTheDeterministicSchedule(t *testing.T) {
 	}, waits.snapshot())
 }
 
+func TestWorkerDoesNotRetryExpiredWorkItemLease(t *testing.T) {
+	waits := &recordedWaits{}
+	worker := newFakeWorker(
+		t,
+		&fakeSchedulerClient{stream: newFakeWorkItemStream(0)},
+		WithWorkerTransientRetryPolicy(4, 10*time.Millisecond, 40*time.Millisecond),
+		withRecordedWaits(waits),
+	)
+
+	var attempts atomic.Int32
+	err := worker.executeRPCWithRetry(context.Background(), "complete task", func(context.Context) error {
+		attempts.Add(1)
+		return status.Error(codes.NotFound, "work item not found")
+	})
+	require.ErrorContains(t, err, "non-retryable")
+	require.EqualValues(t, 1, attempts.Load())
+	require.Empty(t, waits.snapshot())
+	require.True(t, isWorkItemGone(err))
+}
+
 // replayStream delivers a fixed number of health pings and then reports the
 // silent-disconnect sentinel, standing in for a stream that ends without ever
 // producing a server-side error.

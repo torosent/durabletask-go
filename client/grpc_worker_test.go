@@ -95,6 +95,7 @@ type fakeSchedulerClient struct {
 	orchestrationCompletions []*protos.OrchestratorResponse
 	activityCompletions      []*protos.ActivityResponse
 	entityCompletions        []*protos.EntityBatchResult
+	activityCompletionErr    error
 	orchestrationAbandons    int
 	activityAbandons         int
 	entityAbandonAttempts    int
@@ -136,7 +137,7 @@ func (c *fakeSchedulerClient) CompleteActivityTask(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.activityCompletions = append(c.activityCompletions, response)
-	return &protos.CompleteTaskResponse{}, nil
+	return &protos.CompleteTaskResponse{}, c.activityCompletionErr
 }
 
 func (c *fakeSchedulerClient) CompleteEntityTask(
@@ -311,6 +312,47 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerDoesNotAbandonExpiredActivityLease(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSchedulerClient{
+		stream:                stream,
+		activityCompletionErr: status.Error(codes.NotFound, "work item not found"),
+	}
+	worker := newFakeWorker(t, client)
+	worker.executor = &recordingExecutor{
+		executeActivity: func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error) {
+			return &protos.HistoryEvent{
+				EventType: &protos.HistoryEvent_TaskCompleted{
+					TaskCompleted: &protos.TaskCompletedEvent{Result: wrapperspb.String(`"done"`)},
+				},
+			}, nil
+		},
+	}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_ActivityRequest{ActivityRequest: &protos.ActivityRequest{
+			Name:                  "activity",
+			TaskId:                7,
+			OrchestrationInstance: &protos.OrchestrationInstance{InstanceId: "instance"},
+		}},
+		CompletionToken: "expired-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return len(client.activityCompletions) == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	require.Len(t, client.activityCompletions, 1)
+	require.Zero(t, client.activityAbandons)
 }
 
 func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
