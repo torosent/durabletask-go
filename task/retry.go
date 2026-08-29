@@ -3,12 +3,10 @@ package task
 import (
 	"fmt"
 	"time"
-
-	"github.com/microsoft/durabletask-go/backend"
 )
 
 type retryTaskInfo struct {
-	kind    backend.WorkItemKind
+	kind    WorkItemKind
 	name    string
 	version string
 }
@@ -24,7 +22,7 @@ func (ctx *OrchestrationContext) reportRetry(
 	if engine.IsReplaying || engine.metrics.Retry == nil {
 		return
 	}
-	metric := backend.RetryMetric{
+	metric := RetryMetric{
 		InstanceID:           engine.ID,
 		OrchestrationName:    engine.Name,
 		OrchestrationVersion: engine.Version,

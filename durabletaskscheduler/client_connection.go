@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -39,7 +39,7 @@ type recreatingClientConn struct {
 	recreateContext     context.Context
 	cancelRecreate      context.CancelFunc
 	recreateWait        sync.WaitGroup
-	logger              backend.Logger
+	logger              api.Logger
 	closed              bool
 	closeOnce           sync.Once
 	closeErr            error
@@ -50,7 +50,7 @@ func newRecreatingClientConn(
 	factory clientTransportFactory,
 	failureThreshold int,
 	minRecreateInterval time.Duration,
-	logger backend.Logger,
+	logger api.Logger,
 ) *recreatingClientConn {
 	recreateContext, cancelRecreate := context.WithCancel(context.Background())
 	return &recreatingClientConn{

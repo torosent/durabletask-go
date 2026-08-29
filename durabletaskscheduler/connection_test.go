@@ -12,7 +12,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -495,7 +494,7 @@ func TestConfiguredClientAndWorkerUseSeparateMetadataAndConnections(t *testing.T
 	options.WorkerID = "worker-id"
 	options.dialer = bufconnDialer(listener)
 
-	managementClient, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	managementClient, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, managementClient.Close())
@@ -508,7 +507,7 @@ func TestConfiguredClientAndWorkerUseSeparateMetadataAndConnections(t *testing.T
 	worker, err := NewWorker(
 		options,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		durabletaskclient.WithWorkerSilentDisconnectTimeout(time.Second),
 	)
 	require.NoError(t, err)
@@ -536,7 +535,7 @@ func TestClientCloseStopsCompatibilityListener(t *testing.T) {
 	)
 	require.NoError(t, err)
 	options.dialer = bufconnDialer(listener)
-	managementClient, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	managementClient, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.NoError(t, err)
 	<-server.metadata
 	require.NoError(t, managementClient.StartWorkItemListener(context.Background(), task.NewTaskRegistry()))
@@ -563,10 +562,59 @@ func TestNewClientFailsFastWhenHelloIsRejected(t *testing.T) {
 	require.NoError(t, err)
 	options.dialer = bufconnDialer(listener)
 
-	managementClient, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	managementClient, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.Nil(t, managementClient)
 	require.ErrorContains(t, err, "Hello")
 	require.ErrorContains(t, err, "PermissionDenied")
+}
+
+func TestNewClientReceivesMessagesLargerThanGrpcDefault(t *testing.T) {
+	const payloadSize = 5 * 1024 * 1024
+	server := &metadataServer{
+		metadata: make(chan metadata.MD, 4),
+		state: &protos.OrchestrationState{
+			InstanceId:           "large-message",
+			Name:                 "orchestrator",
+			OrchestrationStatus:  protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED,
+			CreatedTimestamp:     timestamppb.Now(),
+			LastUpdatedTimestamp: timestamppb.Now(),
+			Input:                wrapperspb.String(strings.Repeat("x", payloadSize)),
+		},
+	}
+	listener, stop := startBufconnServer(t, server)
+	defer stop()
+
+	options := NewOptions("http://bufconn", "default")
+	options.Authentication = AuthenticationNone
+	options.AllowInsecureConnection = true
+	options.dialer = bufconnDialer(listener)
+	managementClient, err := NewClient(context.Background(), options, api.DefaultLogger())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, managementClient.Close())
+	}()
+
+	result, err := managementClient.FetchOrchestrationMetadata(
+		context.Background(),
+		"large-message",
+		api.WithFetchPayloads(true),
+	)
+	require.NoError(t, err)
+	require.Len(t, result.SerializedInput, payloadSize)
+
+	limitedOptions := *options
+	limitedOptions.MaxReceiveMessageSize = 1024 * 1024
+	limitedClient, err := NewClient(context.Background(), &limitedOptions, api.DefaultLogger())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, limitedClient.Close())
+	}()
+	_, err = limitedClient.FetchOrchestrationMetadata(
+		context.Background(),
+		"large-message",
+		api.WithFetchPayloads(true),
+	)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 }
 
 func TestNewClientRecreatesChannelAndPreservesConfiguration(t *testing.T) {
@@ -625,7 +673,7 @@ func TestNewClientRecreatesChannelAndPreservesConfiguration(t *testing.T) {
 		return listener.Dial()
 	}
 
-	client, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	client, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, client.Close())
@@ -887,7 +935,7 @@ func TestNewClientHelloUsesConfiguredTimeout(t *testing.T) {
 	options.HelloTimeout = 100 * time.Millisecond
 
 	start := time.Now()
-	client, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	client, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.Nil(t, client)
 	require.ErrorContains(t, err, "DTS client Hello failed")
 	require.Equal(t, codes.DeadlineExceeded, status.Code(errors.Unwrap(err)))
@@ -903,7 +951,7 @@ func TestNewClientHelloSucceedsWithinTimeout(t *testing.T) {
 	options := insecureBufconnOptions(t, listener)
 	options.HelloTimeout = 10 * time.Second
 
-	client, err := NewClient(context.Background(), options, backend.DefaultLogger())
+	client, err := NewClient(context.Background(), options, api.DefaultLogger())
 	require.NoError(t, err)
 	require.NoError(t, client.Close())
 }
@@ -919,7 +967,7 @@ func TestNewClientHonorsCallerContextDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	client, err := NewClient(ctx, options, backend.DefaultLogger())
+	client, err := NewClient(ctx, options, api.DefaultLogger())
 	require.Nil(t, client)
 	require.ErrorContains(t, err, "DTS client Hello failed")
 }
@@ -933,7 +981,7 @@ func TestNewWorkerHelloUsesConfiguredTimeout(t *testing.T) {
 	options := insecureBufconnOptions(t, listener)
 	options.HelloTimeout = 100 * time.Millisecond
 
-	worker, err := NewWorker(options, task.NewTaskRegistry(), backend.DefaultLogger())
+	worker, err := NewWorker(options, task.NewTaskRegistry(), api.DefaultLogger())
 	require.NoError(t, err)
 
 	start := time.Now()
@@ -956,7 +1004,7 @@ func TestNewWorkerHelloTimeoutOptionOverridesOptions(t *testing.T) {
 	worker, err := NewWorker(
 		options,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		durabletaskclient.WithWorkerHelloTimeout(100*time.Millisecond),
 	)
 	require.NoError(t, err)
@@ -1015,11 +1063,11 @@ func TestNewClientAndNewWorkerRejectInvalidOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, err := NewClient(context.Background(), tt.options, backend.DefaultLogger())
+			client, err := NewClient(context.Background(), tt.options, api.DefaultLogger())
 			require.Nil(t, client)
 			require.ErrorContains(t, err, tt.wantErr)
 
-			worker, err := NewWorker(tt.options, task.NewTaskRegistry(), backend.DefaultLogger())
+			worker, err := NewWorker(tt.options, task.NewTaskRegistry(), api.DefaultLogger())
 			require.Nil(t, worker)
 			require.ErrorContains(t, err, tt.wantErr)
 		})
@@ -1037,7 +1085,7 @@ func TestNewWorkerGeneratesStableWorkerIDWhenUnset(t *testing.T) {
 	worker, err := NewWorker(
 		options,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		durabletaskclient.WithWorkerSilentDisconnectTimeout(time.Second),
 	)
 	require.NoError(t, err)

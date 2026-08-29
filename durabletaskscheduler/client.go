@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -26,7 +25,7 @@ type Client struct {
 
 // NewClient creates an independently owned management connection and validates
 // it with a deadline-bound Hello call.
-func NewClient(ctx context.Context, options *Options, logger backend.Logger) (*Client, error) {
+func NewClient(ctx context.Context, options *Options, logger api.Logger) (*Client, error) {
 	prepared, err := prepareOptions(options)
 	if err != nil {
 		return nil, err

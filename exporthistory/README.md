@@ -97,7 +97,7 @@ container under the prefix `<mode>-<jobId>/`.
 ## Worker setup
 
 ```go
-store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+store, err := exporthistory.NewAzureBlobHistoryStore(exporthistory.AzureBlobHistoryStoreOptions{
     ConnectionString: storageConnectionString,
     ContainerName:    "history-exports",
 })
@@ -115,7 +115,7 @@ worker, err := durabletaskscheduler.NewWorker(options, registry, logger,
 `ListInstanceIDs`, `FetchOrchestrationMetadata`, and `GetOrchestrationHistory`.
 `*client.TaskHubGrpcClient` and the Durable Task Scheduler client satisfy it.
 
-`Store` is a narrow interface with a single `Write` method. `AzureBlobStore` is
+`Store` is a narrow interface with a single `Write` method. `AzureBlobHistoryStore` is
 the production implementation; supply your own to export elsewhere. It is
 deliberately separate from `payload.AzureBlobStore`, whose large-payload
 contract assigns random object names inside a single container. Its endpoint

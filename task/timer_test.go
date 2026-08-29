@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -327,7 +326,7 @@ func TestLongTimerHonorsHistoryLimits(t *testing.T) {
 
 func executeTimerTurn(
 	t *testing.T,
-	executor backend.Executor,
+	executor Executor,
 	instanceID api.InstanceID,
 	oldEvents []*protos.HistoryEvent,
 	newEvents []*protos.HistoryEvent,

@@ -26,7 +26,7 @@
 // Workers register the system tasks and advertise them to the service:
 //
 //	registry := task.NewTaskRegistry()
-//	store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+//	store, err := exporthistory.NewAzureBlobHistoryStore(exporthistory.AzureBlobHistoryStoreOptions{
 //		ConnectionString: connectionString,
 //		ContainerName:    "history-exports",
 //	})

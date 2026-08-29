@@ -43,7 +43,7 @@ var includeTestFiles bool
 var Analyzer = &analysis.Analyzer{
 	Name: "orchestratorgo",
 	Doc:  "report nondeterministic and replay-unsafe code in durable task orchestrators",
-	URL:  "https://github.com/microsoft/durabletask-go/tree/main/internal/analysis/orchestratorgo",
+	URL:  "https://github.com/microsoft/durabletask-go/tree/main/cmd/orchestratorvet/analysis/orchestratorgo",
 	Run:  run,
 }
 

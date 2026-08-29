@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
@@ -434,6 +435,15 @@ func prepareOptionsWith(options *Options, factory credentialFactory) (Options, e
 	if prepared.HelloTimeout == 0 {
 		prepared.HelloTimeout = 30 * time.Second
 	}
+	if prepared.MaxReceiveMessageSize == 0 {
+		prepared.MaxReceiveMessageSize = DefaultMaxReceiveMessageSize
+	}
+	if prepared.MaxSendMessageSize == 0 {
+		prepared.MaxSendMessageSize = DefaultMaxSendMessageSize
+	}
+	if prepared.KeepaliveTime > 0 && prepared.KeepaliveTimeout == 0 {
+		prepared.KeepaliveTimeout = DefaultKeepaliveTimeout
+	}
 	if prepared.MaximumTimerInterval == 0 {
 		prepared.MaximumTimerInterval = task.DefaultMaximumTimerInterval
 	}
@@ -502,6 +512,17 @@ func connect(
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithPerRPCCredentials(newPerRPCCredentials(options, role, workerID)),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(options.MaxReceiveMessageSize),
+			grpc.MaxCallSendMsgSize(options.MaxSendMessageSize),
+		),
+	}
+	if options.KeepaliveTime > 0 {
+		dialOptions = append(dialOptions, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                options.KeepaliveTime,
+			Timeout:             options.KeepaliveTimeout,
+			PermitWithoutStream: false,
+		}))
 	}
 	if len(options.UnaryInterceptors) > 0 {
 		dialOptions = append(dialOptions, grpc.WithChainUnaryInterceptor(options.UnaryInterceptors...))

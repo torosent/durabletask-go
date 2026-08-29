@@ -33,7 +33,7 @@ if err := registry.AddActivityN("SayHello", SayHello); err != nil {
     return err
 }
 
-logger := backend.DefaultLogger()
+logger := api.DefaultLogger()
 
 // The management client schedules orchestrations and reads their state.
 client, err := durabletaskscheduler.NewClient(ctx, options, logger)
@@ -82,7 +82,7 @@ Exported objects are stored as opaque gzip files (`.jsonl.gz` with content type
 bytes the object name promises.
 
 ```go
-store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+store, err := exporthistory.NewAzureBlobHistoryStore(exporthistory.AzureBlobHistoryStoreOptions{
     ConnectionString: storageConnectionString,
     ContainerName:    "history-exports",
 })
@@ -187,6 +187,8 @@ self-describing `blob:v2` tokens as the .NET SDK.
 > You can find code samples in the [samples](./samples/) directory.
 > Each one connects to the task hub named by `DTS_CONNECTION_STRING`; to run
 > them, set that variable and run `go run ./samples/<name>`.
+> `distributedtracing` has its own module for optional exporter dependencies;
+> run it with `cd samples/distributedtracing && go run .`.
 > [`exporthistory`](./samples/exporthistory) also requires
 > `EXPORT_STORAGE_CONNECTION_STRING` and optionally accepts `EXPORT_CONTAINER`.
 
@@ -433,8 +435,8 @@ hand-written fakes instead:
   embed `protos.TaskHubSidecarServiceClient` and override the few RPCs under test.
   (`TaskHubSidecarService` is the generated wire-contract name of the DTS gRPC
   service; it does not imply a sidecar deployment.)
-- Worker and executor tests implement `backend.Executor` and
-  `backend.EntityExecutor` directly.
+- Worker and executor tests implement `task.Executor` and
+  `task.EntityExecutor` directly.
 - Orchestration behavior is exercised by feeding hand-built histories to
   `task.NewTaskExecutor`.
 
@@ -450,7 +452,9 @@ live Durable Task Scheduler.
 Run the complete repository test suite with the following command.
 
 ```bash
-go test ./... -count=1 -coverpkg=./api,./task,./client,./durabletaskscheduler,./exporthistory,./payload,./backend,./internal/analysis/orchestratorgo,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
+go test ./... -count=1 -coverpkg=./api,./task,./client,./durabletaskscheduler,./exporthistory,./payload,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
+(cd cmd/orchestratorvet && go test ./...)
+(cd samples/distributedtracing && go test ./...)
 ```
 
 Durable Task Scheduler and Azurite tests skip themselves unless their
@@ -468,7 +472,9 @@ deterministic and free of side effects. `cmd/orchestratorvet` is a
 orchestrators a package registers with `task.TaskRegistry`.
 
 ```bash
-go build -o ./bin/orchestratorvet ./cmd/orchestratorvet
+cd cmd/orchestratorvet
+go build -o ../../bin/orchestratorvet .
+cd ../..
 go vet -vettool=$PWD/bin/orchestratorvet ./...
 ```
 

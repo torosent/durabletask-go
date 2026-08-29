@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/api"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc"
@@ -15,7 +15,7 @@ import (
 func NewWorker(
 	options *Options,
 	registry *task.TaskRegistry,
-	logger backend.Logger,
+	logger api.Logger,
 	workerOptions ...durabletaskclient.TaskHubGrpcWorkerOption,
 ) (*durabletaskclient.TaskHubGrpcWorker, error) {
 	prepared, err := prepareOptions(options)

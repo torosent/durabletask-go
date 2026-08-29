@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/exporthistory"
@@ -55,7 +54,7 @@ func run() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 
 	// The export activities read orchestration metadata and history through the
 	// same task hub client the application uses.
@@ -69,7 +68,7 @@ func run() error {
 		}
 	}()
 
-	store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+	store, err := exporthistory.NewAzureBlobHistoryStore(exporthistory.AzureBlobHistoryStoreOptions{
 		ConnectionString: storageConnectionString,
 		ContainerName:    container,
 		// Azurite serves plaintext HTTP on loopback; production endpoints are HTTPS.

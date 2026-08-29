@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/grpcerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -62,16 +61,16 @@ func TestClientRPCErrorPreservesLifecycleAndStateCategories(t *testing.T) {
 		message  string
 		category error
 	}{
-		{codes.AlreadyExists, backend.ErrTaskHubExists.Error(), backend.ErrTaskHubExists},
-		{codes.NotFound, backend.ErrTaskHubNotFound.Error(), backend.ErrTaskHubNotFound},
+		{codes.AlreadyExists, ErrTaskHubExists.Error(), ErrTaskHubExists},
+		{codes.NotFound, ErrTaskHubNotFound.Error(), ErrTaskHubNotFound},
 		{codes.FailedPrecondition, api.ErrNotCompleted.Error(), api.ErrNotCompleted},
 	}
 	for _, test := range tests {
 		var reason string
 		switch {
-		case errors.Is(test.category, backend.ErrTaskHubExists):
+		case errors.Is(test.category, ErrTaskHubExists):
 			reason = grpcerrors.ReasonTaskHubExists
-		case errors.Is(test.category, backend.ErrTaskHubNotFound):
+		case errors.Is(test.category, ErrTaskHubNotFound):
 			reason = grpcerrors.ReasonTaskHubNotFound
 		case errors.Is(test.category, api.ErrNotCompleted):
 			reason = grpcerrors.ReasonNotCompleted

@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -200,12 +199,12 @@ func TestHistoryMetricReportsTurnUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var metric backend.HistoryMetric
+	var metric HistoryMetric
 	instanceID := api.InstanceID("history-metric")
 	_, err := NewTaskExecutor(
 		registry,
-		WithMetricsHooks(backend.MetricsHooks{
-			History: func(value backend.HistoryMetric) {
+		WithMetricsHooks(MetricsHooks{
+			History: func(value HistoryMetric) {
 				metric = value
 			},
 		}),
@@ -342,7 +341,7 @@ func TestHistoryLimitDoesNotOverrideTermination(t *testing.T) {
 func TestContinueAsNewCarryoverIncludesUndrainedResumedEvents(t *testing.T) {
 	resumed := helpers.NewEventRaisedEvent("resumed", wrapperspb.String("1"))
 	tail := helpers.NewEventRaisedEvent("tail", wrapperspb.String("2"))
-	ctx := NewOrchestrationContext(NewTaskRegistry(), "carryover-resumed", nil, []*protos.HistoryEvent{tail})
+	ctx := newTestOrchestrationContext(NewTaskRegistry(), "carryover-resumed", nil, []*protos.HistoryEvent{tail})
 	ctx.resumedEvents = []replayEvent{{event: resumed}}
 	events := ctx.unprocessedExternalEvents()
 	if len(events) != 2 || events[0] != resumed || events[1] != tail {
@@ -353,7 +352,7 @@ func TestContinueAsNewCarryoverIncludesUndrainedResumedEvents(t *testing.T) {
 func TestContinueAsNewCarryoverIncludesSuspendedEvents(t *testing.T) {
 	suspended := helpers.NewEventRaisedEvent("suspended", wrapperspb.String("1"))
 	tail := helpers.NewEventRaisedEvent("tail", wrapperspb.String("2"))
-	ctx := NewOrchestrationContext(NewTaskRegistry(), "carryover-suspended", nil, []*protos.HistoryEvent{tail})
+	ctx := newTestOrchestrationContext(NewTaskRegistry(), "carryover-suspended", nil, []*protos.HistoryEvent{tail})
 	ctx.suspendedEvents = []replayEvent{{event: suspended}}
 	events := ctx.unprocessedExternalEvents()
 	if len(events) != 2 || events[0] != suspended || events[1] != tail {

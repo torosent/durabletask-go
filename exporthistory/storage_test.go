@@ -170,16 +170,16 @@ func TestIsSafeBlobURLRejectsCredentialCarryingURLs(t *testing.T) {
 	assert.False(t, isSafeBlobURL(parse("http://user:pass@127.0.0.1:10000"), true))
 }
 
-// TestNewAzureBlobStoreRejectsCredentialCarryingAccountURL covers the same rule
+// TestNewAzureBlobHistoryStoreRejectsCredentialCarryingAccountURL covers the same rule
 // at the constructor boundary, which is where an operator-supplied endpoint
 // actually enters the process.
-func TestNewAzureBlobStoreRejectsCredentialCarryingAccountURL(t *testing.T) {
+func TestNewAzureBlobHistoryStoreRejectsCredentialCarryingAccountURL(t *testing.T) {
 	for _, accountURL := range []string{
 		"https://user:password@account.blob.core.windows.net",
 		"https://account.blob.core.windows.net/?sig=redacted",
 		"https://account.blob.core.windows.net/#fragment",
 	} {
-		_, err := NewAzureBlobStore(AzureBlobStoreOptions{
+		_, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 			ContainerName: "container",
 			AccountURL:    accountURL,
 			Credential:    fakeCredential{},
@@ -189,26 +189,26 @@ func TestNewAzureBlobStoreRejectsCredentialCarryingAccountURL(t *testing.T) {
 	}
 }
 
-func TestNewAzureBlobStoreValidation(t *testing.T) {
+func TestNewAzureBlobHistoryStoreValidation(t *testing.T) {
 	tests := []struct {
 		name    string
-		options AzureBlobStoreOptions
+		options AzureBlobHistoryStoreOptions
 		message string
 	}{
-		{"missing container", AzureBlobStoreOptions{ConnectionString: testConnectionString}, "container name is required"},
+		{"missing container", AzureBlobHistoryStoreOptions{ConnectionString: testConnectionString}, "container name is required"},
 		{
 			name:    "invalid container",
-			options: AzureBlobStoreOptions{ConnectionString: testConnectionString, ContainerName: "BAD"},
+			options: AzureBlobHistoryStoreOptions{ConnectionString: testConnectionString, ContainerName: "BAD"},
 			message: "is not valid",
 		},
 		{
 			name:    "no credentials",
-			options: AzureBlobStoreOptions{ContainerName: "container"},
+			options: AzureBlobHistoryStoreOptions{ContainerName: "container"},
 			message: "exactly one of connection string or account URL is required",
 		},
 		{
 			name: "both credential modes",
-			options: AzureBlobStoreOptions{
+			options: AzureBlobHistoryStoreOptions{
 				ContainerName:    "container",
 				ConnectionString: testConnectionString,
 				AccountURL:       "https://account.blob.core.windows.net",
@@ -217,12 +217,12 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 		},
 		{
 			name:    "account URL without a credential",
-			options: AzureBlobStoreOptions{ContainerName: "container", AccountURL: "https://account.blob.core.windows.net"},
+			options: AzureBlobHistoryStoreOptions{ContainerName: "container", AccountURL: "https://account.blob.core.windows.net"},
 			message: "requires a token credential",
 		},
 		{
 			name: "connection string with a credential",
-			options: AzureBlobStoreOptions{
+			options: AzureBlobHistoryStoreOptions{
 				ContainerName:    "container",
 				ConnectionString: testConnectionString,
 				Credential:       fakeCredential{},
@@ -231,7 +231,7 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 		},
 		{
 			name: "insecure account URL",
-			options: AzureBlobStoreOptions{
+			options: AzureBlobHistoryStoreOptions{
 				ContainerName: "container",
 				AccountURL:    "http://account.blob.core.windows.net",
 				Credential:    fakeCredential{},
@@ -240,7 +240,7 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 		},
 		{
 			name: "invalid allow-listed container",
-			options: AzureBlobStoreOptions{
+			options: AzureBlobHistoryStoreOptions{
 				ContainerName:     "container",
 				ConnectionString:  testConnectionString,
 				AllowedContainers: []string{"BAD"},
@@ -250,13 +250,13 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := NewAzureBlobStore(test.options)
+			_, err := NewAzureBlobHistoryStore(test.options)
 			require.ErrorIs(t, err, ErrValidation)
 			assert.Contains(t, err.Error(), test.message)
 		})
 	}
 
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "container",
 	})
@@ -264,14 +264,14 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 	assert.Equal(t, "container", store.DefaultContainer())
 
 	// The well-known Azurite endpoint is plaintext, so it needs an explicit opt-in.
-	_, err = NewAzureBlobStore(AzureBlobStoreOptions{
+	_, err = NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: azuriteConnectionString,
 		ContainerName:    "container",
 	})
 	require.ErrorIs(t, err, ErrValidation)
 	assert.Contains(t, err.Error(), "service URL is not allowed")
 
-	_, err = NewAzureBlobStore(AzureBlobStoreOptions{
+	_, err = NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  azuriteConnectionString,
 		ContainerName:     "container",
 		AllowInsecureHTTP: true,
@@ -279,8 +279,8 @@ func TestNewAzureBlobStoreValidation(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestAzureBlobStoreRejectsDisallowedContainers(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreRejectsDisallowedContainers(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  testConnectionString,
 		ContainerName:     "primary",
 		AllowedContainers: []string{"secondary"},
@@ -307,8 +307,8 @@ func TestAzureBlobStoreRejectsDisallowedContainers(t *testing.T) {
 	require.ErrorIs(t, err, ErrValidation)
 }
 
-func TestAzureBlobStoreAllowAnyContainer(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreAllowAnyContainer(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  testConnectionString,
 		ContainerName:     "primary",
 		AllowAnyContainer: true,
@@ -321,10 +321,10 @@ func TestAzureBlobStoreAllowAnyContainer(t *testing.T) {
 	require.NoError(t, store.Write(context.Background(), ExportObject{Container: "anything", Name: "a"}))
 }
 
-// TestAzureBlobStoreCreatesEachContainerOnce keeps a large export from issuing
+// TestAzureBlobHistoryStoreCreatesEachContainerOnce keeps a large export from issuing
 // one container create per object.
-func TestAzureBlobStoreCreatesEachContainerOnce(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreCreatesEachContainerOnce(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  testConnectionString,
 		ContainerName:     "primary",
 		AllowAnyContainer: true,
@@ -363,10 +363,10 @@ func TestAzureBlobStoreCreatesEachContainerOnce(t *testing.T) {
 	assert.Equal(t, 1, creates["secondary"])
 }
 
-// TestAzureBlobStoreRetriesContainerBeingDeleted covers Azure keeping a deleted
+// TestAzureBlobHistoryStoreRetriesContainerBeingDeleted covers Azure keeping a deleted
 // container's name reserved for a short window.
-func TestAzureBlobStoreRetriesContainerBeingDeleted(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreRetriesContainerBeingDeleted(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -397,8 +397,8 @@ func TestAzureBlobStoreRetriesContainerBeingDeleted(t *testing.T) {
 	}, waits)
 }
 
-func TestAzureBlobStoreTreatsExistingContainerAsSuccess(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreTreatsExistingContainerAsSuccess(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -415,10 +415,10 @@ func TestAzureBlobStoreTreatsExistingContainerAsSuccess(t *testing.T) {
 	assert.Equal(t, 1, uploaded)
 }
 
-// TestAzureBlobStoreRetriesAfterContainerCreationFailure keeps a transient
+// TestAzureBlobHistoryStoreRetriesAfterContainerCreationFailure keeps a transient
 // creation failure from permanently wedging the store.
-func TestAzureBlobStoreRetriesAfterContainerCreationFailure(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreRetriesAfterContainerCreationFailure(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -441,10 +441,10 @@ func TestAzureBlobStoreRetriesAfterContainerCreationFailure(t *testing.T) {
 	assert.Equal(t, 2, attempts)
 }
 
-// TestAzureBlobStoreForgetsDeletedContainer covers a container removed between
+// TestAzureBlobHistoryStoreForgetsDeletedContainer covers a container removed between
 // initialization and a later upload.
-func TestAzureBlobStoreForgetsDeletedContainer(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreForgetsDeletedContainer(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -471,11 +471,11 @@ func TestAzureBlobStoreForgetsDeletedContainer(t *testing.T) {
 	assert.Equal(t, 2, creates)
 }
 
-// TestAzureBlobStoreReportsCreationFailureToWaiters keeps a caller that joined a
+// TestAzureBlobHistoryStoreReportsCreationFailureToWaiters keeps a caller that joined a
 // failing container initialization from proceeding to upload as if the container
 // existed.
-func TestAzureBlobStoreReportsCreationFailureToWaiters(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreReportsCreationFailureToWaiters(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -515,11 +515,11 @@ func TestAzureBlobStoreReportsCreationFailureToWaiters(t *testing.T) {
 	assert.Equal(t, 1, uploads)
 }
 
-// TestAzureBlobStoreInvalidationKeepsNewerInitialization keeps a stale
+// TestAzureBlobHistoryStoreInvalidationKeepsNewerInitialization keeps a stale
 // ContainerNotFound from discarding a container initialization that started
 // after the failing write began.
-func TestAzureBlobStoreInvalidationKeepsNewerInitialization(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreInvalidationKeepsNewerInitialization(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})
@@ -550,8 +550,8 @@ func TestAzureBlobStoreInvalidationKeepsNewerInitialization(t *testing.T) {
 	assert.Equal(t, 2, creates)
 }
 
-func TestAzureBlobStoreSendsHeadersAndMetadata(t *testing.T) {
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+func TestAzureBlobHistoryStoreSendsHeadersAndMetadata(t *testing.T) {
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString: testConnectionString,
 		ContainerName:    "primary",
 	})

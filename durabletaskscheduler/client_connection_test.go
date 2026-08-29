@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -81,7 +81,7 @@ func newTestRecreatingClientConn(
 		factory,
 		failureThreshold,
 		minRecreateInterval,
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 	)
 	t.Cleanup(func() {
 		require.NoError(t, connection.Close())

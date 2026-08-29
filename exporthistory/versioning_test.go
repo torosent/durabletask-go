@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/api"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
@@ -99,7 +99,7 @@ func startFilterCapturingWorker(
 	worker, err := durabletaskclient.NewTaskHubGrpcWorker(
 		connection,
 		registry,
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		workerOptions...,
 	)
 	require.NoError(t, err)

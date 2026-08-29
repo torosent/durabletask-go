@@ -183,6 +183,10 @@ func panicCause(value any) error {
 	return err
 }
 
+type workItemAbandonDelayProvider interface {
+	WorkItemAbandonDelay() time.Duration
+}
+
 var _ error = (*TaskFailedError)(nil)
 var _ error = (*EntityOperationFailedError)(nil)
 var _ api.DurableTaskErrorTypeProvider = (*TaskFailedError)(nil)
@@ -193,6 +197,7 @@ var _ api.DurableTaskFailureDetailsProvider = (*EntityOperationFailedError)(nil)
 var _ api.NonRetriable = (*EntityOperationFailedError)(nil)
 var _ api.DurableTaskErrorTypeProvider = (*taskNotRegisteredError)(nil)
 var _ api.NonRetriable = (*taskNotRegisteredError)(nil)
-var _ interface{ WorkItemAbandonDelay() time.Duration } = (*taskNotRegisteredError)(nil)
+var _ workItemAbandonDelayProvider = (*taskNotRegisteredError)(nil)
+var _ workItemAbandonDelayProvider = (*VersionMismatchError)(nil)
 var _ api.DurableTaskErrorTypeProvider = (*panicFailureError)(nil)
 var _ api.DurableTaskStackTraceProvider = (*panicFailureError)(nil)

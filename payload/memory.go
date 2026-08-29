@@ -12,12 +12,18 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 )
 
+// MemoryStore is a process-local, non-durable large-payload store.
+//
+// References become unreadable when the process restarts and cannot be resolved
+// by clients or workers in another process. Use it only for tests and
+// single-process experiments; use [AzureBlobStore] for production DTS workloads.
 type MemoryStore struct {
 	mu       sync.RWMutex
 	payloads map[string][]byte
 	maxBytes int
 }
 
+// NewMemoryStore creates a process-local store with an optional payload limit.
 func NewMemoryStore(maxBytes ...int) *MemoryStore {
 	limit := api.DefaultLargePayloadMaxBytes
 	if len(maxBytes) > 0 && maxBytes[0] > 0 {
@@ -29,6 +35,7 @@ func NewMemoryStore(maxBytes ...int) *MemoryStore {
 	}
 }
 
+// Store saves one payload in process memory.
 func (s *MemoryStore) Store(ctx context.Context, payload []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -44,6 +51,7 @@ func (s *MemoryStore) Store(ctx context.Context, payload []byte) (string, error)
 	return location, nil
 }
 
+// Resolve reads a payload previously stored by this process.
 func (s *MemoryStore) Resolve(ctx context.Context, location string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

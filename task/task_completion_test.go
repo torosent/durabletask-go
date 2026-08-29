@@ -7,7 +7,7 @@ import (
 )
 
 func TestCompletedTaskIgnoresLaterCancellationFailureAndCompletion(t *testing.T) {
-	ctx := NewOrchestrationContext(NewTaskRegistry(), "completed-task", nil, nil)
+	ctx := newTestOrchestrationContext(NewTaskRegistry(), "completed-task", nil, nil)
 	scope := newCancellationScope(nil)
 	task := newTaskInScope(ctx, scope)
 	task.complete([]byte(`"first"`))

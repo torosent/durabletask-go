@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/microsoft/durabletask-go/internal/analysis/orchestratorgo"
+	"github.com/microsoft/durabletask-go/cmd/orchestratorvet/analysis/orchestratorgo"
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/packages"
 )

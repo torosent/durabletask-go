@@ -235,6 +235,10 @@ func TestNewOptionsFromConnectionString(t *testing.T) {
 			require.Equal(t, tt.wantTokenFile, options.TokenFilePath)
 			require.Equal(t, tt.wantTenants, options.AdditionallyAllowedTenants)
 			require.Equal(t, 30*time.Second, options.HelloTimeout)
+			require.Equal(t, DefaultMaxReceiveMessageSize, options.MaxReceiveMessageSize)
+			require.Equal(t, DefaultMaxSendMessageSize, options.MaxSendMessageSize)
+			require.Equal(t, DefaultKeepaliveTime, options.KeepaliveTime)
+			require.Equal(t, DefaultKeepaliveTimeout, options.KeepaliveTimeout)
 			require.Equal(t, 5, options.ChannelRecreateFailureThreshold)
 			require.Equal(t, 30*time.Second, options.ChannelRecreateMinInterval)
 			require.Empty(t, options.WorkerID)
@@ -394,6 +398,10 @@ func TestNewOptionsDefaults(t *testing.T) {
 	require.Equal(t, AuthenticationDefaultAzure, options.Authentication)
 	require.Equal(t, DefaultResourceID, options.ResourceID)
 	require.Equal(t, 30*time.Second, options.HelloTimeout)
+	require.Equal(t, DefaultMaxReceiveMessageSize, options.MaxReceiveMessageSize)
+	require.Equal(t, DefaultMaxSendMessageSize, options.MaxSendMessageSize)
+	require.Equal(t, DefaultKeepaliveTime, options.KeepaliveTime)
+	require.Equal(t, DefaultKeepaliveTimeout, options.KeepaliveTimeout)
 	require.Equal(t, task.DefaultMaximumTimerInterval, options.MaximumTimerInterval)
 	require.Equal(t, 5, options.ChannelRecreateFailureThreshold)
 	require.Equal(t, 30*time.Second, options.ChannelRecreateMinInterval)
@@ -508,6 +516,8 @@ func TestPrepareOptionsAppliesDefaultsAndCopiesTenants(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DefaultResourceID, prepared.ResourceID)
 	require.Equal(t, 30*time.Second, prepared.HelloTimeout)
+	require.Equal(t, DefaultMaxReceiveMessageSize, prepared.MaxReceiveMessageSize)
+	require.Equal(t, DefaultMaxSendMessageSize, prepared.MaxSendMessageSize)
 	require.Equal(t, task.DefaultMaximumTimerInterval, prepared.MaximumTimerInterval)
 	options.AdditionallyAllowedTenants[0] = "changed"
 	require.Equal(t, []string{"tenant"}, prepared.AdditionallyAllowedTenants)
@@ -580,6 +590,64 @@ func TestOptionsValidateRejectsNegativeChannelRecreateInterval(t *testing.T) {
 	options := NewOptions("scheduler.example.com", "hub")
 	options.ChannelRecreateMinInterval = -time.Second
 	require.ErrorContains(t, options.Validate(), "channel recreate minimum interval")
+}
+
+func TestOptionsValidateRejectsInvalidTransportLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Options)
+		message string
+	}{
+		{
+			name:    "negative receive size",
+			mutate:  func(options *Options) { options.MaxReceiveMessageSize = -1 },
+			message: "maximum receive message size",
+		},
+		{
+			name:    "receive size below minimum",
+			mutate:  func(options *Options) { options.MaxReceiveMessageSize = minimumGRPCMessageSize - 1 },
+			message: "maximum receive message size",
+		},
+		{
+			name:    "negative send size",
+			mutate:  func(options *Options) { options.MaxSendMessageSize = -1 },
+			message: "maximum send message size",
+		},
+		{
+			name:    "send size below minimum",
+			mutate:  func(options *Options) { options.MaxSendMessageSize = minimumGRPCMessageSize - 1 },
+			message: "maximum send message size",
+		},
+		{
+			name:    "negative keepalive time",
+			mutate:  func(options *Options) { options.KeepaliveTime = -time.Second },
+			message: "keepalive time",
+		},
+		{
+			name:    "aggressive keepalive time",
+			mutate:  func(options *Options) { options.KeepaliveTime = minimumKeepaliveTime - time.Second },
+			message: "keepalive time",
+		},
+		{
+			name:    "negative keepalive timeout",
+			mutate:  func(options *Options) { options.KeepaliveTimeout = -time.Second },
+			message: "keepalive timeout",
+		},
+		{
+			name: "keepalive timeout not below interval",
+			mutate: func(options *Options) {
+				options.KeepaliveTimeout = options.KeepaliveTime
+			},
+			message: "must be less than keepalive time",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := NewOptions("scheduler.example.com", "hub")
+			test.mutate(options)
+			require.ErrorContains(t, options.Validate(), test.message)
+		})
+	}
 }
 
 func TestOptionsValidateRejectsNilInterceptors(t *testing.T) {

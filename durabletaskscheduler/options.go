@@ -16,7 +16,21 @@ import (
 	"google.golang.org/grpc"
 )
 
-const DefaultResourceID = "https://durabletask.io"
+const (
+	// DefaultResourceID is the Azure resource used to request DTS access tokens.
+	DefaultResourceID = "https://durabletask.io"
+
+	// DefaultMaxReceiveMessageSize and DefaultMaxSendMessageSize are the default
+	// per-message gRPC bounds.
+	DefaultMaxReceiveMessageSize = 64 * 1024 * 1024
+	DefaultMaxSendMessageSize    = 64 * 1024 * 1024
+	// DefaultKeepaliveTime and DefaultKeepaliveTimeout configure pings while a
+	// gRPC stream is active.
+	DefaultKeepaliveTime    = 2 * time.Minute
+	DefaultKeepaliveTimeout = 20 * time.Second
+	minimumKeepaliveTime    = 30 * time.Second
+	minimumGRPCMessageSize  = 64 * 1024
+)
 
 type AuthenticationType string
 
@@ -80,6 +94,17 @@ type Options struct {
 	// HelloTimeout controls fail-fast connectivity checks.
 	HelloTimeout time.Duration
 
+	// MaxReceiveMessageSize and MaxSendMessageSize bound individual gRPC
+	// messages. Zero uses the 64 MiB SDK default.
+	MaxReceiveMessageSize int
+	MaxSendMessageSize    int
+
+	// KeepaliveTime controls client pings while a gRPC stream is active. Zero
+	// disables keepalive, in which case KeepaliveTimeout is ignored.
+	// KeepaliveTimeout bounds each ping acknowledgement.
+	KeepaliveTime    time.Duration
+	KeepaliveTimeout time.Duration
+
 	// MaximumTimerInterval limits one physical durable timer action. Longer
 	// timers are split deterministically. Zero uses the three-day default.
 	MaximumTimerInterval time.Duration
@@ -118,6 +143,10 @@ func NewOptions(endpointAddress, taskHubName string) *Options {
 		Authentication:                  AuthenticationDefaultAzure,
 		ResourceID:                      DefaultResourceID,
 		HelloTimeout:                    30 * time.Second,
+		MaxReceiveMessageSize:           DefaultMaxReceiveMessageSize,
+		MaxSendMessageSize:              DefaultMaxSendMessageSize,
+		KeepaliveTime:                   DefaultKeepaliveTime,
+		KeepaliveTimeout:                DefaultKeepaliveTimeout,
 		MaximumTimerInterval:            task.DefaultMaximumTimerInterval,
 		ChannelRecreateFailureThreshold: 5,
 		ChannelRecreateMinInterval:      30 * time.Second,
@@ -246,6 +275,30 @@ func (o *Options) Validate() error {
 	}
 	if o.HelloTimeout < 0 {
 		return fmt.Errorf("DTS Hello timeout cannot be negative")
+	}
+	if o.MaxReceiveMessageSize < 0 {
+		return fmt.Errorf("DTS maximum receive message size cannot be negative")
+	}
+	if o.MaxReceiveMessageSize > 0 && o.MaxReceiveMessageSize < minimumGRPCMessageSize {
+		return fmt.Errorf("DTS maximum receive message size cannot be less than %d", minimumGRPCMessageSize)
+	}
+	if o.MaxSendMessageSize < 0 {
+		return fmt.Errorf("DTS maximum send message size cannot be negative")
+	}
+	if o.MaxSendMessageSize > 0 && o.MaxSendMessageSize < minimumGRPCMessageSize {
+		return fmt.Errorf("DTS maximum send message size cannot be less than %d", minimumGRPCMessageSize)
+	}
+	if o.KeepaliveTime < 0 {
+		return fmt.Errorf("DTS keepalive time cannot be negative")
+	}
+	if o.KeepaliveTime > 0 && o.KeepaliveTime < minimumKeepaliveTime {
+		return fmt.Errorf("DTS keepalive time cannot be less than %s", minimumKeepaliveTime)
+	}
+	if o.KeepaliveTimeout < 0 {
+		return fmt.Errorf("DTS keepalive timeout cannot be negative")
+	}
+	if o.KeepaliveTime > 0 && o.KeepaliveTimeout >= o.KeepaliveTime {
+		return fmt.Errorf("DTS keepalive timeout must be less than keepalive time")
 	}
 	if o.MaximumTimerInterval < 0 {
 		return fmt.Errorf("DTS maximum timer interval cannot be negative")

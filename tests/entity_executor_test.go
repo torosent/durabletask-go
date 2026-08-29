@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/assert"
@@ -17,8 +16,8 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func newEntityExecutor(r *task.TaskRegistry) backend.EntityExecutor {
-	return task.NewTaskExecutor(r).(backend.EntityExecutor)
+func newEntityExecutor(r *task.TaskRegistry) task.EntityExecutor {
+	return task.NewTaskExecutor(r).(task.EntityExecutor)
 }
 
 func Test_Executor_EntityBasicOperation(t *testing.T) {
