@@ -16,6 +16,9 @@
 # vendor/
 
 __debug_bin
+/cmd/orchestratorvet/orchestratorvet
+/samples/distributedtracing/distributedtracing
+/.tmp/
 
 .idea/
 # Local build output, e.g. the orchestratorvet analyzer binary

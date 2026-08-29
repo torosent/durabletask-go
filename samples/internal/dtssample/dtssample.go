@@ -16,7 +16,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/microsoft/durabletask-go/backend"
+	"github.com/microsoft/durabletask-go/api"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/task"
@@ -75,7 +75,7 @@ func StartWithOptions(
 	registry *task.TaskRegistry,
 	workerOptions ...durabletaskclient.TaskHubGrpcWorkerOption,
 ) (*App, error) {
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	client, err := durabletaskscheduler.NewClient(ctx, options, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect the Durable Task Scheduler client: %w", err)

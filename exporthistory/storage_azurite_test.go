@@ -17,14 +17,14 @@ import (
 
 // newAzuriteExportStore builds a store against a throwaway container so Azurite
 // runs exercise the real container-initialization and upload paths.
-func newAzuriteExportStore(t *testing.T) (*AzureBlobStore, string) {
+func newAzuriteExportStore(t *testing.T) (*AzureBlobHistoryStore, string) {
 	t.Helper()
 	connectionString := os.Getenv("AZURITE_CONNECTION_STRING")
 	if connectionString == "" {
 		t.Skip("set AZURITE_CONNECTION_STRING to run against Azurite")
 	}
 	container := randomContainerName(t)
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  connectionString,
 		ContainerName:     container,
 		AllowInsecureHTTP: true,
@@ -44,10 +44,10 @@ func randomContainerName(t *testing.T) string {
 	return "dtgoexport" + hex.EncodeToString(suffix[:])
 }
 
-// TestAzureBlobStoreAzuriteWritesCompressedObjects covers the production write
+// TestAzureBlobHistoryStoreAzuriteWritesCompressedObjects covers the production write
 // path against real storage, including container creation, headers, metadata,
 // and overwrite-on-reexport.
-func TestAzureBlobStoreAzuriteWritesCompressedObjects(t *testing.T) {
+func TestAzureBlobHistoryStoreAzuriteWritesCompressedObjects(t *testing.T) {
 	store, container := newAzuriteExportStore(t)
 	ctx := context.Background()
 
@@ -91,9 +91,9 @@ func TestAzureBlobStoreAzuriteWritesCompressedObjects(t *testing.T) {
 	assert.Equal(t, []byte("second write"), downloadAzuriteBlob(t, store, container, object.Name))
 }
 
-// TestAzureBlobStoreAzuriteRejectsDisallowedContainer keeps a job from writing
+// TestAzureBlobHistoryStoreAzuriteRejectsDisallowedContainer keeps a job from writing
 // outside the containers the worker was configured for, against real storage.
-func TestAzureBlobStoreAzuriteRejectsDisallowedContainer(t *testing.T) {
+func TestAzureBlobHistoryStoreAzuriteRejectsDisallowedContainer(t *testing.T) {
 	store, _ := newAzuriteExportStore(t)
 	err := store.Write(context.Background(), ExportObject{
 		Container: randomContainerName(t),
@@ -104,16 +104,16 @@ func TestAzureBlobStoreAzuriteRejectsDisallowedContainer(t *testing.T) {
 	assert.Contains(t, err.Error(), "is not allowed by this worker")
 }
 
-// TestAzureBlobStoreAzuriteWritesAcrossAllowedContainers covers the allow-list
+// TestAzureBlobHistoryStoreAzuriteWritesAcrossAllowedContainers covers the allow-list
 // and per-container initialization against real storage.
-func TestAzureBlobStoreAzuriteWritesAcrossAllowedContainers(t *testing.T) {
+func TestAzureBlobHistoryStoreAzuriteWritesAcrossAllowedContainers(t *testing.T) {
 	connectionString := os.Getenv("AZURITE_CONNECTION_STRING")
 	if connectionString == "" {
 		t.Skip("set AZURITE_CONNECTION_STRING to run against Azurite")
 	}
 	primary := randomContainerName(t)
 	secondary := randomContainerName(t)
-	store, err := NewAzureBlobStore(AzureBlobStoreOptions{
+	store, err := NewAzureBlobHistoryStore(AzureBlobHistoryStoreOptions{
 		ConnectionString:  connectionString,
 		ContainerName:     primary,
 		AllowedContainers: []string{secondary},
@@ -137,7 +137,7 @@ func TestAzureBlobStoreAzuriteWritesAcrossAllowedContainers(t *testing.T) {
 	}
 }
 
-func downloadAzuriteBlob(t *testing.T, store *AzureBlobStore, container, name string) []byte {
+func downloadAzuriteBlob(t *testing.T, store *AzureBlobHistoryStore, container, name string) []byte {
 	t.Helper()
 	response, err := store.client.DownloadStream(context.Background(), container, name, nil)
 	require.NoError(t, err)
@@ -149,7 +149,7 @@ func downloadAzuriteBlob(t *testing.T, store *AzureBlobStore, container, name st
 
 func azuriteBlobProperties(
 	t *testing.T,
-	store *AzureBlobStore,
+	store *AzureBlobHistoryStore,
 	container string,
 	name string,
 ) blob.GetPropertiesResponse {

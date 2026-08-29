@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -61,7 +60,7 @@ func TestTaskHubGrpcClientStreamsHistoryInOrder(t *testing.T) {
 	}}
 	client := &TaskHubGrpcClient{
 		client:    scheduler,
-		logger:    backend.DefaultLogger(),
+		logger:    api.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
 	var values []string
@@ -121,7 +120,7 @@ func TestTaskHubGrpcClientHistoryLimitAndErrors(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := &TaskHubGrpcClient{
 				client:    test.scheduler,
-				logger:    backend.DefaultLogger(),
+				logger:    api.DefaultLogger(),
 				converter: api.DefaultDataConverter(),
 			}
 			_, err := client.GetOrchestrationHistory(context.Background(), "instance", test.query)
@@ -133,7 +132,7 @@ func TestTaskHubGrpcClientHistoryLimitAndErrors(t *testing.T) {
 func TestTaskHubGrpcClientHistoryValidationAndCallbackError(t *testing.T) {
 	client := &TaskHubGrpcClient{
 		client:    &historySchedulerClient{},
-		logger:    backend.DefaultLogger(),
+		logger:    api.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
 	err := client.StreamOrchestrationHistory(context.Background(), "", api.HistoryQuery{}, func(*api.HistoryEvent) error {
@@ -166,7 +165,7 @@ func TestTaskHubGrpcClientHistoryMapsCanceledReceive(t *testing.T) {
 	}}
 	client := &TaskHubGrpcClient{
 		client:    scheduler,
-		logger:    backend.DefaultLogger(),
+		logger:    api.DefaultLogger(),
 		converter: api.DefaultDataConverter(),
 	}
 	err := client.StreamOrchestrationHistory(ctx, "instance", api.HistoryQuery{}, func(*api.HistoryEvent) error {

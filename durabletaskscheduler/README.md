@@ -58,7 +58,9 @@ ignored.
 Access tokens are requested for `Options.ResourceID` (default
 `https://durabletask.io`) with trailing slashes removed and `/.default`
 appended. Token acquisition failures are surfaced as retriable `Unavailable`
-gRPC errors. Every RPC carries `taskhub` and `x-user-agent` metadata; worker
+gRPC errors. Tokens and immutable authorization metadata are cached until the
+credential's `RefreshOn` time (or five minutes before expiry), and concurrent
+refreshes are coalesced. Every RPC carries `taskhub` and `x-user-agent` metadata; worker
 connections add `workerid`. `Options.UserAgent` and `Options.WorkerID` override
 the generated values and are rejected if they contain leading/trailing
 whitespace or newlines. Unset worker IDs default to
@@ -70,6 +72,13 @@ context still applies when it is shorter. Client channels use a default gRPC
 service config that retries `UNAVAILABLE` up to five attempts with a 50 ms
 initial backoff, 250 ms cap, and multiplier 2. Worker channels do not, because
 the worker owns its own reconnect loop.
+
+Individual gRPC messages are bounded to 64 MiB by default through
+`Options.MaxReceiveMessageSize` and `Options.MaxSendMessageSize`. Active streams
+use a two-minute keepalive with a 20-second acknowledgement timeout; set
+`Options.KeepaliveTime` to zero to disable it. The timeout is ignored while
+keepalive is disabled. Values below 30 seconds are rejected to avoid
+aggressive-ping disconnects.
 
 `NewClient` creates and owns a management connection; call `Close` when done.
 Options created with `NewOptions`, `NewOptionsFromConnectionString`, or
@@ -158,7 +167,13 @@ whereas unfiltered delivery produces a deterministic task-not-found failure.
 Auto-generated filters reject task kinds with no registrations and validate
 that strict worker versions can resolve every advertised logical name.
 Capability advertisement is explicit: history streaming is enabled by default,
-while scheduled tasks use `durabletaskscheduler.WithScheduledTasks()`.
+while scheduled tasks use `durabletaskscheduler.WithScheduledTasks()`. Streamed
+history accumulation is bounded to 100,000 events and 64 MiB by default; use
+`client.WithMaxStreamedHistoryEvents` and
+`client.WithMaxStreamedHistoryBytes` to choose different bounded limits. These
+are per-work-item limits, so size worker concurrency with the aggregate memory
+budget in mind. Exceeding either limit delays and abandons the work item until
+the worker is reconfigured with a larger bounded limit.
 
 ### Recurring scheduled tasks
 
@@ -226,34 +241,29 @@ for cross-version service compatibility.
 ### Large payloads
 
 Large payload support uses an opaque, integrity-checked reference encoded in
-the existing string payload fields, so no cloud storage dependency is required.
-Configure a shared store/resolver for both the management client and worker:
+the existing string payload fields. Production DTS workloads should configure
+the same Azure Blob store for every management client and worker:
 
 ```go
-store := payload.NewMemoryStore()
-options.LargePayloads = &api.LargePayloadOptions{
-    Store:            store,
-    Resolver:         store,
-    ThresholdBytes:   64 * 1024,
-    MaxPayloadBytes:  64 * 1024 * 1024,
-}
-```
-
-`payload.NewFileStore` provides a bounded local-file implementation. For
-production DTS interoperability, `payload.NewAzureBlobStore` emits the same
-self-describing `blob:v2:<absolute-blob-url>` token as the .NET SDK and can read
-legacy .NET `blob:v1` tokens:
-
-```go
-store, _ := payload.NewAzureBlobStore(payload.AzureBlobStoreOptions{
+store, err := payload.NewAzureBlobStore(payload.AzureBlobStoreOptions{
     ConnectionString: os.Getenv("AzureWebJobsStorage"),
     Container:        "durabletask-payloads",
 })
+if err != nil {
+    return err
+}
 options.LargePayloads = &api.LargePayloadOptions{
-    Store:    store,
-    Resolver: store,
+    Store:            store,
+    Resolver:         store,
 }
 ```
+
+`payload.NewAzureBlobStore` emits the same self-describing
+`blob:v2:<absolute-blob-url>` token as the .NET SDK and can read legacy .NET
+`blob:v1` tokens. `payload.NewMemoryStore` is only for tests and single-process
+experiments because references are lost on restart. `payload.NewFileStore`
+requires every client and worker to share the same durable filesystem path;
+container-local or other ephemeral storage is not safe.
 
 Identity authentication uses `AccountURL` plus an `azcore.TokenCredential`.
 Cross-account identity reads require an explicit `AllowedHosts` entry. Azure

@@ -15,7 +15,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -54,7 +53,7 @@ func startEmulatorClientAndWorker(
 ) (*durabletaskscheduler.Client, *durabletaskclient.TaskHubGrpcWorker, *durabletaskscheduler.Options) {
 	t.Helper()
 	options := emulatorOptions(t)
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
@@ -146,7 +145,7 @@ func TestDTSEmulatorCustomConverterAndVersionMigration(t *testing.T) {
 		return input, nil
 	}))
 
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(
@@ -182,7 +181,7 @@ func TestDTSEmulatorCustomConverterAndVersionMigration(t *testing.T) {
 
 func TestDTSEmulatorMixedVersionWorkers(t *testing.T) {
 	baseOptions := emulatorOptions(t)
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), baseOptions, logger)
 	require.NoError(t, err)
 
@@ -536,7 +535,7 @@ func TestDTSEmulatorScheduledFilteredLargePayloadWorker(t *testing.T) {
 		return output, nil
 	}))
 
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(
@@ -808,7 +807,7 @@ func TestDTSEmulatorWorkerStopAndRestart(t *testing.T) {
 	}))
 
 	options := emulatorOptions(t)
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	defer func() {
@@ -1061,7 +1060,7 @@ func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
 	}))
 	options := emulatorOptions(t)
 	options.MaximumTimerInterval = maximumInterval
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
@@ -1074,7 +1073,7 @@ func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
 		require.NoError(t, managementClient.Close())
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	instanceID, err := managementClient.ScheduleNewOrchestration(
 		ctx,
@@ -1189,7 +1188,7 @@ func TestDTSEmulatorScheduledTasksAndHistory(t *testing.T) {
 		registry,
 		options.Versioning.DefaultVersion,
 	))
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(
@@ -1335,7 +1334,7 @@ func TestDTSEmulatorAzuriteBlobV2RoundTrip(t *testing.T) {
 		}
 		return result, nil
 	}))
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(

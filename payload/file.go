@@ -14,11 +14,17 @@ import (
 	"github.com/microsoft/durabletask-go/api"
 )
 
+// FileStore stores large payloads beneath one filesystem root.
+//
+// Every client and worker that may resolve its references must mount the same
+// durable filesystem at the same path. Container-local and other ephemeral
+// filesystems lose references on restart and are not suitable for production.
 type FileStore struct {
 	root     string
 	maxBytes int64
 }
 
+// NewFileStore creates a filesystem-backed store with an optional payload limit.
 func NewFileStore(root string, maxBytes ...int64) (*FileStore, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("file payload store root is required")
@@ -37,6 +43,7 @@ func NewFileStore(root string, maxBytes ...int64) (*FileStore, error) {
 	return &FileStore{root: absoluteRoot, maxBytes: limit}, nil
 }
 
+// Store writes one payload beneath the configured root.
 func (s *FileStore) Store(ctx context.Context, payload []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -83,6 +90,7 @@ func (s *FileStore) Store(ctx context.Context, payload []byte) (string, error) {
 	return location, nil
 }
 
+// Resolve reads a payload location created by this store.
 func (s *FileStore) Resolve(ctx context.Context, location string) ([]byte, error) {
 	hash, err := parseFileLocation(location)
 	if err != nil {

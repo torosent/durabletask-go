@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
@@ -14,7 +15,6 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
@@ -25,13 +25,21 @@ import (
 type TaskHubGrpcClient struct {
 	client         protos.TaskHubSidecarServiceClient
 	connection     grpc.ClientConnInterface
-	logger         backend.Logger
+	logger         api.Logger
 	largePayloads  *api.LargePayloadOptions
 	defaultVersion string
 	converter      api.DataConverter
 
 	listenerMu sync.Mutex
 	listener   *TaskHubGrpcWorker
+}
+
+func newInfiniteRetries() *backoff.ExponentialBackOff {
+	retries := backoff.NewExponentialBackOff()
+	retries.MaxInterval = 15 * time.Second
+	retries.MaxElapsedTime = 0
+	retries.Reset()
+	return retries
 }
 
 type TaskHubGrpcClientOption func(*TaskHubGrpcClient)
@@ -68,7 +76,7 @@ func WithDataConverter(converter api.DataConverter) TaskHubGrpcClientOption {
 // NewTaskHubGrpcClient creates a client that can be used to manage orchestrations over a borrowed gRPC connection.
 // The caller retains ownership of the connection; this client neither closes nor recreates it. DTS applications that
 // want an owned, resilient management channel should use durabletaskscheduler.NewClient.
-func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger backend.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
+func NewTaskHubGrpcClient(cc grpc.ClientConnInterface, logger api.Logger, opts ...TaskHubGrpcClientOption) *TaskHubGrpcClient {
 	c := &TaskHubGrpcClient{
 		client:     protos.NewTaskHubSidecarServiceClient(cc),
 		connection: cc,

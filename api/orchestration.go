@@ -17,18 +17,15 @@ import (
 
 var (
 	ErrInstanceNotFound  = errors.New("no such instance exists")
-	ErrNotStarted        = errors.New("orchestration has not started")
 	ErrNotCompleted      = errors.New("orchestration has not yet completed")
-	ErrNoFailures        = errors.New("orchestration did not report failure details")
 	ErrDuplicateInstance = errors.New("orchestration instance already exists")
-	ErrIgnoreInstance    = errors.New("ignore creating orchestration instance")
 	ErrInvalidState      = errors.New("orchestration is not in a valid state for this operation")
 
 	EmptyInstanceID = InstanceID("")
 )
 
-// CreateOrchestrationAction controls how a local task hub handles an existing
-// orchestration whose runtime status matches an ID reuse policy.
+// CreateOrchestrationAction controls how DTS handles an existing orchestration
+// whose runtime status matches an ID reuse policy.
 type CreateOrchestrationAction int32
 
 const (
@@ -82,7 +79,7 @@ type OrchestrationMetadata struct {
 // NewOrchestrationOptions configures options for starting a new orchestration.
 type NewOrchestrationOptions func(*protos.CreateInstanceRequest, DataConverter) error
 
-// GetOrchestrationMetadataOptions is a set of options for fetching orchestration metadata.
+// FetchOrchestrationMetadataOptions configures orchestration metadata retrieval.
 type FetchOrchestrationMetadataOptions func(*protos.GetInstanceRequest)
 
 // RaiseEventOptions is a set of options for raising an orchestration event.

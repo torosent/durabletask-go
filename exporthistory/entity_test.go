@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/assert"
@@ -20,7 +19,7 @@ import (
 // start-orchestration actions are exercised exactly as the worker runs them.
 type entityHarness struct {
 	t        *testing.T
-	executor backend.EntityExecutor
+	executor task.EntityExecutor
 	jobID    string
 	state    *wrapperspb.StringValue
 	actions  []*protos.OperationAction
@@ -30,7 +29,7 @@ func newEntityHarness(t *testing.T, jobID string) *entityHarness {
 	t.Helper()
 	registry := task.NewTaskRegistry()
 	require.NoError(t, registry.AddEntityN(ExportJobEntityName, exportJobEntity))
-	executor, ok := task.NewTaskExecutor(registry).(backend.EntityExecutor)
+	executor, ok := task.NewTaskExecutor(registry).(task.EntityExecutor)
 	require.True(t, ok)
 	return &entityHarness{t: t, executor: executor, jobID: jobID}
 }

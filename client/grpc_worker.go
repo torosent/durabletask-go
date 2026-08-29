@@ -7,15 +7,14 @@ import (
 	"io"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
@@ -52,6 +51,15 @@ const (
 	WorkerCapabilityHistoryStreaming WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_HISTORY_STREAMING
 	WorkerCapabilityScheduledTasks   WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_SCHEDULED_TASKS
 	WorkerCapabilityLargePayloads    WorkerCapability = protos.WorkerCapability_WORKER_CAPABILITY_LARGE_PAYLOADS
+
+	// DefaultMaxStreamedHistoryEvents and DefaultMaxStreamedHistoryBytes are
+	// the worker's default per-work-item replay-history safety bounds.
+	DefaultMaxStreamedHistoryEvents       = api.DefaultHistoryMaxEvents
+	DefaultMaxStreamedHistoryBytes  int64 = api.DefaultHistoryMaxBytes
+	// MaxStreamedHistoryEvents and MaxStreamedHistoryBytes bound configurable
+	// worker replay-history limits.
+	MaxStreamedHistoryEvents       = api.MaxHistoryMaxEvents
+	MaxStreamedHistoryBytes  int64 = api.MaxHistoryMaxBytes
 )
 
 type WorkItemFilter struct {
@@ -80,6 +88,8 @@ type taskHubGrpcWorkerOptions struct {
 	transientRetryMaxAttempts   int
 	transientRetryBaseDelay     time.Duration
 	transientRetryMaxDelay      time.Duration
+	maxStreamedHistoryEvents    int
+	maxStreamedHistoryBytes     int64
 	maximumTimerInterval        *time.Duration
 	taskExecutorOptions         []task.TaskExecutorOption
 	versioning                  *task.VersioningOptions
@@ -91,6 +101,7 @@ type taskHubGrpcWorkerOptions struct {
 	converter                   api.DataConverter
 	unversionedOrchestrators    map[string]struct{}
 	unversionedActivities       map[string]struct{}
+	reconnectRandom             randomInt64N
 	// waitFn overrides every delay the worker imposes on itself: reconnect
 	// backoff, transient RPC retry backoff, and work-item abandon delays. It is
 	// only set by tests so the deterministic delay schedule can be observed
@@ -112,6 +123,9 @@ func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
 		transientRetryMaxAttempts:   10,
 		transientRetryBaseDelay:     200 * time.Millisecond,
 		transientRetryMaxDelay:      15 * time.Second,
+		maxStreamedHistoryEvents:    DefaultMaxStreamedHistoryEvents,
+		maxStreamedHistoryBytes:     DefaultMaxStreamedHistoryBytes,
+		reconnectRandom:             rand.Int64N,
 		capabilities:                []WorkerCapability{WorkerCapabilityHistoryStreaming},
 	}
 }
@@ -143,6 +157,36 @@ func WithMaxConcurrentEntityWorkItems(n int) TaskHubGrpcWorkerOption {
 			return err
 		}
 		options.maxConcurrentEntities = n
+		return nil
+	}
+}
+
+// WithMaxStreamedHistoryEvents limits the number of history events retained
+// while receiving a streamed orchestration history.
+func WithMaxStreamedHistoryEvents(n int) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if n <= 0 || n > MaxStreamedHistoryEvents {
+			return fmt.Errorf(
+				"maximum streamed history events must be between 1 and %d",
+				MaxStreamedHistoryEvents,
+			)
+		}
+		options.maxStreamedHistoryEvents = n
+		return nil
+	}
+}
+
+// WithMaxStreamedHistoryBytes limits the protobuf bytes retained while
+// receiving a streamed orchestration history.
+func WithMaxStreamedHistoryBytes(n int64) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if n <= 0 || n > MaxStreamedHistoryBytes {
+			return fmt.Errorf(
+				"maximum streamed history bytes must be between 1 and %d",
+				MaxStreamedHistoryBytes,
+			)
+		}
+		options.maxStreamedHistoryBytes = n
 		return nil
 	}
 }
@@ -194,8 +238,9 @@ func WithWorkerRPCTimeout(timeout time.Duration) TaskHubGrpcWorkerOption {
 	}
 }
 
-// WithWorkerReconnectBackoff configures the deterministic reconnect schedule.
-// Delays double from baseDelay and are always within [baseDelay, maxDelay].
+// WithWorkerReconnectBackoff configures the reconnect schedule. Nominal delays
+// double from baseDelay, receive ±25% jitter, and remain within
+// [baseDelay, maxDelay].
 func WithWorkerReconnectBackoff(baseDelay, maxDelay time.Duration) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		if baseDelay <= 0 || maxDelay < baseDelay {
@@ -404,8 +449,8 @@ func WithWorkerDataConverter(converter api.DataConverter) TaskHubGrpcWorkerOptio
 // DTS gRPC work-item stream (named TaskHubSidecarService in the wire contract).
 type TaskHubGrpcWorker struct {
 	clientFactory grpcWorkerClientFactory
-	executor      backend.Executor
-	logger        backend.Logger
+	executor      task.Executor
+	logger        api.Logger
 	options       taskHubGrpcWorkerOptions
 
 	mu      sync.Mutex
@@ -450,7 +495,7 @@ type grpcWorkerConnection struct {
 func NewTaskHubGrpcWorker(
 	cc grpc.ClientConnInterface,
 	registry *task.TaskRegistry,
-	logger backend.Logger,
+	logger api.Logger,
 	opts ...TaskHubGrpcWorkerOption,
 ) (*TaskHubGrpcWorker, error) {
 	if cc == nil {
@@ -472,7 +517,7 @@ func NewTaskHubGrpcWorker(
 func NewTaskHubGrpcWorkerWithConnectionFactory(
 	factory TaskHubGrpcWorkerConnectionFactory,
 	registry *task.TaskRegistry,
-	logger backend.Logger,
+	logger api.Logger,
 	opts ...TaskHubGrpcWorkerOption,
 ) (*TaskHubGrpcWorker, error) {
 	if factory == nil {
@@ -501,7 +546,7 @@ func NewTaskHubGrpcWorkerWithConnectionFactory(
 func newTaskHubGrpcWorker(
 	factory grpcWorkerClientFactory,
 	registry *task.TaskRegistry,
-	logger backend.Logger,
+	logger api.Logger,
 	opts ...TaskHubGrpcWorkerOption,
 ) (*TaskHubGrpcWorker, error) {
 	if factory == nil {
@@ -511,7 +556,7 @@ func newTaskHubGrpcWorker(
 		return nil, fmt.Errorf("task registry is required")
 	}
 	if logger == nil {
-		logger = backend.DefaultLogger()
+		logger = api.DefaultLogger()
 	}
 
 	options := defaultTaskHubGrpcWorkerOptions()
@@ -899,7 +944,11 @@ func (w *TaskHubGrpcWorker) execute(run *grpcWorkerRun, connection *grpcWorkerCo
 }
 
 func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerConnection) error {
-	reconnectBackoff := newWorkerBackoff(w.options.reconnectBaseDelay, w.options.reconnectMaxDelay)
+	reconnectBackoff := newWorkerBackoff(
+		w.options.reconnectBaseDelay,
+		w.options.reconnectMaxDelay,
+		w.options.reconnectRandom,
+	)
 	for {
 		observedMessage, err := w.consumeConnection(run, connection)
 		w.retireConnection(run, connection)
@@ -1159,6 +1208,9 @@ func isTransientWorkerError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrStreamedHistoryLimitExceeded) {
+		return false
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, errSilentDisconnect) {
 		return true
 	}
@@ -1169,6 +1221,17 @@ func isTransientWorkerError(err error) bool {
 	if grpcStatus.Code() == codes.Canceled &&
 		strings.Contains(grpcStatus.Message(), "client connection is closing") {
 		return false
+	}
+	return isTransientWorkerGRPCStatus(grpcStatus)
+}
+
+func isTransientWorkerGRPCStatus(grpcStatus *status.Status) bool {
+	if grpcStatus.Code() == codes.ResourceExhausted {
+		message := grpcStatus.Message()
+		if strings.Contains(message, "received message larger than max") ||
+			strings.Contains(message, "trying to send message larger than max") {
+			return false
+		}
 	}
 	return isTransientWorkerGRPCCode(grpcStatus.Code())
 }
@@ -1220,24 +1283,26 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// workerBackoff is a deterministic exponential backoff. Every delay it produces
-// is within [base, max]: unlike a randomized backoff it never returns a delay
-// below the configured base or up to 50% above the configured maximum, and its
-// doubling saturates instead of overflowing for very large maximums.
+type randomInt64N func(int64) int64
+
+// workerBackoff is a bounded, jittered exponential backoff. Every delay it
+// produces stays within [base, max], and doubling saturates instead of
+// overflowing for very large maximums.
 type workerBackoff struct {
 	base    time.Duration
 	max     time.Duration
 	current time.Duration
+	random  randomInt64N
 }
 
-func newWorkerBackoff(base, max time.Duration) *workerBackoff {
+func newWorkerBackoff(base, max time.Duration, random randomInt64N) *workerBackoff {
 	if base <= 0 {
 		base = time.Millisecond
 	}
 	if max < base {
 		max = base
 	}
-	return &workerBackoff{base: base, max: max, current: base}
+	return &workerBackoff{base: base, max: max, current: base, random: random}
 }
 
 // Reset restarts the schedule at the base delay.
@@ -1249,6 +1314,17 @@ func (b *workerBackoff) Reset() {
 func (b *workerBackoff) Next() time.Duration {
 	delay := b.current
 	b.current = doubleDurationBounded(b.current, b.max)
+	if b.random != nil {
+		jitter := delay / 4
+		lower := max(b.base, delay-jitter)
+		upper := b.max
+		if delay <= time.Duration(math.MaxInt64)-jitter {
+			upper = min(b.max, delay+jitter)
+		}
+		if width := upper - lower; width > 0 {
+			delay = lower + time.Duration(b.random(int64(width)+1))
+		}
+	}
 	return delay
 }
 
@@ -1262,12 +1338,4 @@ func doubleDurationBounded(delay, max time.Duration) time.Duration {
 		return doubled
 	}
 	return max
-}
-
-func newInfiniteRetries() *backoff.ExponentialBackOff {
-	b := backoff.NewExponentialBackOff()
-	b.MaxInterval = 15 * time.Second
-	b.MaxElapsedTime = 0
-	b.Reset()
-	return b
 }
