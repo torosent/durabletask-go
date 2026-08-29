@@ -36,6 +36,74 @@ type recordingCredential struct {
 
 type failingCredential struct{}
 
+type blockingCredential struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+	token   azcore.AccessToken
+	err     error
+}
+
+func newBlockingCredential() *blockingCredential {
+	return &blockingCredential{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		token:   azcore.AccessToken{Token: "token", ExpiresOn: time.Now().Add(time.Hour)},
+	}
+}
+
+func (c *blockingCredential) GetToken(
+	ctx context.Context,
+	_ policy.TokenRequestOptions,
+) (azcore.AccessToken, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return azcore.AccessToken{}, ctx.Err()
+	case <-c.release:
+		return c.token, c.err
+	}
+}
+
+func (c *blockingCredential) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func newTestSchedulerCredentials(credential azcore.TokenCredential) *schedulerPerRPCCredentials {
+	return &schedulerPerRPCCredentials{
+		credential: credential,
+		scope:      "https://durabletask.io/.default",
+		taskHub:    "hub",
+		userAgent:  "agent",
+	}
+}
+
+func callSchedulerCredentialsConcurrently(
+	perRPC *schedulerPerRPCCredentials,
+	callers int,
+) <-chan error {
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			_, err := perRPC.GetRequestMetadata(context.Background())
+			errs <- err
+		}()
+	}
+	close(start)
+	return errs
+}
+
 func (failingCredential) GetToken(
 	context.Context,
 	policy.TokenRequestOptions,
@@ -172,15 +240,247 @@ func TestSchedulerCredentialsUseExpectedScope(t *testing.T) {
 }
 
 func TestSchedulerCredentialFailureIsTransient(t *testing.T) {
-	perRPC := &schedulerPerRPCCredentials{
-		credential: failingCredential{},
-		scope:      "https://durabletask.io/.default",
-		taskHub:    "hub",
-		userAgent:  "agent",
-	}
+	perRPC := newTestSchedulerCredentials(failingCredential{})
 	_, err := perRPC.GetRequestMetadata(context.Background())
 	require.Equal(t, codes.Unavailable, status.Code(err))
 	require.ErrorContains(t, err, "temporary token failure")
+}
+
+func TestSchedulerCredentialsCacheAccessToken(t *testing.T) {
+	credential := &recordingCredential{}
+	perRPC := newTestSchedulerCredentials(credential)
+
+	first, err := perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	second, err := perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, first["authorization"], second["authorization"])
+
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	require.Len(t, credential.options, 1)
+}
+
+func TestSchedulerCredentialsCoalesceConcurrentTokenRequests(t *testing.T) {
+	credential := newBlockingCredential()
+	perRPC := newTestSchedulerCredentials(credential)
+
+	const callers = 64
+	errs := callSchedulerCredentialsConcurrently(perRPC, callers)
+	<-credential.started
+	close(credential.release)
+	for range callers {
+		require.NoError(t, <-errs)
+	}
+	require.Equal(t, 1, credential.callCount())
+}
+
+func TestSchedulerCredentialsCoalesceShortLivedTokenRequests(t *testing.T) {
+	credential := newBlockingCredential()
+	credential.token.ExpiresOn = time.Time{}
+	perRPC := newTestSchedulerCredentials(credential)
+
+	const callers = 64
+	errs := callSchedulerCredentialsConcurrently(perRPC, callers)
+	<-credential.started
+	close(credential.release)
+	for range callers {
+		require.NoError(t, <-errs)
+	}
+	require.Equal(t, 1, credential.callCount())
+}
+
+func TestSchedulerCredentialsCoalesceRefreshFailure(t *testing.T) {
+	credential := newBlockingCredential()
+	credential.err = errors.New("token unavailable")
+	perRPC := newTestSchedulerCredentials(credential)
+
+	const callers = 64
+	errs := callSchedulerCredentialsConcurrently(perRPC, callers)
+	<-credential.started
+	close(credential.release)
+	for range callers {
+		require.ErrorContains(t, <-errs, "token unavailable")
+	}
+	_, err := perRPC.GetRequestMetadata(context.Background())
+	require.ErrorContains(t, err, "token unavailable")
+	require.Equal(t, 1, credential.callCount())
+}
+
+func TestSchedulerCredentialsCanceledWaiterDoesNotBlockOnRefresh(t *testing.T) {
+	credential := newBlockingCredential()
+	perRPC := newTestSchedulerCredentials(credential)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := perRPC.GetRequestMetadata(context.Background())
+		firstDone <- err
+	}()
+	<-credential.started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := perRPC.GetRequestMetadata(ctx)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, context.Canceled.Error())
+
+	close(credential.release)
+	require.NoError(t, <-firstDone)
+}
+
+func TestSchedulerCredentialsCanceledLeaderDoesNotCancelSharedRefresh(t *testing.T) {
+	credential := newBlockingCredential()
+	perRPC := newTestSchedulerCredentials(credential)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := perRPC.GetRequestMetadata(leaderCtx)
+		leaderDone <- err
+	}()
+	<-credential.started
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := perRPC.GetRequestMetadata(context.Background())
+		waiterDone <- err
+	}()
+	cancelLeader()
+	require.ErrorContains(t, <-leaderDone, context.Canceled.Error())
+
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("shared refresh ended with leader context: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(credential.release)
+	require.NoError(t, <-waiterDone)
+	require.Equal(t, 1, credential.callCount())
+}
+
+func TestSchedulerCredentialsUseValidTokenWhenRefreshFails(t *testing.T) {
+	perRPC := newTestSchedulerCredentials(failingCredential{})
+	perRPC.token.Store(perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "cached",
+		ExpiresOn: time.Now().Add(time.Minute),
+	}))
+
+	values, err := perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "Bearer cached", values["authorization"])
+}
+
+func TestSchedulerCredentialsRefreshesStaleTokenWithoutMutatingOldMetadata(t *testing.T) {
+	credential := &recordingCredential{}
+	perRPC := newTestSchedulerCredentials(credential)
+	oldState := perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "old",
+		ExpiresOn: time.Now().Add(time.Hour),
+	})
+	oldState.refreshAfter = time.Now().Add(-time.Second)
+	perRPC.token.Store(oldState)
+
+	values, err := perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, oldState.metadata["authorization"], values["authorization"])
+	require.Eventually(t, func() bool {
+		return perRPC.token.Load() != oldState
+	}, time.Second, time.Millisecond)
+	values, err = perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	require.NotEqual(t, oldState.metadata["authorization"], values["authorization"])
+	require.Equal(t, "Bearer old", oldState.metadata["authorization"])
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	require.Len(t, credential.options, 1)
+}
+
+func TestSchedulerCredentialStateHonorsRefreshOnAndExpiryBuffer(t *testing.T) {
+	perRPC := newTestSchedulerCredentials(&recordingCredential{})
+	expiresOn := time.Now().Add(time.Hour)
+	refreshOn := time.Now().Add(10 * time.Minute)
+
+	withRefreshOn := perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "token",
+		ExpiresOn: expiresOn,
+		RefreshOn: refreshOn,
+	})
+	require.Equal(t, refreshOn, withRefreshOn.refreshAfter)
+
+	withoutRefreshOn := perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "token",
+		ExpiresOn: expiresOn,
+	})
+	require.Equal(t, expiresOn.Add(-accessTokenRefreshBuffer), withoutRefreshOn.refreshAfter)
+}
+
+func TestSchedulerCredentialsDoNotUseExpiredTokenWhenRefreshFails(t *testing.T) {
+	perRPC := newTestSchedulerCredentials(failingCredential{})
+	perRPC.token.Store(perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "expired",
+		ExpiresOn: time.Now().Add(-time.Minute),
+	}))
+
+	_, err := perRPC.GetRequestMetadata(context.Background())
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "temporary token failure")
+}
+
+func TestSchedulerCredentialsRejectExpiredCredentialToken(t *testing.T) {
+	credential := newBlockingCredential()
+	credential.token.ExpiresOn = time.Now().Add(-time.Minute)
+	close(credential.release)
+	perRPC := newTestSchedulerCredentials(credential)
+
+	_, err := perRPC.GetRequestMetadata(context.Background())
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.ErrorContains(t, err, "expired access token")
+	_, err = perRPC.GetRequestMetadata(context.Background())
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, 1, credential.callCount())
+}
+
+func TestSchedulerCredentialsUseValidTokenWhileRefreshing(t *testing.T) {
+	credential := newBlockingCredential()
+	credential.token.Token = "refreshed"
+	perRPC := newTestSchedulerCredentials(credential)
+	cached := perRPC.newCredentialState(azcore.AccessToken{
+		Token:     "cached",
+		ExpiresOn: time.Now().Add(time.Hour),
+	})
+	cached.refreshAfter = time.Now().Add(-time.Second)
+	perRPC.token.Store(cached)
+
+	values, err := perRPC.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "Bearer cached", values["authorization"])
+	<-credential.started
+	close(credential.release)
+	require.Eventually(t, func() bool {
+		return perRPC.token.Load() != cached
+	}, time.Second, time.Millisecond)
+}
+
+func BenchmarkSchedulerCredentialsCachedToken(b *testing.B) {
+	perRPC := &schedulerPerRPCCredentials{
+		credential: &recordingCredential{},
+		scope:      "https://durabletask.io/.default",
+		taskHub:    "hub",
+		userAgent:  "agent",
+		workerID:   "worker",
+	}
+	if _, err := perRPC.GetRequestMetadata(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := perRPC.GetRequestMetadata(context.Background()); err != nil {
+				b.Error(err)
+			}
+		}
+	})
 }
 
 func TestConfiguredClientAndWorkerUseSeparateMetadataAndConnections(t *testing.T) {

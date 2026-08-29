@@ -161,6 +161,58 @@ func TestTransformOrchestratorResponsePayloadFields(t *testing.T) {
 	}
 }
 
+func BenchmarkTransformOrchestratorResponseDisabled(b *testing.B) {
+	response := &protos.OrchestratorResponse{
+		CustomStatus: wrapperspb.String("status"),
+		Actions: []*protos.OrchestratorAction{
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_ScheduleTask{
+					ScheduleTask: &protos.ScheduleTaskAction{Input: wrapperspb.String("activity")},
+				},
+			},
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_CreateSubOrchestration{
+					CreateSubOrchestration: &protos.CreateSubOrchestrationAction{Input: wrapperspb.String("child")},
+				},
+			},
+			{
+				OrchestratorActionType: &protos.OrchestratorAction_CompleteOrchestration{
+					CompleteOrchestration: &protos.CompleteOrchestrationAction{Result: wrapperspb.String("result")},
+				},
+			},
+		},
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := TransformOrchestratorResponse(ctx, nil, response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestTransformOrchestratorResponseDisabledFastPath(t *testing.T) {
+	t.Run("ordinary payload ignores cancellation because no work is required", func(t *testing.T) {
+		value := wrapperspb.String("ordinary")
+		response := &protos.OrchestratorResponse{CustomStatus: value}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		require.NoError(t, TransformOrchestratorResponse(ctx, nil, response))
+		require.Same(t, value, response.CustomStatus)
+	})
+
+	t.Run("reserved reference still requires configuration", func(t *testing.T) {
+		response := &protos.OrchestratorResponse{
+			CustomStatus: wrapperspb.String(api.AzureBlobPayloadReferencePrefixV2 + "https://account.example/payload"),
+		}
+
+		err := TransformOrchestratorResponse(context.Background(), nil, response)
+		require.ErrorIs(t, err, api.ErrFeatureNotSupported)
+	})
+}
+
 func TestTransformHistoryEventPayloadFields(t *testing.T) {
 	store := payload.NewMemoryStore()
 	options := &api.LargePayloadOptions{
