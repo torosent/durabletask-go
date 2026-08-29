@@ -18,7 +18,6 @@ import (
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -255,7 +254,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 			},
 		)}
 	default:
-		response = proto.Clone(results.Response).(*protos.OrchestratorResponse)
+		response = results.Response
 		response.InstanceId = request.InstanceId
 		response.CompletionToken = completionToken
 		if response.OrchestrationTraceContext == nil {
@@ -273,6 +272,10 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		return callErr
 	})
 	if err != nil {
+		if isWorkItemGone(err) {
+			w.logger.Warnf("%s: orchestration work item was no longer available before completion", request.InstanceId)
+			return
+		}
 		w.logger.Errorf("%s: failed to complete orchestration work item: %v", request.InstanceId, err)
 		w.abandonOrchestration(ctx, client, completionToken)
 	}
@@ -407,6 +410,15 @@ func (w *TaskHubGrpcWorker) processActivity(
 		return callErr
 	})
 	if err != nil {
+		if isWorkItemGone(err) {
+			w.logger.Warnf(
+				"%s/%s#%d: activity work item was no longer available before completion",
+				request.OrchestrationInstance.InstanceId,
+				request.Name,
+				request.TaskId,
+			)
+			return
+		}
 		w.logger.Errorf("%s/%s#%d: failed to complete activity work item: %v", request.OrchestrationInstance.InstanceId, request.Name, request.TaskId, err)
 		w.abandonActivity(ctx, client, completionToken)
 	}
@@ -467,7 +479,6 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		w.abandonEntity(ctx, client, completionToken)
 		return
 	}
-	result = proto.Clone(result).(*protos.EntityBatchResult)
 	result.CompletionToken = completionToken
 	if len(operationInfos) > len(result.Results) {
 		operationInfos = operationInfos[:len(result.Results)]
@@ -484,6 +495,10 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		return callErr
 	})
 	if err != nil {
+		if isWorkItemGone(err) {
+			w.logger.Warnf("%s: entity work item was no longer available before completion", request.GetInstanceId())
+			return
+		}
 		w.logger.Errorf("%s: failed to complete entity work item: %v", request.GetInstanceId(), err)
 		w.abandonEntity(ctx, client, completionToken)
 	}
@@ -654,5 +669,12 @@ func isTransientWorkerRPCError(err error) bool {
 	if !ok {
 		return false
 	}
+	if grpcStatus.Code() == codes.NotFound {
+		return false
+	}
 	return isTransientWorkerGRPCCode(grpcStatus.Code())
+}
+
+func isWorkItemGone(err error) bool {
+	return status.Code(err) == codes.NotFound
 }

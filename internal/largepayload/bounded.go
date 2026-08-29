@@ -153,6 +153,11 @@ func (p *transformPlan) add(target **wrapperspb.StringValue) {
 	if target == nil || *target == nil {
 		return
 	}
+	// With no options, ordinary payloads are already final. Reserved references
+	// must still run through the transform so missing configuration is rejected.
+	if p.options == nil && !api.IsLargePayloadReference((*target).GetValue()) {
+		return
+	}
 	if _, duplicate := p.queued[target]; duplicate {
 		return
 	}
