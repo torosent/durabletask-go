@@ -3,12 +3,15 @@ package durabletaskscheduler
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -24,6 +27,25 @@ import (
 )
 
 const modulePath = "github.com/microsoft/durabletask-go"
+
+const (
+	accessTokenRefreshBuffer        = 5 * time.Minute
+	accessTokenMinimumCacheDuration = time.Second
+	accessTokenRefreshRetryDelay    = time.Second
+	accessTokenRefreshTimeout       = 5 * time.Minute
+)
+
+type schedulerCredentialState struct {
+	metadata     map[string]string
+	refreshAfter time.Time
+	validUntil   time.Time
+}
+
+type schedulerCredentialRefresh struct {
+	done  chan struct{}
+	state *schedulerCredentialState
+	err   error
+}
 
 const retryServiceConfig = `{
   "methodConfig": [{
@@ -51,24 +73,173 @@ type schedulerPerRPCCredentials struct {
 	taskHub    string
 	userAgent  string
 	workerID   string
+
+	metadataOnce sync.Once
+	// metadata is immutable after construction; gRPC copies it into each request.
+	metadata   map[string]string
+	token      atomic.Pointer[schedulerCredentialState]
+	refreshMu  sync.Mutex
+	refresh    *schedulerCredentialRefresh
+	refreshErr error
+	retryAfter time.Time
 }
 
 func (c *schedulerPerRPCCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
-	metadata := map[string]string{
-		"taskhub":      c.taskHub,
-		"x-user-agent": c.userAgent,
-	}
-	if c.workerID != "" {
-		metadata["workerid"] = c.workerID
-	}
 	if c.credential != nil {
-		token, err := c.credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{c.scope}})
+		state, err := c.getToken(ctx)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "failed to acquire DTS access token: %v", err)
 		}
-		metadata["authorization"] = "Bearer " + token.Token
+		return state.metadata, nil
 	}
-	return metadata, nil
+	return c.baseMetadata(), nil
+}
+
+func (c *schedulerPerRPCCredentials) baseMetadata() map[string]string {
+	c.metadataOnce.Do(func() {
+		c.metadata = map[string]string{
+			"taskhub":      c.taskHub,
+			"x-user-agent": c.userAgent,
+		}
+		if c.workerID != "" {
+			c.metadata["workerid"] = c.workerID
+		}
+	})
+	return c.metadata
+}
+
+// getToken keeps the common cached-token path lock-free. The mutex only
+// coordinates refresh ownership and waiters when the cached token needs work.
+func (c *schedulerPerRPCCredentials) getToken(ctx context.Context) (*schedulerCredentialState, error) {
+	now := time.Now()
+	cached := c.token.Load()
+	if tokenIsFresh(cached, now) {
+		return cached, nil
+	}
+
+	c.refreshMu.Lock()
+	now = time.Now()
+	cached = c.token.Load()
+	switch {
+	case tokenIsFresh(cached, now):
+		c.refreshMu.Unlock()
+		return cached, nil
+	case c.refreshErr != nil && now.Before(c.retryAfter):
+		err := c.refreshErr
+		c.refreshMu.Unlock()
+		if tokenIsValid(cached, now) {
+			return cached, nil
+		}
+		return nil, err
+	case c.refresh == nil:
+		if err := ctx.Err(); err != nil {
+			c.refreshMu.Unlock()
+			return nil, err
+		}
+		refresh := &schedulerCredentialRefresh{done: make(chan struct{})}
+		c.refresh = refresh
+		c.refreshMu.Unlock()
+		go c.refreshToken(context.WithoutCancel(ctx), cached, refresh)
+		if tokenIsValid(cached, now) {
+			return cached, nil
+		}
+		return waitForCredentialRefresh(ctx, refresh)
+	case tokenIsValid(cached, now):
+		c.refreshMu.Unlock()
+		return cached, nil
+	}
+
+	refresh := c.refresh
+	c.refreshMu.Unlock()
+	return waitForCredentialRefresh(ctx, refresh)
+}
+
+func (c *schedulerPerRPCCredentials) refreshToken(
+	ctx context.Context,
+	cached *schedulerCredentialState,
+	refresh *schedulerCredentialRefresh,
+) {
+	refreshCtx, cancel := context.WithTimeout(ctx, accessTokenRefreshTimeout)
+	defer cancel()
+	token, refreshErr := c.credential.GetToken(refreshCtx, policy.TokenRequestOptions{Scopes: []string{c.scope}})
+	if refreshErr == nil {
+		refreshed := c.newCredentialState(token)
+		if tokenIsValid(refreshed, time.Now()) {
+			cached = refreshed
+		} else {
+			refreshErr = errors.New("DTS credential returned an expired access token")
+		}
+	}
+	err := refreshErr
+	if refreshErr != nil && tokenIsValid(cached, time.Now()) {
+		err = nil
+	}
+
+	c.refreshMu.Lock()
+	if refreshErr == nil {
+		c.token.Store(cached)
+		c.refreshErr = nil
+		c.retryAfter = time.Time{}
+	} else {
+		c.refreshErr = refreshErr
+		c.retryAfter = time.Now().Add(accessTokenRefreshRetryDelay)
+	}
+	refresh.state = cached
+	refresh.err = err
+	c.refresh = nil
+	close(refresh.done)
+	c.refreshMu.Unlock()
+}
+
+func waitForCredentialRefresh(
+	ctx context.Context,
+	refresh *schedulerCredentialRefresh,
+) (*schedulerCredentialState, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-refresh.done:
+		return refresh.state, refresh.err
+	}
+}
+
+func (c *schedulerPerRPCCredentials) newCredentialState(token azcore.AccessToken) *schedulerCredentialState {
+	now := time.Now()
+	validUntil := token.ExpiresOn
+	if validUntil.IsZero() {
+		validUntil = now.Add(accessTokenMinimumCacheDuration)
+	}
+	refreshAfter := token.RefreshOn
+	if refreshAfter.IsZero() {
+		refreshAfter = token.ExpiresOn.Add(-accessTokenRefreshBuffer)
+	}
+	minimumRefresh := now.Add(accessTokenMinimumCacheDuration)
+	if refreshAfter.IsZero() || refreshAfter.Before(minimumRefresh) {
+		refreshAfter = minimumRefresh
+	}
+	if refreshAfter.After(validUntil) {
+		refreshAfter = validUntil
+	}
+
+	base := c.baseMetadata()
+	metadata := make(map[string]string, len(base)+1)
+	for key, value := range base {
+		metadata[key] = value
+	}
+	metadata["authorization"] = "Bearer " + token.Token
+	return &schedulerCredentialState{
+		metadata:     metadata,
+		refreshAfter: refreshAfter,
+		validUntil:   validUntil,
+	}
+}
+
+func tokenIsFresh(state *schedulerCredentialState, now time.Time) bool {
+	return state != nil && state.refreshAfter.After(now)
+}
+
+func tokenIsValid(state *schedulerCredentialState, now time.Time) bool {
+	return state != nil && state.validUntil.After(now)
 }
 
 func (c *schedulerPerRPCCredentials) RequireTransportSecurity() bool {

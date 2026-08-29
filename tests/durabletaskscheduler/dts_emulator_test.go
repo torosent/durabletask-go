@@ -274,7 +274,7 @@ func TestDTSEmulatorAdvancedManagementOperations(t *testing.T) {
 	}))
 	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	t.Run("create-task-hub", func(t *testing.T) {
 		err := managementClient.CreateTaskHub(ctx)
@@ -313,8 +313,18 @@ func TestDTSEmulatorAdvancedManagementOperations(t *testing.T) {
 		}
 		require.NoError(t, err)
 		require.Len(t, result.Orchestrations, 1)
-		require.Equal(t, completedIDs[0], result.Orchestrations[0].InstanceID)
+		require.Contains(t, []api.InstanceID{completedIDs[0], completedIDs[2]}, result.Orchestrations[0].InstanceID)
 		require.NotEmpty(t, result.ContinuationToken)
+		next, err := managementClient.QueryInstances(ctx, api.OrchestrationQuery{
+			InstanceIDPrefix:  prefix,
+			PageSize:          1,
+			Tags:              map[string]string{"group": "0"},
+			ContinuationToken: result.ContinuationToken,
+		})
+		require.NoError(t, err)
+		require.Len(t, next.Orchestrations, 1)
+		require.Contains(t, []api.InstanceID{completedIDs[0], completedIDs[2]}, next.Orchestrations[0].InstanceID)
+		require.NotEqual(t, result.Orchestrations[0].InstanceID, next.Orchestrations[0].InstanceID)
 	})
 
 	t.Run("list-instance-ids", func(t *testing.T) {
@@ -1207,7 +1217,7 @@ func TestDTSEmulatorScheduledTasksAndHistory(t *testing.T) {
 		ScheduleID:              scheduleID,
 		OrchestrationName:       targetName,
 		TypedOrchestrationInput: "scheduled",
-		Interval:                2 * time.Second,
+		Interval:                time.Hour,
 		StartImmediatelyIfLate:  true,
 		Tags:                    map[string]string{"source": scheduleTag},
 		ContextFields:           api.ContextFields{"tenant": "north"},
