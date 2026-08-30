@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/payload"
@@ -103,7 +102,7 @@ func TestTaskHubGrpcClientLargePayloadManagementFields(t *testing.T) {
 	fake := &largePayloadSchedulerClient{}
 	client := &TaskHubGrpcClient{
 		client:        fake,
-		logger:        backend.DefaultLogger(),
+		logger:        api.DefaultLogger(),
 		largePayloads: options,
 	}
 	ctx := context.Background()
@@ -152,7 +151,7 @@ func TestTaskHubGrpcClientUsesConverterBeforeLargePayloadExternalization(t *test
 	converter := textDataConverter{}
 	client := &TaskHubGrpcClient{
 		client:        fake,
-		logger:        backend.DefaultLogger(),
+		logger:        api.DefaultLogger(),
 		largePayloads: options,
 		converter:     converter,
 	}

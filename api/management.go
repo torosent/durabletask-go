@@ -17,7 +17,7 @@ const (
 	DefaultPurgePollInterval     = 100 * time.Millisecond
 )
 
-var ErrFeatureNotSupported = errors.New("feature is not supported by this task hub")
+var ErrFeatureNotSupported = errors.New("feature is not supported by Durable Task Scheduler")
 
 // OrchestrationQuery describes a bounded query for orchestration instances.
 // ContinuationToken values are opaque and must only be reused with the same query.

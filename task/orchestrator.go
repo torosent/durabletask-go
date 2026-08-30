@@ -17,7 +17,6 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -46,7 +45,7 @@ type OrchestrationContext struct {
 	errorProperties          api.ErrorPropertiesProvider
 	orchestrationTags        map[string]string
 	logger                   *slog.Logger
-	metrics                  backend.MetricsHooks
+	metrics                  MetricsHooks
 	orchestrationOptions     OrchestrationOptions
 	parentInstanceID         api.InstanceID
 	executionID              string
@@ -233,24 +232,6 @@ func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) SubOrchestratorOption 
 	}
 }
 
-// NewOrchestrationContext returns a new [OrchestrationContext] struct with the specified parameters.
-func NewOrchestrationContext(registry *TaskRegistry, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) *OrchestrationContext {
-	return newOrchestrationContext(
-		context.Background(),
-		registry,
-		id,
-		oldEvents,
-		newEvents,
-		OrchestrationOptions{},
-		slog.Default(),
-		backend.MetricsHooks{},
-		nil,
-		nil,
-		"",
-		api.DefaultDataConverter(),
-	)
-}
-
 func newOrchestrationContext(
 	baseContext context.Context,
 	registry *TaskRegistry,
@@ -259,7 +240,7 @@ func newOrchestrationContext(
 	newEvents []*protos.HistoryEvent,
 	options OrchestrationOptions,
 	logger *slog.Logger,
-	metrics backend.MetricsHooks,
+	metrics MetricsHooks,
 	contextFields api.ContextFields,
 	errorProperties api.ErrorPropertiesProvider,
 	defaultVersion string,
@@ -494,7 +475,7 @@ func (ctx *OrchestrationContext) HistoryLimitExceeded() bool {
 	return ctx.engineContext().historyLimitExceeded
 }
 
-func (ctx *OrchestrationContext) processEvent(e *backend.HistoryEvent) error {
+func (ctx *OrchestrationContext) processEvent(e *protos.HistoryEvent) error {
 	defer ctx.syncDerivedContexts()
 	// Buffer certain events if we're in a suspended state
 	if ctx.isSuspended && (e.GetExecutionResumed() == nil && e.GetExecutionTerminated() == nil) {
@@ -622,7 +603,7 @@ func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivity
 
 	if options.retryPolicy != nil {
 		retryInfo := retryTaskInfo{
-			kind:    backend.WorkItemKindActivity,
+			kind:    WorkItemKindActivity,
 			name:    helpers.GetTaskFunctionName(activity),
 			version: options.versionOrInherited(engine.Version).GetValue(),
 		}
@@ -713,7 +694,7 @@ func (ctx *OrchestrationContext) CallSubOrchestrator(orchestrator any, opts ...S
 
 	if options.retryPolicy != nil {
 		retryInfo := retryTaskInfo{
-			kind:    backend.WorkItemKindOrchestration,
+			kind:    WorkItemKindOrchestration,
 			name:    helpers.GetTaskFunctionName(orchestrator),
 			version: options.versionOrDefault(engine.defaultVersion).GetValue(),
 		}

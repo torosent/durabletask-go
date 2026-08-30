@@ -18,7 +18,7 @@ import (
 func TestReplaySafeLoggerSuppressesReplayOutput(t *testing.T) {
 	var output bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&output, nil))
-	ctx := NewOrchestrationContext(NewTaskRegistry(), "logging", nil, nil)
+	ctx := newTestOrchestrationContext(NewTaskRegistry(), "logging", nil, nil)
 	ctx.Name = "logger-test"
 	ctx.Version = "v1"
 	ctx.logger = logger

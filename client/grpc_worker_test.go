@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -196,7 +195,7 @@ func (c *fakeSchedulerClient) AbandonTaskEntityWorkItem(
 }
 
 type recordingExecutor struct {
-	executeOrchestrator func(context.Context, api.InstanceID, []*protos.HistoryEvent, []*protos.HistoryEvent) (*backend.ExecutionResults, error)
+	executeOrchestrator func(context.Context, api.InstanceID, []*protos.HistoryEvent, []*protos.HistoryEvent) (*task.ExecutionResults, error)
 	executeActivity     func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error)
 	executeEntity       func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
 }
@@ -206,7 +205,7 @@ func (e *recordingExecutor) ExecuteOrchestrator(
 	id api.InstanceID,
 	pastEvents []*protos.HistoryEvent,
 	newEvents []*protos.HistoryEvent,
-) (*backend.ExecutionResults, error) {
+) (*task.ExecutionResults, error) {
 	return e.executeOrchestrator(ctx, id, pastEvents, newEvents)
 }
 
@@ -245,7 +244,7 @@ func newFakeWorker(t *testing.T, client *fakeSchedulerClient, opts ...TaskHubGrp
 			return client, nil, nil
 		},
 		registry,
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		options...,
 	)
 	require.NoError(t, err)
@@ -581,9 +580,9 @@ func TestTaskHubGrpcWorkerLocallyRejectsFilteredWorkItems(t *testing.T) {
 			api.InstanceID,
 			[]*protos.HistoryEvent,
 			[]*protos.HistoryEvent,
-		) (*backend.ExecutionResults, error) {
+		) (*task.ExecutionResults, error) {
 			executionCount.Add(1)
-			return &backend.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+			return &task.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
 		},
 		executeActivity: func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error) {
 			executionCount.Add(1)
@@ -703,11 +702,11 @@ func TestTaskHubGrpcWorkerStreamsRequiredHistory(t *testing.T) {
 			_ api.InstanceID,
 			pastEvents []*protos.HistoryEvent,
 			newEvents []*protos.HistoryEvent,
-		) (*backend.ExecutionResults, error) {
+		) (*task.ExecutionResults, error) {
 			require.Equal(t, []*protos.HistoryEvent{pastEvent}, pastEvents)
 			require.Equal(t, []*protos.HistoryEvent{newEvent}, newEvents)
 			close(executed)
-			return &backend.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+			return &task.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
 		},
 	}
 	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
@@ -757,9 +756,9 @@ func TestTaskHubGrpcWorkerAbandonsSilentHistoryStream(t *testing.T) {
 			api.InstanceID,
 			[]*protos.HistoryEvent,
 			[]*protos.HistoryEvent,
-		) (*backend.ExecutionResults, error) {
+		) (*task.ExecutionResults, error) {
 			executions.Add(1)
-			return &backend.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+			return &task.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
 		},
 	}
 	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
@@ -778,6 +777,55 @@ func TestTaskHubGrpcWorkerAbandonsSilentHistoryStream(t *testing.T) {
 		return client.orchestrationAbandons == 1
 	}, time.Second, time.Millisecond)
 	require.Zero(t, executions.Load())
+
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerDelaysAbandonAfterStreamedHistoryLimit(t *testing.T) {
+	stream := newFakeWorkItemStream(1)
+	client := &fakeSchedulerClient{
+		stream: stream,
+		history: []*protos.HistoryChunk{{
+			Events: []*protos.HistoryEvent{{EventId: 1}, {EventId: 2}},
+		}},
+	}
+	waits := &recordedWaits{}
+	worker := newFakeWorker(
+		t,
+		client,
+		WithMaxStreamedHistoryEvents(1),
+		withRecordedWaits(waits),
+	)
+	var executions atomic.Int32
+	worker.executor = &recordingExecutor{
+		executeOrchestrator: func(
+			context.Context,
+			api.InstanceID,
+			[]*protos.HistoryEvent,
+			[]*protos.HistoryEvent,
+		) (*task.ExecutionResults, error) {
+			executions.Add(1)
+			return &task.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+		},
+	}
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_OrchestratorRequest{OrchestratorRequest: &protos.OrchestratorRequest{
+			InstanceId:               "instance",
+			RequiresHistoryStreaming: true,
+		}},
+		CompletionToken: "orchestration-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.orchestrationAbandons == 1
+	}, time.Second, time.Millisecond)
+	require.Zero(t, executions.Load())
+	require.Contains(t, waits.snapshot(), 5*time.Millisecond)
 
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
@@ -980,7 +1028,7 @@ func TestTaskHubGrpcWorkerRecreatesConnectionAfterTransientDisconnect(t *testing
 			return clients[index], nil, nil
 		},
 		registry,
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithWorkerHelloTimeout(time.Second),
 		WithWorkerSilentDisconnectTimeout(time.Second),
 		WithWorkerReconnectBackoff(time.Millisecond, 5*time.Millisecond),
@@ -1071,7 +1119,7 @@ func TestTaskHubGrpcWorkerOptionValidation(t *testing.T) {
 			return nil, nil, errors.New("unused")
 		},
 		registry,
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithMaxConcurrentActivityWorkItems(0),
 	)
 	require.Error(t, err)
@@ -1097,6 +1145,15 @@ func TestTransientWorkerGRPCCodes(t *testing.T) {
 	} {
 		require.False(t, isTransientWorkerGRPCCode(code), code.String())
 	}
+	tooLarge := status.Error(codes.ResourceExhausted, "grpc: received message larger than max")
+	require.False(t, isTransientWorkerError(tooLarge))
+	require.False(t, isTransientWorkerRPCError(tooLarge))
+	tooLarge = status.Error(codes.ResourceExhausted, "trying to send message larger than max")
+	require.False(t, isTransientWorkerError(tooLarge))
+	require.False(t, isTransientWorkerRPCError(tooLarge))
+	historyLimit := newStreamedHistoryLimitError("streamed history exceeds limit")
+	require.False(t, isTransientWorkerError(historyLimit))
+	require.False(t, isTransientWorkerRPCError(historyLimit))
 	require.False(t, isTransientWorkerError(
 		status.Error(codes.Canceled, "grpc: the client connection is closing"),
 	))

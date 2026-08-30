@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
@@ -32,7 +31,7 @@ type entityMessage struct {
 // way the scheduler does, so replay stays faithful without a live service.
 type orchestrationDriver struct {
 	t          *testing.T
-	executor   backend.Executor
+	executor   task.Executor
 	instanceID api.InstanceID
 	oldEvents  []*protos.HistoryEvent
 	newEvents  []*protos.HistoryEvent

@@ -1,11 +1,36 @@
 package task
 
 import (
+	"context"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/protos"
 )
+
+func newTestOrchestrationContext(
+	registry *TaskRegistry,
+	id api.InstanceID,
+	oldEvents []*protos.HistoryEvent,
+	newEvents []*protos.HistoryEvent,
+) *OrchestrationContext {
+	return newOrchestrationContext(
+		context.Background(),
+		registry,
+		id,
+		oldEvents,
+		newEvents,
+		OrchestrationOptions{},
+		slog.Default(),
+		MetricsHooks{},
+		nil,
+		nil,
+		"",
+		api.DefaultDataConverter(),
+	)
+}
 
 func Test_computeNextDelay(t *testing.T) {
 	time1 := time.Now()

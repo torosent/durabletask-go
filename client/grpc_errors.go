@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/grpcerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -58,7 +57,7 @@ func clientRPCError(ctx context.Context, operation string, err error) error {
 		switch code {
 		case codes.AlreadyExists:
 			if operation == "failed to create task hub" {
-				category = backend.ErrTaskHubExists
+				category = ErrTaskHubExists
 			} else {
 				category = api.ErrDuplicateInstance
 			}
@@ -66,7 +65,7 @@ func clientRPCError(ctx context.Context, operation string, err error) error {
 			category = api.ErrInvalidArgument
 		case codes.NotFound:
 			if operation == "failed to delete task hub" {
-				category = backend.ErrTaskHubNotFound
+				category = ErrTaskHubNotFound
 			} else {
 				category = api.ErrInstanceNotFound
 			}
@@ -106,9 +105,9 @@ func clientErrorReasonCategory(reason string) error {
 	case grpcerrors.ReasonNotCompleted:
 		return api.ErrNotCompleted
 	case grpcerrors.ReasonTaskHubExists:
-		return backend.ErrTaskHubExists
+		return ErrTaskHubExists
 	case grpcerrors.ReasonTaskHubNotFound:
-		return backend.ErrTaskHubNotFound
+		return ErrTaskHubNotFound
 	default:
 		return nil
 	}

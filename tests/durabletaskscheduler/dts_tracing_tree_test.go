@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/task"
@@ -294,7 +293,7 @@ func TestDTSEmulatorTracingTreeVersionMigration(t *testing.T) {
 		return input + "+v2", nil
 	}))
 
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
@@ -374,7 +373,7 @@ func TestDTSEmulatorTracingTreeScheduledTask(t *testing.T) {
 	}))
 	require.NoError(t, durabletaskscheduler.RegisterScheduledTasksWithDefaultVersion(registry, "1.0"))
 
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 	worker, err := durabletaskscheduler.NewWorker(

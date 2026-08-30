@@ -49,9 +49,9 @@ type Store interface {
 	Write(ctx context.Context, object ExportObject) error
 }
 
-// AzureBlobStoreOptions configures [AzureBlobStore]. Exactly one authentication
+// AzureBlobHistoryStoreOptions configures [AzureBlobHistoryStore]. Exactly one authentication
 // mode must be supplied: ConnectionString, or AccountURL with Credential.
-type AzureBlobStoreOptions struct {
+type AzureBlobHistoryStoreOptions struct {
 	ConnectionString string
 	AccountURL       string
 	Credential       azcore.TokenCredential
@@ -67,8 +67,8 @@ type AzureBlobStoreOptions struct {
 	AllowAnyContainer bool
 }
 
-// AzureBlobStore writes exported history objects to Azure Blob Storage.
-type AzureBlobStore struct {
+// AzureBlobHistoryStore writes exported history objects to Azure Blob Storage.
+type AzureBlobHistoryStore struct {
 	client            *azblob.Client
 	defaultContainer  string
 	allowedContainers map[string]struct{}
@@ -96,7 +96,7 @@ type containerInit struct {
 	err  error
 }
 
-var _ Store = (*AzureBlobStore)(nil)
+var _ Store = (*AzureBlobHistoryStore)(nil)
 
 // Azure keeps a deleted container's name reserved until the delete finishes,
 // rejecting recreation with ContainerBeingDeleted for up to about half a
@@ -107,8 +107,8 @@ const (
 	containerBeingDeletedMaxBackoff     = 8 * time.Second
 )
 
-// NewAzureBlobStore constructs a production Azure Blob Storage export store.
-func NewAzureBlobStore(options AzureBlobStoreOptions) (*AzureBlobStore, error) {
+// NewAzureBlobHistoryStore constructs a production Azure Blob Storage export store.
+func NewAzureBlobHistoryStore(options AzureBlobHistoryStoreOptions) (*AzureBlobHistoryStore, error) {
 	if strings.TrimSpace(options.ContainerName) == "" {
 		return nil, &ValidationError{Message: "azure blob container name is required"}
 	}
@@ -172,7 +172,7 @@ func NewAzureBlobStore(options AzureBlobStoreOptions) (*AzureBlobStore, error) {
 		allowed[container] = struct{}{}
 	}
 
-	return &AzureBlobStore{
+	return &AzureBlobHistoryStore{
 		client:            client,
 		defaultContainer:  options.ContainerName,
 		allowedContainers: allowed,
@@ -182,10 +182,10 @@ func NewAzureBlobStore(options AzureBlobStoreOptions) (*AzureBlobStore, error) {
 }
 
 // DefaultContainer returns the container configured for this store.
-func (s *AzureBlobStore) DefaultContainer() string { return s.defaultContainer }
+func (s *AzureBlobHistoryStore) DefaultContainer() string { return s.defaultContainer }
 
 // Write uploads object, creating its container on first use.
-func (s *AzureBlobStore) Write(ctx context.Context, object ExportObject) error {
+func (s *AzureBlobHistoryStore) Write(ctx context.Context, object ExportObject) error {
 	if err := s.validateObject(object); err != nil {
 		return err
 	}
@@ -214,7 +214,7 @@ func (s *AzureBlobStore) Write(ctx context.Context, object ExportObject) error {
 	return nil
 }
 
-func (s *AzureBlobStore) validateObject(object ExportObject) error {
+func (s *AzureBlobHistoryStore) validateObject(object ExportObject) error {
 	container := object.Container
 	if container == "" {
 		return &ValidationError{Message: "export object container is required"}
@@ -238,7 +238,7 @@ func (s *AzureBlobStore) validateObject(object ExportObject) error {
 // ensureContainer creates container once per process and returns the
 // initialization the caller joined, so a later failure can invalidate exactly
 // that initialization.
-func (s *AzureBlobStore) ensureContainer(ctx context.Context, container string) (*containerInit, error) {
+func (s *AzureBlobHistoryStore) ensureContainer(ctx context.Context, container string) (*containerInit, error) {
 	s.containersMu.Lock()
 	if existing, ok := s.containers[container]; ok {
 		s.containersMu.Unlock()
@@ -266,7 +266,7 @@ func (s *AzureBlobStore) ensureContainer(ctx context.Context, container string) 
 // forgetContainer drops a cached initialization, but only when it is still the
 // current one, so it never discards a newer initialization started after this
 // one was retired.
-func (s *AzureBlobStore) forgetContainer(container string, init *containerInit) {
+func (s *AzureBlobHistoryStore) forgetContainer(container string, init *containerInit) {
 	s.containersMu.Lock()
 	defer s.containersMu.Unlock()
 	if current, ok := s.containers[container]; ok && current == init {
@@ -274,7 +274,7 @@ func (s *AzureBlobStore) forgetContainer(container string, init *containerInit) 
 	}
 }
 
-func (s *AzureBlobStore) createContainerWithRetry(ctx context.Context, container string) error {
+func (s *AzureBlobHistoryStore) createContainerWithRetry(ctx context.Context, container string) error {
 	backoff := containerBeingDeletedInitialBackoff
 	for attempt := 0; ; attempt++ {
 		err := s.createContainer(ctx, container)
@@ -293,7 +293,7 @@ func (s *AzureBlobStore) createContainerWithRetry(ctx context.Context, container
 	}
 }
 
-func (s *AzureBlobStore) createContainer(ctx context.Context, container string) error {
+func (s *AzureBlobHistoryStore) createContainer(ctx context.Context, container string) error {
 	if s.createContainerHook != nil {
 		return s.createContainerHook(ctx, container)
 	}
@@ -301,7 +301,7 @@ func (s *AzureBlobStore) createContainer(ctx context.Context, container string) 
 	return err
 }
 
-func (s *AzureBlobStore) uploadBlob(
+func (s *AzureBlobHistoryStore) uploadBlob(
 	ctx context.Context,
 	container string,
 	name string,
@@ -315,7 +315,7 @@ func (s *AzureBlobStore) uploadBlob(
 	return err
 }
 
-func (s *AzureBlobStore) waitForRetry(ctx context.Context, d time.Duration) error {
+func (s *AzureBlobHistoryStore) waitForRetry(ctx context.Context, d time.Duration) error {
 	if s.waitHook != nil {
 		return s.waitHook(ctx, d)
 	}
