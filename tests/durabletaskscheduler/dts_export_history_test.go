@@ -16,7 +16,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/durabletaskscheduler"
 	"github.com/microsoft/durabletask-go/exporthistory"
@@ -27,7 +26,7 @@ import (
 
 // exportHistoryAzuriteStore builds an export store against a throwaway Azurite
 // container. It skips when Azurite is not configured.
-func exportHistoryAzuriteStore(t *testing.T) (*exporthistory.AzureBlobStore, string, *azblob.Client) {
+func exportHistoryAzuriteStore(t *testing.T) (*exporthistory.AzureBlobHistoryStore, string, *azblob.Client) {
 	t.Helper()
 	connectionString := os.Getenv("AZURITE_CONNECTION_STRING")
 	if connectionString == "" {
@@ -38,7 +37,7 @@ func exportHistoryAzuriteStore(t *testing.T) (*exporthistory.AzureBlobStore, str
 	require.NoError(t, err)
 	container := "dtsexport" + hex.EncodeToString(suffix[:])
 
-	store, err := exporthistory.NewAzureBlobStore(exporthistory.AzureBlobStoreOptions{
+	store, err := exporthistory.NewAzureBlobHistoryStore(exporthistory.AzureBlobHistoryStoreOptions{
 		ConnectionString:  connectionString,
 		ContainerName:     container,
 		AllowInsecureHTTP: true,
@@ -216,7 +215,7 @@ func TestDTSExportHistoryJobNotFound(t *testing.T) {
 	testCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	managementClient, err := durabletaskscheduler.NewClient(testCtx, options, backend.DefaultLogger())
+	managementClient, err := durabletaskscheduler.NewClient(testCtx, options, api.DefaultLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, managementClient.Close()) })
 	exportClient, err := exporthistory.NewClient(managementClient.TaskHubGrpcClient, exporthistory.ClientOptions{
@@ -380,7 +379,7 @@ func startExportHistoryDTSWorker(
 	options *durabletaskscheduler.Options,
 ) (*durabletaskscheduler.Client, *durabletaskclient.TaskHubGrpcWorker) {
 	t.Helper()
-	logger := backend.DefaultLogger()
+	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
 	require.NoError(t, err)
 

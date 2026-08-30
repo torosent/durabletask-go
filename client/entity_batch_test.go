@@ -1,4 +1,4 @@
-package backend
+package client
 
 import (
 	"testing"
@@ -12,7 +12,7 @@ import (
 
 func TestEntityBatchFromRequestV2OmitsMissingParentDestination(t *testing.T) {
 	requestID := uuid.NewString()
-	batch, infos, err := EntityBatchFromRequestV2(&protos.EntityRequest{
+	batch, infos, err := entityBatchFromRequestV2(&protos.EntityRequest{
 		InstanceId: "@counter@key",
 		OperationRequests: []*protos.HistoryEvent{{
 			EventType: &protos.HistoryEvent_EntityOperationCalled{
@@ -31,17 +31,17 @@ func TestEntityBatchFromRequestV2OmitsMissingParentDestination(t *testing.T) {
 
 func TestEntityBatchFromRequestV2Validation(t *testing.T) {
 	t.Run("nil-request", func(t *testing.T) {
-		_, _, err := EntityBatchFromRequestV2(nil)
+		_, _, err := entityBatchFromRequestV2(nil)
 		require.ErrorContains(t, err, "entity request must not be nil")
 	})
 
 	t.Run("invalid-instance-id", func(t *testing.T) {
-		_, _, err := EntityBatchFromRequestV2(&protos.EntityRequest{InstanceId: "not-an-entity"})
+		_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{InstanceId: "not-an-entity"})
 		require.ErrorContains(t, err, "invalid entity instance ID")
 	})
 
 	t.Run("nil-operation-event", func(t *testing.T) {
-		_, _, err := EntityBatchFromRequestV2(&protos.EntityRequest{
+		_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{
 			InstanceId:        "@counter@key",
 			OperationRequests: []*protos.HistoryEvent{nil},
 		})
@@ -49,7 +49,7 @@ func TestEntityBatchFromRequestV2Validation(t *testing.T) {
 	})
 
 	t.Run("invalid-signal-request-id", func(t *testing.T) {
-		_, _, err := EntityBatchFromRequestV2(&protos.EntityRequest{
+		_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{
 			InstanceId: "@counter@key",
 			OperationRequests: []*protos.HistoryEvent{{
 				EventType: &protos.HistoryEvent_EntityOperationSignaled{
@@ -64,7 +64,7 @@ func TestEntityBatchFromRequestV2Validation(t *testing.T) {
 	})
 
 	t.Run("invalid-call-request-id", func(t *testing.T) {
-		_, _, err := EntityBatchFromRequestV2(&protos.EntityRequest{
+		_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{
 			InstanceId: "@counter@key",
 			OperationRequests: []*protos.HistoryEvent{{
 				EventType: &protos.HistoryEvent_EntityOperationCalled{
@@ -84,7 +84,7 @@ func TestEntityBatchFromRequestV2Validation(t *testing.T) {
 func TestEntityBatchFromRequestV2RoutesSignalsAndCalls(t *testing.T) {
 	signalID := uuid.NewString()
 	callID := uuid.NewString()
-	batch, infos, err := EntityBatchFromRequestV2(&protos.EntityRequest{
+	batch, infos, err := entityBatchFromRequestV2(&protos.EntityRequest{
 		InstanceId:  "@counter@key",
 		EntityState: wrapperspb.String("7"),
 		OperationRequests: []*protos.HistoryEvent{

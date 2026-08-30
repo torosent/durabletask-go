@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -25,7 +24,7 @@ type taskExecutor struct {
 	orchestratorNotFound     OrchestratorNotFoundStrategy
 	orchestrationOptions     OrchestrationOptions
 	logger                   *slog.Logger
-	metrics                  backend.MetricsHooks
+	metrics                  MetricsHooks
 	contextFields            api.ContextFields
 	errorProperties          api.ErrorPropertiesProvider
 	converter                api.DataConverter
@@ -140,7 +139,7 @@ func WithLogger(logger *slog.Logger) TaskExecutorOption {
 }
 
 // WithMetricsHooks configures optional transport-neutral metric callbacks.
-func WithMetricsHooks(hooks backend.MetricsHooks) TaskExecutorOption {
+func WithMetricsHooks(hooks MetricsHooks) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.metrics = hooks
 	}
@@ -154,8 +153,8 @@ func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 	}
 }
 
-// NewTaskExecutor returns a [backend.Executor] implementation that executes orchestrator and activity functions in-memory.
-func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend.Executor {
+// NewTaskExecutor returns a [Executor] implementation that executes orchestrator and activity functions in-memory.
+func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) Executor {
 	executor := &taskExecutor{
 		Registry:             registry,
 		orchestrationOptions: normalizeOrchestrationOptions(OrchestrationOptions{}),
@@ -168,7 +167,7 @@ func NewTaskExecutor(registry *TaskRegistry, opts ...TaskExecutorOption) backend
 	return executor
 }
 
-// ExecuteActivity implements backend.Executor and executes an activity function in the current goroutine.
+// ExecuteActivity implements Executor and executes an activity function in the current goroutine.
 func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, e *protos.HistoryEvent) (response *protos.HistoryEvent, err error) {
 	ts := e.GetTaskScheduled()
 	if ts == nil {
@@ -251,8 +250,8 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 	return helpers.NewTaskCompletedEvent(e.EventId, rawResult), nil
 }
 
-// ExecuteOrchestrator implements backend.Executor and executes an orchestrator function in the current goroutine.
-func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*backend.ExecutionResults, error) {
+// ExecuteOrchestrator implements Executor and executes an orchestrator function in the current goroutine.
+func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*ExecutionResults, error) {
 	started := startedEvent(oldEvents, newEvents)
 	name := started.GetName()
 	version := started.GetVersion().GetValue()
@@ -261,7 +260,7 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		if te.versioning.FailureStrategy == VersionFailureReject {
 			return nil, versionErr
 		}
-		return &backend.ExecutionResults{
+		return &ExecutionResults{
 			Response: &protos.OrchestratorResponse{
 				InstanceId: string(id),
 				Actions: []*protos.OrchestratorAction{
@@ -302,7 +301,7 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 	actions := orchestrationCtx.start()
 	te.reportHistoryMetric(orchestrationCtx)
 
-	results := &backend.ExecutionResults{
+	results := &ExecutionResults{
 		Response: &protos.OrchestratorResponse{
 			InstanceId:   string(id),
 			Actions:      actions,
@@ -490,7 +489,7 @@ func (te *taskExecutor) reportHistoryMetric(ctx *OrchestrationContext) {
 	if te.metrics.History == nil {
 		return
 	}
-	metric := backend.HistoryMetric{
+	metric := HistoryMetric{
 		InstanceID:           ctx.ID,
 		OrchestrationName:    ctx.Name,
 		OrchestrationVersion: ctx.Version,

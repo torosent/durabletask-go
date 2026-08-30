@@ -4,7 +4,7 @@
 // telemetry service-side.
 //
 //	export DTS_CONNECTION_STRING="Endpoint=http://localhost:8080;TaskHub=default;Authentication=None"
-//	go run ./samples/distributedtracing
+//	cd samples/distributedtracing && go run .
 package main
 
 import (

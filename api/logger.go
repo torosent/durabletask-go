@@ -1,4 +1,4 @@
-package backend
+package api
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"log/slog"
 )
 
+// Logger receives diagnostic messages from DTS clients and workers.
 type Logger interface {
 	// Debug logs a message at level Debug.
 	Debug(v ...any)
@@ -39,46 +40,40 @@ var defaultLogger = &logger{
 	debugLogger:   log.New(log.Writer(), "DEBUG: ", log.Flags()),
 }
 
-// Debug implements Logger
-func (log *logger) Debug(v ...any) {
-	log.debugLogger.Print(v...)
+func (l *logger) Debug(v ...any) {
+	l.debugLogger.Print(v...)
 }
 
-// Debugf implements Logger
-func (log *logger) Debugf(format string, v ...any) {
-	log.debugLogger.Printf(format, v...)
+func (l *logger) Debugf(format string, v ...any) {
+	l.debugLogger.Printf(format, v...)
 }
 
-// Error implements Logger
-func (log *logger) Error(v ...any) {
-	log.errorLogger.Print(v...)
+func (l *logger) Error(v ...any) {
+	l.errorLogger.Print(v...)
 }
 
-// Errorf implements Logger
-func (log *logger) Errorf(format string, v ...any) {
-	log.errorLogger.Printf(format, v...)
+func (l *logger) Errorf(format string, v ...any) {
+	l.errorLogger.Printf(format, v...)
 }
 
-// Info implements Logger
-func (log *logger) Info(v ...any) {
-	log.infoLogger.Print(v...)
+func (l *logger) Info(v ...any) {
+	l.infoLogger.Print(v...)
 }
 
-// Infof implements Logger
-func (log *logger) Infof(format string, v ...any) {
-	log.infoLogger.Printf(format, v...)
+func (l *logger) Infof(format string, v ...any) {
+	l.infoLogger.Printf(format, v...)
 }
 
-// Warn implements Logger
-func (log *logger) Warn(v ...any) {
-	log.warningLogger.Print(v...)
+func (l *logger) Warn(v ...any) {
+	l.warningLogger.Print(v...)
 }
 
-// Warnf implements Logger
-func (log *logger) Warnf(format string, v ...any) {
-	log.warningLogger.Printf(format, v...)
+func (l *logger) Warnf(format string, v ...any) {
+	l.warningLogger.Printf(format, v...)
 }
 
+// DefaultLogger returns the process-wide logger used when a caller does not
+// supply one.
 func DefaultLogger() Logger {
 	return defaultLogger
 }

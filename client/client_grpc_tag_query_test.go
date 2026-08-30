@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -86,7 +85,7 @@ func startQueryClient(t *testing.T, server protos.TaskHubSidecarServiceServer) *
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, connection.Close()) })
-	return NewTaskHubGrpcClient(connection, backend.DefaultLogger())
+	return NewTaskHubGrpcClient(connection, api.DefaultLogger())
 }
 
 // TestQueryInstancesTagFilterHonoursScanPageCap asserts the documented remote

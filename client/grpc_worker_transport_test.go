@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
@@ -53,12 +52,13 @@ func (r *recordedWaits) count() int {
 func withRecordedWaits(waits *recordedWaits) TaskHubGrpcWorkerOption {
 	return func(options *taskHubGrpcWorkerOptions) error {
 		options.waitFn = waits.wait
+		options.reconnectRandom = nil
 		return nil
 	}
 }
 
-func TestWorkerBackoffIsDeterministicAndStaysWithinConfiguredBounds(t *testing.T) {
-	schedule := newWorkerBackoff(200*time.Millisecond, time.Second)
+func TestWorkerBackoffScheduleStaysWithinConfiguredBounds(t *testing.T) {
+	schedule := newWorkerBackoff(200*time.Millisecond, time.Second, nil)
 	delays := make([]time.Duration, 0, 6)
 	for i := 0; i < 6; i++ {
 		delays = append(delays, schedule.Next())
@@ -75,25 +75,33 @@ func TestWorkerBackoffIsDeterministicAndStaysWithinConfiguredBounds(t *testing.T
 	schedule.Reset()
 	require.Equal(t, 200*time.Millisecond, schedule.Next())
 
-	// A randomized backoff would drift below the base and up to 50% above the
-	// maximum, so require the exact schedule to be reproducible.
-	repeat := newWorkerBackoff(200*time.Millisecond, time.Second)
+	repeat := newWorkerBackoff(200*time.Millisecond, time.Second, nil)
 	for _, expected := range delays {
 		require.Equal(t, expected, repeat.Next())
 	}
 }
 
 func TestWorkerBackoffSaturatesInsteadOfOverflowing(t *testing.T) {
-	schedule := newWorkerBackoff(time.Hour, time.Duration(math.MaxInt64))
-	previous := time.Duration(0)
-	for i := 0; i < 200; i++ {
-		delay := schedule.Next()
-		require.Positive(t, delay, "delay %d overflowed to a non-positive duration", i)
-		require.GreaterOrEqual(t, delay, time.Hour)
-		require.GreaterOrEqual(t, delay, previous)
-		previous = delay
+	for _, random := range []randomInt64N{
+		nil,
+		func(n int64) int64 { return n - 1 },
+	} {
+		schedule := newWorkerBackoff(time.Hour, time.Duration(math.MaxInt64), random)
+		previous := time.Duration(0)
+		for i := range 200 {
+			delay := schedule.Next()
+			require.Positive(t, delay, "delay %d overflowed to a non-positive duration", i)
+			require.GreaterOrEqual(t, delay, time.Hour)
+			require.LessOrEqual(t, delay, time.Duration(math.MaxInt64))
+			if random == nil {
+				require.GreaterOrEqual(t, delay, previous)
+			}
+			previous = delay
+		}
+		if random == nil {
+			require.Equal(t, time.Duration(math.MaxInt64), previous)
+		}
 	}
-	require.Equal(t, time.Duration(math.MaxInt64), previous)
 
 	require.Equal(t, time.Second, doubleDurationBounded(time.Second, time.Second))
 	require.Equal(t, 2*time.Second, doubleDurationBounded(time.Second, time.Minute))
@@ -102,6 +110,33 @@ func TestWorkerBackoffSaturatesInsteadOfOverflowing(t *testing.T) {
 		time.Duration(math.MaxInt64),
 		doubleDurationBounded(time.Duration(math.MaxInt64)-1, time.Duration(math.MaxInt64)),
 	)
+}
+
+func TestWorkerBackoffJitterUsesTheFullBoundedRange(t *testing.T) {
+	tests := []struct {
+		name     string
+		random   randomInt64N
+		expected []time.Duration
+	}{
+		{
+			name:     "lower bound",
+			random:   func(int64) int64 { return 0 },
+			expected: []time.Duration{200 * time.Millisecond, 300 * time.Millisecond, 600 * time.Millisecond, 750 * time.Millisecond},
+		},
+		{
+			name:     "upper bound",
+			random:   func(n int64) int64 { return n - 1 },
+			expected: []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, time.Second},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			schedule := newWorkerBackoff(200*time.Millisecond, time.Second, test.random)
+			for _, expected := range test.expected {
+				require.Equal(t, expected, schedule.Next())
+			}
+		})
+	}
 }
 
 func TestWorkerTransientRetryDelayIsDeterministicAndBounded(t *testing.T) {
@@ -534,6 +569,52 @@ func TestStreamHistoryHandlesManySingleEventChunksWithoutQuadraticCopying(t *tes
 	)
 }
 
+func TestStreamHistoryEnforcesEventAndByteLimitsBeforeRetainingChunk(t *testing.T) {
+	tests := []struct {
+		name    string
+		history []*protos.HistoryChunk
+		option  TaskHubGrpcWorkerOption
+		message string
+	}{
+		{
+			name: "events",
+			history: []*protos.HistoryChunk{
+				{Events: []*protos.HistoryEvent{{EventId: 1}, {EventId: 2}}},
+				{Events: []*protos.HistoryEvent{{EventId: 3}}},
+			},
+			option:  WithMaxStreamedHistoryEvents(2),
+			message: "2 events",
+		},
+		{
+			name: "bytes",
+			history: []*protos.HistoryChunk{
+				{Events: []*protos.HistoryEvent{{EventId: 1}}},
+			},
+			option:  WithMaxStreamedHistoryBytes(1),
+			message: "1 bytes",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeSchedulerClient{
+				stream:  newFakeWorkItemStream(0),
+				history: test.history,
+			}
+			worker := newFakeWorker(t, client, test.option)
+
+			events, err := worker.streamHistory(
+				context.Background(),
+				client,
+				&protos.OrchestratorRequest{InstanceId: "instance"},
+			)
+			require.Nil(t, events)
+			require.ErrorIs(t, err, ErrStreamedHistoryLimitExceeded)
+			require.Equal(t, codes.ResourceExhausted, status.Code(err))
+			require.ErrorContains(t, err, test.message)
+		})
+	}
+}
+
 // unrepresentableConcurrency returns the smallest concurrency that cannot be
 // advertised on the 32-bit GetWorkItems fields. It is computed at runtime
 // because the constant expression math.MaxInt32+1 does not fit in an int on
@@ -549,7 +630,7 @@ func unrepresentableConcurrency() (int, bool) {
 // maxInt is the largest value of the platform int type.
 const maxInt = int(^uint(0) >> 1)
 
-func TestWorkerConcurrencyOptionValidation(t *testing.T) {
+func TestWorkerLimitOptionValidation(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
 		option TaskHubGrpcWorkerOption
@@ -560,6 +641,10 @@ func TestWorkerConcurrencyOptionValidation(t *testing.T) {
 		{"negative activities", WithMaxConcurrentActivityWorkItems(-1)},
 		{"zero entities", WithMaxConcurrentEntityWorkItems(0)},
 		{"negative entities", WithMaxConcurrentEntityWorkItems(-1)},
+		{"zero streamed history events", WithMaxStreamedHistoryEvents(0)},
+		{"excessive streamed history events", WithMaxStreamedHistoryEvents(MaxStreamedHistoryEvents + 1)},
+		{"zero streamed history bytes", WithMaxStreamedHistoryBytes(0)},
+		{"excessive streamed history bytes", WithMaxStreamedHistoryBytes(MaxStreamedHistoryBytes + 1)},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			options := defaultTaskHubGrpcWorkerOptions()
@@ -586,6 +671,8 @@ func TestWorkerConcurrencyOptionValidation(t *testing.T) {
 	options := defaultTaskHubGrpcWorkerOptions()
 	require.NoError(t, WithMaxConcurrentOrchestrationWorkItems(math.MaxInt32)(&options))
 	require.EqualValues(t, math.MaxInt32, int32(options.maxConcurrentOrchestrations))
+	require.Equal(t, DefaultMaxStreamedHistoryEvents, options.maxStreamedHistoryEvents)
+	require.Equal(t, DefaultMaxStreamedHistoryBytes, options.maxStreamedHistoryBytes)
 }
 
 func TestWorkerOptionValidationRejectsInvalidConfiguration(t *testing.T) {
@@ -649,7 +736,7 @@ func TestWorkerConstructorPropagatesOptionValidationErrors(t *testing.T) {
 	_, err := newTaskHubGrpcWorker(
 		factory,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithTaskExecutorOptions(nil),
 	)
 	require.ErrorContains(t, err, "task executor option cannot be nil")
@@ -657,18 +744,18 @@ func TestWorkerConstructorPropagatesOptionValidationErrors(t *testing.T) {
 	_, err = newTaskHubGrpcWorker(
 		factory,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithWorkerCapabilities(WorkerCapabilityLargePayloads),
 	)
 	require.ErrorContains(t, err, "large-payload capability requires worker large-payload options")
 
-	_, err = NewTaskHubGrpcWorker(nil, task.NewTaskRegistry(), backend.DefaultLogger())
+	_, err = NewTaskHubGrpcWorker(nil, task.NewTaskRegistry(), api.DefaultLogger())
 	require.ErrorContains(t, err, "gRPC connection is required")
 
-	_, err = NewTaskHubGrpcWorkerWithConnectionFactory(nil, task.NewTaskRegistry(), backend.DefaultLogger())
+	_, err = NewTaskHubGrpcWorkerWithConnectionFactory(nil, task.NewTaskRegistry(), api.DefaultLogger())
 	require.ErrorContains(t, err, "connection factory is required")
 
-	_, err = newTaskHubGrpcWorker(factory, nil, backend.DefaultLogger())
+	_, err = newTaskHubGrpcWorker(factory, nil, api.DefaultLogger())
 	require.ErrorContains(t, err, "task registry is required")
 }
 
@@ -689,7 +776,7 @@ func TestConnectionFactoryRejectsNilConnections(t *testing.T) {
 			return nil, closer, nil
 		},
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 	)
 	require.NoError(t, err)
 	err = worker.Start(context.Background())
@@ -718,7 +805,7 @@ func TestOwnedConnectionFactoryRecreatesAndClosesRetiredConnections(t *testing.T
 			return clients[index], closers[index], nil
 		},
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithWorkerHelloTimeout(time.Second),
 		WithWorkerSilentDisconnectTimeout(time.Second),
 		WithWorkerReconnectBackoff(time.Millisecond, 5*time.Millisecond),
@@ -811,7 +898,7 @@ func TestBorrowedConnectionIsReusedAcrossReconnectsAndNeverClosed(t *testing.T) 
 	worker, err := NewTaskHubGrpcWorker(
 		connection,
 		task.NewTaskRegistry(),
-		backend.DefaultLogger(),
+		api.DefaultLogger(),
 		WithWorkerHelloTimeout(time.Second),
 		WithWorkerSilentDisconnectTimeout(time.Second),
 		WithWorkerReconnectBackoff(time.Millisecond, 5*time.Millisecond),

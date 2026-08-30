@@ -1,7 +1,6 @@
-package backend
+package client
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -11,15 +10,9 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-// EntityExecutor is an optional extension implemented by executors that can
-// process durable entity operation batches.
-type EntityExecutor interface {
-	ExecuteEntity(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
-}
-
-// EntityBatchFromRequestV2 converts a scheduler-dispatched V2 entity request
-// into the worker-facing batch model and response routing metadata.
-func EntityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatchRequest, []*protos.OperationInfo, error) {
+// entityBatchFromRequestV2 converts a scheduler-dispatched V2 entity request
+// into the executor-facing batch model and response routing metadata.
+func entityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatchRequest, []*protos.OperationInfo, error) {
 	if request == nil {
 		return nil, nil, fmt.Errorf("entity request must not be nil")
 	}

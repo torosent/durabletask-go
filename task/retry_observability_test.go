@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
 )
@@ -24,9 +23,9 @@ func TestRetryObservabilityReportsNewRetryMetric(t *testing.T) {
 	}
 
 	instanceID := api.InstanceID("retry-observability")
-	metrics := make([]backend.RetryMetric, 0, 1)
-	executor := NewTaskExecutor(registry, WithMetricsHooks(backend.MetricsHooks{
-		Retry: func(metric backend.RetryMetric) {
+	metrics := make([]RetryMetric, 0, 1)
+	executor := NewTaskExecutor(registry, WithMetricsHooks(MetricsHooks{
+		Retry: func(metric RetryMetric) {
 			metrics = append(metrics, metric)
 		},
 	}))
@@ -73,8 +72,8 @@ func TestRetryMetricIsSuppressedDuringReplay(t *testing.T) {
 
 	metricCount := 0
 	instanceID := api.InstanceID("retry-replay")
-	_, err := NewTaskExecutor(registry, WithMetricsHooks(backend.MetricsHooks{
-		Retry: func(backend.RetryMetric) {
+	_, err := NewTaskExecutor(registry, WithMetricsHooks(MetricsHooks{
+		Retry: func(RetryMetric) {
 			metricCount++
 		},
 	})).ExecuteOrchestrator(

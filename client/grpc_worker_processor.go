@@ -10,14 +10,15 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
 	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/largepayload"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"github.com/microsoft/durabletask-go/task"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -190,6 +191,9 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		history, err := w.streamHistory(ctx, client, request)
 		if err != nil {
 			w.logger.Errorf("%s: failed to stream required orchestration history: %v", request.InstanceId, err)
+			if errors.Is(err, ErrStreamedHistoryLimitExceeded) {
+				_ = w.wait(ctx, w.options.transientRetryMaxDelay)
+			}
 			w.abandonOrchestration(ctx, client, completionToken)
 			return
 		}
@@ -215,7 +219,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 	}
 
 	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
-	var delayed backend.WorkItemAbandonDelayError
+	var delayed workItemAbandonDelayError
 	if errors.As(err, &delayed) {
 		w.logger.Warnf("%s: orchestration work item rejected; abandoning it: %v", request.InstanceId, err)
 		_ = w.wait(ctx, delayed.WorkItemAbandonDelay())
@@ -297,7 +301,10 @@ func (w *TaskHubGrpcWorker) streamHistory(
 		return nil, err
 	}
 
-	var history []*protos.HistoryEvent
+	var (
+		history      []*protos.HistoryEvent
+		historyBytes int64
+	)
 	for {
 		chunk, recvErr := recvBeforeSilenceTimeout(stream.Recv, cancelHistory, w.options.silentDisconnectTimeout)
 		if errors.Is(recvErr, io.EOF) {
@@ -309,7 +316,23 @@ func (w *TaskHubGrpcWorker) streamHistory(
 		if chunk == nil {
 			return nil, status.Error(codes.Internal, "received a nil history chunk")
 		}
+		if limit := w.options.maxStreamedHistoryEvents; limit > 0 &&
+			len(chunk.Events) > limit-len(history) {
+			return nil, newStreamedHistoryLimitError(
+				"streamed history exceeds %d events",
+				limit,
+			)
+		}
+		chunkBytes := int64(proto.Size(chunk))
+		if limit := w.options.maxStreamedHistoryBytes; limit > 0 &&
+			chunkBytes > limit-historyBytes {
+			return nil, newStreamedHistoryLimitError(
+				"streamed history exceeds %d bytes",
+				limit,
+			)
+		}
 		history = append(history, chunk.Events...)
+		historyBytes += chunkBytes
 	}
 }
 
@@ -356,7 +379,7 @@ func (w *TaskHubGrpcWorker) processActivity(
 	)
 	event.GetTaskScheduled().Tags = contextprop.Clone(request.Tags)
 	result, err := w.executor.ExecuteActivity(ctx, api.InstanceID(request.OrchestrationInstance.InstanceId), event)
-	var delayed backend.WorkItemAbandonDelayError
+	var delayed workItemAbandonDelayError
 	if errors.As(err, &delayed) {
 		w.logger.Warnf(
 			"%s/%s#%d: activity work item rejected; abandoning it: %v",
@@ -430,7 +453,7 @@ func (w *TaskHubGrpcWorker) processEntityV2(
 	completionToken string,
 	request *protos.EntityRequest,
 ) {
-	batch, operationInfos, err := backend.EntityBatchFromRequestV2(request)
+	batch, operationInfos, err := entityBatchFromRequestV2(request)
 	if err != nil {
 		w.logger.Errorf("invalid V2 entity work item: %v", err)
 		w.abandonEntity(ctx, client, completionToken)
@@ -462,7 +485,7 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		w.abandonEntity(ctx, client, completionToken)
 		return
 	}
-	executor, ok := w.executor.(backend.EntityExecutor)
+	executor, ok := w.executor.(task.EntityExecutor)
 	if !ok {
 		w.logger.Error("task executor does not support entity work items")
 		w.abandonEntity(ctx, client, completionToken)
@@ -665,6 +688,9 @@ func (w *TaskHubGrpcWorker) retryDelay(attempt int) time.Duration {
 }
 
 func isTransientWorkerRPCError(err error) bool {
+	if errors.Is(err, ErrStreamedHistoryLimitExceeded) {
+		return false
+	}
 	grpcStatus, ok := status.FromError(err)
 	if !ok {
 		return false
@@ -672,7 +698,7 @@ func isTransientWorkerRPCError(err error) bool {
 	if grpcStatus.Code() == codes.NotFound {
 		return false
 	}
-	return isTransientWorkerGRPCCode(grpcStatus.Code())
+	return isTransientWorkerGRPCStatus(grpcStatus)
 }
 
 func isWorkItemGone(err error) bool {

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/internal/grpcerrors"
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"github.com/stretchr/testify/require"
@@ -85,7 +84,7 @@ func (*lifecycleErrorServer) CreateTaskHub(
 ) (*protos.CreateTaskHubResponse, error) {
 	return nil, grpcerrors.New(
 		codes.AlreadyExists,
-		backend.ErrTaskHubExists.Error(),
+		ErrTaskHubExists.Error(),
 		grpcerrors.ReasonTaskHubExists,
 	)
 }
@@ -96,7 +95,7 @@ func (*lifecycleErrorServer) DeleteTaskHub(
 ) (*protos.DeleteTaskHubResponse, error) {
 	return nil, grpcerrors.New(
 		codes.NotFound,
-		backend.ErrTaskHubNotFound.Error(),
+		ErrTaskHubNotFound.Error(),
 		grpcerrors.ReasonTaskHubNotFound,
 	)
 }
@@ -157,9 +156,9 @@ func TestTaskHubLifecycleErrorsRoundTripOverGRPC(t *testing.T) {
 			defer cancel()
 
 			err := client.CreateTaskHub(ctx)
-			require.True(t, errors.Is(err, backend.ErrTaskHubExists), "CreateTaskHub() error = %v", err)
+			require.True(t, errors.Is(err, ErrTaskHubExists), "CreateTaskHub() error = %v", err)
 			err = client.DeleteTaskHub(ctx)
-			require.True(t, errors.Is(err, backend.ErrTaskHubNotFound), "DeleteTaskHub() error = %v", err)
+			require.True(t, errors.Is(err, ErrTaskHubNotFound), "DeleteTaskHub() error = %v", err)
 		})
 	}
 }

@@ -7,7 +7,8 @@ orchestrator functions a package registers with `task.TaskRegistry`.
 ## Running it
 
 ```bash
-go build -o ./bin/orchestratorvet ./cmd/orchestratorvet
+cd cmd/orchestratorvet && go build -o ../../bin/orchestratorvet .
+cd ../..
 go vet -vettool=$PWD/bin/orchestratorvet ./...
 ```
 
@@ -22,7 +23,7 @@ go vet -vettool=$PWD/bin/orchestratorvet -orchestratorgo.test-files ./...
 The binary also runs standalone under any
 [`unitchecker`](https://pkg.go.dev/golang.org/x/tools/go/analysis/unitchecker)
 driver, and the analyzer itself is available as
-`github.com/microsoft/durabletask-go/internal/analysis/orchestratorgo.Analyzer`
+`github.com/microsoft/durabletask-go/cmd/orchestratorvet/analysis/orchestratorgo.Analyzer`
 for embedding in a multichecker.
 
 ## What it analyzes
@@ -214,7 +215,7 @@ The analyzer reports only what it can prove, and stays silent otherwise.
 ## Testing and benchmarking
 
 The analyzer's `analysistest` fixtures live in
-`internal/analysis/orchestratorgo/testdata/src`, split one package per scenario,
+`cmd/orchestratorvet/analysis/orchestratorgo/testdata/src`, split one package per scenario,
 with a dedicated package of negative cases. The scenario list is discovered from
 that directory, so a new fixture package is exercised as soon as it is added.
 
@@ -224,8 +225,8 @@ in place of the fixture it replaces, which catches a rewrite that produces code
 that no longer builds, such as one that leaves an unused import behind.
 
 ```bash
-go test ./internal/analysis/orchestratorgo/...
-go test -run '^$' -bench . ./internal/analysis/orchestratorgo/...
+cd cmd/orchestratorvet && go test ./...
+cd cmd/orchestratorvet && go test -run '^$' -bench . ./analysis/orchestratorgo/...
 ```
 
 The benchmarks measure orchestrator-count scaling, call-graph depth, and the
