@@ -21,17 +21,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const devAccountKey = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+// placeholderAccountKey is a syntactically valid base64 value, not a credential.
+// These tests only construct clients to exercise URL and transport policy; they
+// never authenticate against a storage service. Its decoded text says as much.
+const placeholderAccountKey = "ZHVyYWJsZXRhc2stZ28gZXhwb3J0aGlzdG9yeSB1bml0IHRlc3RzIHVzZSB0aGlzIHBsYWNlaG9sZGVyIGFjY291bnQga2V5OyBpdCBpcyBub3QgYSByZWFsIGNyZWRlbnRpYWwgYW5kIG5ldmVyIGF1dGhlbnRpY2F0ZXMu"
 
 // testConnectionString points at an HTTPS endpoint that is never contacted:
 // every test that uses it installs client hooks.
 const testConnectionString = "DefaultEndpointsProtocol=https;AccountName=devstoreaccount1;" +
-	"AccountKey=" + devAccountKey + ";EndpointSuffix=core.windows.net"
+	"AccountKey=" + placeholderAccountKey + ";EndpointSuffix=core.windows.net"
 
-// azuriteConnectionString is the well-known Azurite development endpoint, which
-// is plaintext and therefore requires AllowInsecureHTTP.
+// azuriteConnectionString mirrors the shape of the Azurite development endpoint,
+// which is plaintext and therefore requires AllowInsecureHTTP. Live Azurite tests
+// read a real connection string from AZURITE_CONNECTION_STRING instead.
 const azuriteConnectionString = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;" +
-	"AccountKey=" + devAccountKey + ";BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+	"AccountKey=" + placeholderAccountKey + ";BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
 
 // memoryStore is an in-memory [Store] used by tests that exercise the export
 // pipeline without Azure Storage.

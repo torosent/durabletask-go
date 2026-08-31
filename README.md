@@ -556,12 +556,12 @@ The end-to-end tests read the following environment variables and skip themselve
 * `DTS_CONNECTION_STRING`: a full connection string. Takes precedence over the two variables below.
 * `DTS_EMULATOR_ENDPOINT`: the emulator's gRPC endpoint, for example `http://127.0.0.1:8080`.
 * `DTS_TASK_HUB`: the task hub name to use with `DTS_EMULATOR_ENDPOINT`. Defaults to `default`.
-* `AZURITE_CONNECTION_STRING`: an Azure Storage connection string used by the blob payload and history-export tests.
+* `AZURITE_CONNECTION_STRING`: an Azure Storage connection string used by the blob payload and history-export tests. Use the well-known development credentials documented by [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite#well-known-storage-account-and-key).
 
 ```bash
 DTS_EMULATOR_ENDPOINT="http://127.0.0.1:8080" \
 DTS_TASK_HUB="default" \
-AZURITE_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;" \
+AZURITE_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<azurite-account-key>;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;" \
 go test ./... -count=1
 ```
 
