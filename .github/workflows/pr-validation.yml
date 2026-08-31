@@ -112,9 +112,15 @@ jobs:
 
       # The race run also executes every test on the latest Go version, so only
       # the minimum supported Go version needs a separate non-race execution.
+      #
+      # AZURITE_CONNECTION_STRING is supplied by the repository variable of the
+      # same name so no account key is stored in the repository. The Azurite
+      # tests skip themselves when it is unset. Populate it with Azurite's
+      # well-known development credentials:
+      # https://learn.microsoft.com/azure/storage/common/storage-use-azurite#well-known-storage-account-and-key
       - name: Run full repository ${{ matrix.test-kind }} tests
         env:
           DTS_EMULATOR_ENDPOINT: "http://127.0.0.1:8080"
           DTS_TASK_HUB: "default"
-          AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<azurite-account-key>;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          AZURITE_CONNECTION_STRING: ${{ vars.AZURITE_CONNECTION_STRING }}
         run: ${{ matrix.test-command }}
