@@ -264,6 +264,13 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		if response.OrchestrationTraceContext == nil {
 			response.OrchestrationTraceContext = request.OrchestrationTraceContext
 		}
+		if err := populateOrchestratorActionTraceContexts(
+			response.Actions,
+			pastEvents,
+			request.NewEvents,
+		); err != nil {
+			w.logger.Warnf("%s: failed to populate action trace contexts: %v", request.InstanceId, err)
+		}
 	}
 	if err := largepayload.TransformOrchestratorResponse(ctx, w.options.largePayloads, response); err != nil {
 		w.logger.Errorf("%s: failed to externalize orchestration response payloads: %v", request.InstanceId, err)
@@ -283,6 +290,54 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		w.logger.Errorf("%s: failed to complete orchestration work item: %v", request.InstanceId, err)
 		w.abandonOrchestration(ctx, client, completionToken)
 	}
+}
+
+func populateOrchestratorActionTraceContexts(
+	actions []*protos.OrchestratorAction,
+	pastEvents []*protos.HistoryEvent,
+	newEvents []*protos.HistoryEvent,
+) error {
+	parent := executionStartedTraceContext(pastEvents, newEvents)
+	if parent == nil {
+		return nil
+	}
+	for _, action := range actions {
+		if action == nil {
+			continue
+		}
+		switch {
+		case action.GetScheduleTask() != nil:
+			scheduled := action.GetScheduleTask()
+			if scheduled.ParentTraceContext == nil {
+				traceContext, err := helpers.OrchestratorActionTraceContext(parent)
+				if err != nil {
+					return fmt.Errorf("schedule task action %d: %w", action.Id, err)
+				}
+				scheduled.ParentTraceContext = traceContext
+			}
+		case action.GetCreateSubOrchestration() != nil:
+			created := action.GetCreateSubOrchestration()
+			if created.ParentTraceContext == nil {
+				traceContext, err := helpers.OrchestratorActionTraceContext(parent)
+				if err != nil {
+					return fmt.Errorf("create sub-orchestration action %d: %w", action.Id, err)
+				}
+				created.ParentTraceContext = traceContext
+			}
+		}
+	}
+	return nil
+}
+
+func executionStartedTraceContext(eventLists ...[]*protos.HistoryEvent) *protos.TraceContext {
+	for _, events := range eventLists {
+		for _, event := range events {
+			if started := event.GetExecutionStarted(); started != nil {
+				return started.GetParentTraceContext()
+			}
+		}
+	}
+	return nil
 }
 
 func (w *TaskHubGrpcWorker) streamHistory(

@@ -60,11 +60,11 @@ func (*OrchestrationContext) WhenAny(tasks ...Task) Task { return nil }
 
 func (*OrchestrationContext) WhenAll(tasks ...Task) error { return nil }
 
-type callActivityOption func()
+type CallActivityOption func()
 type SubOrchestratorOption func()
 type ContinueAsNewOption func()
 
-func WithActivityInput(any) callActivityOption            { return nil }
+func WithActivityInput(any) CallActivityOption            { return nil }
 func WithSubOrchestrationInput(any) SubOrchestratorOption { return nil }
 
 func (*OrchestrationContext) Go(func(*OrchestrationContext)) {}
@@ -77,7 +77,7 @@ func (*OrchestrationContext) Logger() *slog.Logger { return slog.Default() }
 
 func (*OrchestrationContext) GetInput(v any) error { return nil }
 
-func (*OrchestrationContext) CallActivity(activity any, opts ...callActivityOption) Task { return nil }
+func (*OrchestrationContext) CallActivity(activity any, opts ...CallActivityOption) Task { return nil }
 
 func (*OrchestrationContext) CallSubOrchestrator(o any, opts ...SubOrchestratorOption) Task {
 	return nil

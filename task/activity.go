@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"time"
 
@@ -11,12 +12,14 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-type callActivityOption func(*callActivityOptions, api.DataConverter) error
+// CallActivityOption configures an activity invocation.
+type CallActivityOption func(*callActivityOptions, api.DataConverter) error
 
 type callActivityOptions struct {
 	rawInput    *wrapperspb.StringValue
 	version     *wrapperspb.StringValue
 	retryPolicy *RetryPolicy
+	tags        map[string]string
 }
 
 func (options *callActivityOptions) versionOrInherited(inheritedVersion string) *wrapperspb.StringValue {
@@ -31,7 +34,7 @@ func (options *callActivityOptions) versionOrInherited(inheritedVersion string) 
 }
 
 // WithActivityVersion configures the activity version.
-func WithActivityVersion(version string) callActivityOption {
+func WithActivityVersion(version string) CallActivityOption {
 	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		opt.version = wrapperspb.String(version)
 		return nil
@@ -89,7 +92,7 @@ func (policy *RetryPolicy) Validate() error {
 
 // WithActivityInput configures an input for an activity invocation.
 // The configured data converter must be able to serialize the input.
-func WithActivityInput(input any) callActivityOption {
+func WithActivityInput(input any) CallActivityOption {
 	return func(opt *callActivityOptions, converter api.DataConverter) error {
 		data, err := marshalData(converter, input)
 		if err != nil {
@@ -101,14 +104,26 @@ func WithActivityInput(input any) callActivityOption {
 }
 
 // WithRawActivityInput configures a raw input for an activity invocation.
-func WithRawActivityInput(input string) callActivityOption {
+func WithRawActivityInput(input string) CallActivityOption {
 	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		opt.rawInput = wrapperspb.String(input)
 		return nil
 	}
 }
 
-func WithActivityRetryPolicy(policy *RetryPolicy) callActivityOption {
+// WithActivityTags adds user tags to an activity invocation. Explicit activity
+// tags override orchestration tags with the same key.
+func WithActivityTags(tags map[string]string) CallActivityOption {
+	return func(opt *callActivityOptions, _ api.DataConverter) error {
+		if err := validateUnreservedKeys("activity tag", tags); err != nil {
+			return err
+		}
+		opt.tags = maps.Clone(tags)
+		return nil
+	}
+}
+
+func WithActivityRetryPolicy(policy *RetryPolicy) CallActivityOption {
 	return func(opt *callActivityOptions, _ api.DataConverter) error {
 		if policy == nil {
 			return nil

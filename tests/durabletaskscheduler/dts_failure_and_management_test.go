@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/microsoft/durabletask-go/api"
-	durabletaskclient "github.com/microsoft/durabletask-go/client"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/microsoft/durabletask-go/tests/failurechain"
 	"github.com/stretchr/testify/require"
@@ -343,11 +342,8 @@ func TestDTSEmulatorPaginationContinuationEquivalence(t *testing.T) {
 	}
 }
 
-// TestDTSEmulatorOrchestrationIDReuse asserts the instance ID dedupe contract
-// against a real service, including the two documented gRPC wire limitations:
-// the ERROR action cannot be transmitted (so it must behave exactly like
-// sending no policy at all) and the IGNORE action is rejected client-side
-// because current services cannot distinguish it from TERMINATE.
+// TestDTSEmulatorOrchestrationIDReuse asserts the current status-based instance
+// ID deduplication contract against a real service.
 func TestDTSEmulatorOrchestrationIDReuse(t *testing.T) {
 	registry := task.NewTaskRegistry()
 	require.NoError(t, registry.AddOrchestratorN("DTSReuseComplete", func(ctx *task.OrchestrationContext) (any, error) {
@@ -385,55 +381,10 @@ func TestDTSEmulatorOrchestrationIDReuse(t *testing.T) {
 		return id, err
 	}
 
-	t.Run("ignore-action-is-rejected-by-the-wire-contract", func(t *testing.T) {
-		_, err := scheduleDuplicate(t, "dts-reuse-ignore", api.WithOrchestrationIdReusePolicy(
-			&api.OrchestrationIdReusePolicy{
-				Action:          api.REUSE_ID_ACTION_IGNORE,
-				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
-			},
-		))
-		require.ErrorIs(t, err, durabletaskclient.ErrUnsupportedOrchestrationIDReusePolicy)
-	})
-
-	t.Run("error-action-matches-no-policy", func(t *testing.T) {
-		// The ERROR action is dropped from the wire request, so it must be
-		// indistinguishable from scheduling without a reuse policy.
-		defaultID, defaultErr := scheduleDuplicate(t, "dts-reuse-default")
-		errorID, errorErr := scheduleDuplicate(t, "dts-reuse-error", api.WithOrchestrationIdReusePolicy(
-			&api.OrchestrationIdReusePolicy{
-				Action:          api.REUSE_ID_ACTION_ERROR,
-				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
-			},
-		))
-		require.Equal(t, defaultErr == nil, errorErr == nil, "ERROR action diverged from the no-policy default")
-
-		if defaultErr != nil {
-			require.ErrorIs(t, defaultErr, api.ErrDuplicateInstance)
-			require.ErrorIs(t, errorErr, api.ErrDuplicateInstance)
-			for _, id := range []api.InstanceID{defaultID, errorID} {
-				current, fetchErr := managementClient.FetchOrchestrationMetadata(ctx, id, api.WithFetchPayloads(true))
-				require.NoError(t, fetchErr)
-				require.Equal(t, `"original"`, current.SerializedOutput)
-			}
-			return
-		}
-
-		t.Log("DTS service behaviour: an unqualified duplicate replaces a completed instance")
-		for _, id := range []api.InstanceID{defaultID, errorID} {
-			require.Eventuallyf(t, func() bool {
-				metadata, fetchErr := managementClient.FetchOrchestrationMetadata(ctx, id, api.WithFetchPayloads(true))
-				return fetchErr == nil &&
-					metadata.RuntimeStatus == api.RUNTIME_STATUS_COMPLETED &&
-					metadata.SerializedOutput == `"replacement"`
-			}, 20*time.Second, 100*time.Millisecond, "instance %s was not replaced", id)
-		}
-	})
-
-	t.Run("terminate-action-replaces-matching-status", func(t *testing.T) {
-		id, err := scheduleDuplicate(t, "dts-reuse-terminate", api.WithOrchestrationIdReusePolicy(
-			&api.OrchestrationIdReusePolicy{
-				Action:          api.REUSE_ID_ACTION_TERMINATE,
-				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
+	t.Run("empty-dedupe-set-replaces-completed-instance", func(t *testing.T) {
+		id, err := scheduleDuplicate(t, "dts-reuse-all", api.WithOrchestrationIDReusePolicy(
+			&api.OrchestrationIDReusePolicy{
+				DedupeStatuses: []api.OrchestrationStatus{},
 			},
 		))
 		require.NoError(t, err)
@@ -445,11 +396,10 @@ func TestDTSEmulatorOrchestrationIDReuse(t *testing.T) {
 		}, 20*time.Second, 100*time.Millisecond)
 	})
 
-	t.Run("terminate-action-rejects-unmatched-status", func(t *testing.T) {
-		id, err := scheduleDuplicate(t, "dts-reuse-unmatched", api.WithOrchestrationIdReusePolicy(
-			&api.OrchestrationIdReusePolicy{
-				Action:          api.REUSE_ID_ACTION_TERMINATE,
-				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_CONTINUED_AS_NEW},
+	t.Run("dedupe-status-rejects-completed-instance", func(t *testing.T) {
+		id, err := scheduleDuplicate(t, "dts-reuse-dedupe", api.WithOrchestrationIDReusePolicy(
+			&api.OrchestrationIDReusePolicy{
+				DedupeStatuses: []api.OrchestrationStatus{api.RUNTIME_STATUS_COMPLETED},
 			},
 		))
 		require.ErrorIs(t, err, api.ErrDuplicateInstance)
@@ -457,5 +407,22 @@ func TestDTSEmulatorOrchestrationIDReuse(t *testing.T) {
 		require.NoError(t, fetchErr)
 		require.Equal(t, api.RUNTIME_STATUS_COMPLETED, current.RuntimeStatus)
 		require.Equal(t, `"original"`, current.SerializedOutput)
+	})
+
+	t.Run("all-dedupe-statuses-replace-nothing", func(t *testing.T) {
+		_, err := scheduleDuplicate(t, "dts-reuse-none", api.WithOrchestrationIDReusePolicy(
+			&api.OrchestrationIDReusePolicy{
+				DedupeStatuses: []api.OrchestrationStatus{
+					api.RUNTIME_STATUS_RUNNING,
+					api.RUNTIME_STATUS_COMPLETED,
+					api.RUNTIME_STATUS_FAILED,
+					api.RUNTIME_STATUS_CANCELED,
+					api.RUNTIME_STATUS_TERMINATED,
+					api.RUNTIME_STATUS_PENDING,
+					api.RUNTIME_STATUS_SUSPENDED,
+				},
+			},
+		))
+		require.ErrorIs(t, err, api.ErrDuplicateInstance)
 	})
 }

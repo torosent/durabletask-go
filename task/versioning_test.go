@@ -303,6 +303,115 @@ func TestSubOrchestrationOptionsAddTagsAndContextFields(t *testing.T) {
 	t.Fatal("missing sub-orchestration action")
 }
 
+func TestActivityTagsOverrideOrchestrationTagsAndAreCloned(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("parent", func(ctx *OrchestrationContext) (any, error) {
+		tags := map[string]string{"scope": "activity", "child": "yes"}
+		ctx.CallActivity("activity", WithActivityTags(tags))
+		tags["child"] = "mutated"
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started := helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil)
+	started.GetExecutionStarted().Tags = map[string]string{"scope": "orchestration", "parent": "yes"}
+	result, err := NewTaskExecutor(registry).ExecuteOrchestrator(
+		context.Background(),
+		"parent-instance",
+		nil,
+		[]*protos.HistoryEvent{started},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundActivity, foundCompletion bool
+	for _, action := range result.Response.Actions {
+		if scheduled := action.GetScheduleTask(); scheduled != nil {
+			if scheduled.Tags["scope"] != "activity" ||
+				scheduled.Tags["parent"] != "yes" ||
+				scheduled.Tags["child"] != "yes" {
+				t.Fatalf("activity tags = %#v", scheduled.Tags)
+			}
+			foundActivity = true
+		}
+		if completed := action.GetCompleteOrchestration(); completed != nil {
+			if completed.Tags["scope"] != "orchestration" || completed.Tags["parent"] != "yes" {
+				t.Fatalf("completion tags = %#v", completed.Tags)
+			}
+			foundCompletion = true
+		}
+	}
+	if !foundActivity || !foundCompletion {
+		t.Fatalf("found activity=%t completion=%t", foundActivity, foundCompletion)
+	}
+}
+
+func TestActivityTagsRejectReservedAndEmptyKeys(t *testing.T) {
+	for _, tags := range []map[string]string{
+		{"": "value"},
+		{api.ReservedContextFieldPrefix + "tenant": "value"},
+	} {
+		if err := WithActivityTags(tags)(new(callActivityOptions), api.DefaultDataConverter()); err == nil {
+			t.Fatalf("WithActivityTags(%#v) succeeded", tags)
+		}
+	}
+}
+
+func TestActivityTagValidationIsDeterministic(t *testing.T) {
+	tags := map[string]string{
+		api.ReservedContextFieldPrefix + "z": "value",
+		api.ReservedContextFieldPrefix + "a": "value",
+	}
+	for range 20 {
+		err := WithActivityTags(tags)(new(callActivityOptions), api.DefaultDataConverter())
+		if err == nil || err.Error() != `activity tag "__durabletask.context.a" uses a reserved prefix` {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	}
+}
+
+func TestContinueAsNewCarriesTagsAndNextVersion(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorNVersion("eternal", "v1", func(ctx *OrchestrationContext) (any, error) {
+		ctx.ContinueAsNew("next", WithContinueAsNewVersion("v2"))
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started := helpers.NewExecutionStartedEvent(
+		"eternal",
+		"eternal-instance",
+		nil,
+		nil,
+		nil,
+		nil,
+		wrapperspb.String("v1"),
+	)
+	started.GetExecutionStarted().Tags = map[string]string{
+		"tenant": "north",
+		"__durabletask.context.field.correlation_id": "42",
+	}
+	result, err := NewTaskExecutor(registry).ExecuteOrchestrator(
+		context.Background(),
+		"eternal-instance",
+		nil,
+		[]*protos.HistoryEvent{started},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := completionAction(t, result.Response)
+	if completed.GetTags()["tenant"] != "north" {
+		t.Fatalf("continue-as-new tags = %#v", completed.GetTags())
+	}
+	if completed.GetTags()["__durabletask.context.field.correlation_id"] != "42" {
+		t.Fatalf("continue-as-new context tags = %#v", completed.GetTags())
+	}
+	if completed.GetTags()["__durabletask.context.orchestration_version"] != "v2" {
+		t.Fatalf("continue-as-new version tag = %#v", completed.GetTags())
+	}
+}
+
 func TestExplicitUnversionedSchedulingOverridesDefaults(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorNVersion("parent", "v1", func(ctx *OrchestrationContext) (any, error) {

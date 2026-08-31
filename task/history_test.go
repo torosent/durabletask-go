@@ -62,12 +62,9 @@ func TestHistoryLimitHandlerContinuesAsNewAndPreservesExternalEvents(t *testing.
 	result, err := NewTaskExecutor(
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{
-			MaxEventsPerTurn: 2,
+			MaxHistoryEvents: 4,
 			OnHistoryLimitExceeded: func(info HistoryLimitInfo) (any, error) {
 				handlerCalls++
-				if !info.MaxEventsPerTurnExceeded {
-					t.Fatal("expected per-turn history limit to be exceeded")
-				}
 				var input int
 				if err := info.GetInput(&input); err != nil {
 					return nil, err
@@ -84,6 +81,7 @@ func TestHistoryLimitHandlerContinuesAsNewAndPreservesExternalEvents(t *testing.
 			helpers.NewExecutionStartedEvent("limited", string(instanceID), wrapperspb.String("7"), nil, nil, nil),
 			helpers.NewEventRaisedEvent("first", wrapperspb.String("1")),
 			helpers.NewEventRaisedEvent("second", wrapperspb.String("2")),
+			helpers.NewOrchestratorStartedEvent(),
 		},
 	)
 	if err != nil {
@@ -108,6 +106,131 @@ func TestHistoryLimitHandlerContinuesAsNewAndPreservesExternalEvents(t *testing.
 	}
 	if got := completed.GetCarryoverEvents()[1].GetEventRaised().GetName(); got != "second" {
 		t.Fatalf("second carryover event = %q, want second", got)
+	}
+}
+
+func TestMaxEventsPerTurnReportsPartialServiceConsumption(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("partial", func(ctx *OrchestrationContext) (any, error) {
+		return nil, ctx.WaitForSingleEvent("second", -1).Await(nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("partial-events")
+	result, err := NewTaskExecutor(
+		registry,
+		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 1}),
+	).ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent("partial", string(instanceID), nil, nil, nil, nil),
+			helpers.NewSuspendOrchestrationEvent("pause"),
+			helpers.NewResumeOrchestrationEvent("resume"),
+			helpers.NewEventRaisedEvent("first", wrapperspb.String("1")),
+			helpers.NewEventRaisedEvent("second", wrapperspb.String("2")),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Response.GetNumEventsProcessed().GetValue(); got != 1 {
+		t.Fatalf("numEventsProcessed = %d, want 1 DTS work-item event", got)
+	}
+	if len(result.Response.GetActions()) != 0 {
+		t.Fatalf("partial turn emitted actions: %v", result.Response.GetActions())
+	}
+}
+
+func TestMaxEventsPerTurnOmitsCountWhenAllEventsAreConsumed(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("all-consumed", func(*OrchestrationContext) (any, error) {
+		return "done", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("all-consumed")
+	result, err := NewTaskExecutor(
+		registry,
+		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 2}),
+	).ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent("all-consumed", string(instanceID), nil, nil, nil, nil),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Response.NumEventsProcessed != nil {
+		t.Fatalf("numEventsProcessed = %v, want nil for all events", result.Response.NumEventsProcessed)
+	}
+}
+
+func TestMaxEventsPerTurnSupportsIncrementalRedelivery(t *testing.T) {
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("incremental", func(ctx *OrchestrationContext) (any, error) {
+		var value string
+		if err := ctx.WaitForSingleEvent("second", -1).Await(&value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	instanceID := api.InstanceID("incremental-events")
+	allEvents := []*protos.HistoryEvent{
+		helpers.NewOrchestratorStartedEvent(),
+		helpers.NewExecutionStartedEvent("incremental", string(instanceID), nil, nil, nil, nil),
+		helpers.NewEventRaisedEvent("first", wrapperspb.String(`"one"`)),
+		helpers.NewEventRaisedEvent("second", wrapperspb.String(`"two"`)),
+	}
+	executor := NewTaskExecutor(
+		registry,
+		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 1}),
+	)
+
+	first, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, allEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Response.GetNumEventsProcessed().GetValue(); got != 1 {
+		t.Fatalf("first numEventsProcessed = %d, want 1", got)
+	}
+
+	second, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		allEvents[:2],
+		allEvents[2:],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Response.GetNumEventsProcessed().GetValue(); got != 1 {
+		t.Fatalf("second numEventsProcessed = %d, want 1", got)
+	}
+
+	third, err := executor.ExecuteOrchestrator(
+		context.Background(),
+		instanceID,
+		allEvents[:3],
+		allEvents[3:],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Response.NumEventsProcessed != nil {
+		t.Fatalf("final numEventsProcessed = %v, want nil", third.Response.NumEventsProcessed)
+	}
+	completed := completionAction(t, third.Response)
+	if got := completed.GetResult().GetValue(); got != `"two"` {
+		t.Fatalf("result = %q, want two", got)
 	}
 }
 
