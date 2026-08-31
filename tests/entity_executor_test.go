@@ -20,6 +20,40 @@ func newEntityExecutor(r *task.TaskRegistry) task.EntityExecutor {
 	return task.NewTaskExecutor(r).(task.EntityExecutor)
 }
 
+func Test_Executor_EntityActionsInheritOperationTraceContext(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddEntityN("router", func(ctx *task.EntityContext) (any, error) {
+		if err := ctx.SignalEntity(api.NewEntityID("target", "one"), "signal", nil); err != nil {
+			return nil, err
+		}
+		return nil, ctx.StartNewOrchestration(
+			"child",
+			task.WithEntityStartOrchestrationInstanceID("child-instance"),
+		)
+	}))
+	parent := &protos.TraceContext{
+		TraceParent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+		TraceState:  wrapperspb.String("vendor=value"),
+	}
+	result, err := newEntityExecutor(registry).ExecuteEntity(
+		context.Background(),
+		&protos.EntityBatchRequest{
+			InstanceId: "@router@key",
+			Operations: []*protos.OperationRequest{{
+				Operation:    "route",
+				RequestId:    "request",
+				TraceContext: parent,
+			}},
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Actions, 2)
+	require.Equal(t, parent, result.Actions[0].GetSendSignal().GetParentTraceContext())
+	require.Equal(t, parent, result.Actions[1].GetStartNewOrchestration().GetParentTraceContext())
+	require.NotSame(t, parent, result.Actions[0].GetSendSignal().GetParentTraceContext())
+	require.NotSame(t, parent, result.Actions[1].GetStartNewOrchestration().GetParentTraceContext())
+}
+
 func Test_Executor_EntityBasicOperation(t *testing.T) {
 	r := task.NewTaskRegistry()
 	require.NoError(t, r.AddEntityN("counter", func(ctx *task.EntityContext) (any, error) {

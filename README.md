@@ -150,6 +150,33 @@ reference descriptors remain raw protocol values and bypass conversion.
 Converter identity is not persisted, so a replacement converter must continue
 to decode payloads written by earlier deployments.
 
+## Tags, trace context, and partial turns
+
+`api.WithTags`, `task.WithActivityTags`, and
+`task.WithSubOrchestrationTags` attach user tags to orchestration, activity, and
+sub-orchestration actions. Activity and sub-orchestration tags inherit the
+parent orchestration's tags, with action-specific values taking precedence.
+Completion actions carry the current tags so ContinueAsNew retains them.
+
+The client forwards sampled caller trace context when it schedules
+orchestrations or signals entities. The worker adds distinct action trace
+contexts for service-owned activity and sub-orchestration scheduling spans
+without emitting duplicate local Durable Task spans. Legacy entity operation
+requests also propagate their operation trace context to entity-emitted
+actions; the current DTS V2 entity request does not carry that source field.
+
+`task.OrchestrationOptions.MaxEventsPerTurn` limits new events handled in one
+turn. When a batch is only partially consumed, the worker sets
+`numEventsProcessed` so DTS retains the remaining events for the next replay.
+The value follows DTS work-item counting semantics; orchestration control
+markers do not count toward the configured limit.
+
+Instance-ID reuse follows the current status-based contract. Configure
+`api.OrchestrationIDReusePolicy.DedupeStatuses`: matching existing statuses
+reject the new start, while other statuses may be terminated and replaced. A
+nil slice uses the service default; an empty non-nil slice permits replacement
+for every reusable status.
+
 ## Durable entities
 
 Durable entities are addressable stateful objects that execute operations one at
@@ -534,7 +561,7 @@ The end-to-end tests read the following environment variables and skip themselve
 ```bash
 DTS_EMULATOR_ENDPOINT="http://127.0.0.1:8080" \
 DTS_TASK_HUB="default" \
-AZURITE_CONNECTION_STRING="UseDevelopmentStorage=true" \
+AZURITE_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;" \
 go test ./... -count=1
 ```
 

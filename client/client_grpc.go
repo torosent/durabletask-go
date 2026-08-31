@@ -44,8 +44,6 @@ func newInfiniteRetries() *backoff.ExponentialBackOff {
 
 type TaskHubGrpcClientOption func(*TaskHubGrpcClient)
 
-var ErrUnsupportedOrchestrationIDReusePolicy = errors.New("orchestration ID reuse policy is not supported by the current gRPC wire contract")
-
 // WithLargePayloads configures externalization and hydration for management payloads.
 func WithLargePayloads(options *api.LargePayloadOptions) TaskHubGrpcClientOption {
 	return func(c *TaskHubGrpcClient) {
@@ -103,9 +101,6 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 	if req.Version == nil && c.defaultVersion != "" {
 		req.Version = wrapperspb.String(c.defaultVersion)
 	}
-	if err := c.prepareOrchestrationIDReusePolicy(req); err != nil {
-		return api.EmptyInstanceID, err
-	}
 	if req.InstanceId == "" {
 		u, err := uuid.NewV7()
 		if err == nil {
@@ -132,29 +127,6 @@ func (c *TaskHubGrpcClient) ScheduleNewOrchestration(ctx context.Context, orches
 		return api.EmptyInstanceID, clientRPCError(ctx, "failed to start orchestration", err)
 	}
 	return api.InstanceID(resp.InstanceId), nil
-}
-
-func (c *TaskHubGrpcClient) prepareOrchestrationIDReusePolicy(req *protos.CreateInstanceRequest) error {
-	policy := req.OrchestrationIdReusePolicy
-	action, hasLegacyAction, err := protos.GetLegacyOrchestrationIDReuseAction(policy)
-	if err != nil {
-		return fmt.Errorf("invalid orchestration ID reuse policy: %w", err)
-	}
-	if !hasLegacyAction {
-		return nil
-	}
-
-	switch api.CreateOrchestrationAction(action) {
-	case api.REUSE_ID_ACTION_TERMINATE:
-		return nil
-	case api.REUSE_ID_ACTION_ERROR:
-		req.OrchestrationIdReusePolicy = nil
-		return nil
-	case api.REUSE_ID_ACTION_IGNORE:
-		return fmt.Errorf("%w: IGNORE cannot be distinguished from TERMINATE by DTS servers", ErrUnsupportedOrchestrationIDReusePolicy)
-	default:
-		return fmt.Errorf("invalid orchestration ID reuse action: %d", action)
-	}
 }
 
 // FetchOrchestrationMetadata fetches metadata for the specified orchestration from the configured task hub.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/microsoft/durabletask-go/payload"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 func emulatorOptions(t *testing.T) *durabletaskscheduler.Options {
@@ -1047,6 +1049,61 @@ func TestDTSEmulatorSendEventReplay(t *testing.T) {
 	require.Equal(t, `"pong"`, receiver.SerializedOutput)
 }
 
+func TestDTSEmulatorActivityAndCompletionTags(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSTaggedActivity", func(task.ActivityContext) (any, error) {
+		return "done", nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSTaggedOrchestration", func(ctx *task.OrchestrationContext) (any, error) {
+		var result string
+		err := ctx.CallActivity(
+			"DTSTaggedActivity",
+			task.WithActivityTags(map[string]string{
+				"scope":    "activity",
+				"activity": "true",
+			}),
+		).Await(&result)
+		return result, err
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSTaggedOrchestration",
+		api.WithInstanceID(uniqueInstanceID("go-action-tags")),
+		api.WithTags(map[string]string{
+			"scope":  "orchestration",
+			"parent": "true",
+		}),
+	)
+	require.NoError(t, err)
+	metadata, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"scope":  "orchestration",
+		"parent": "true",
+	}, metadata.Tags)
+
+	history, err := managementClient.GetOrchestrationHistory(
+		ctx,
+		instanceID,
+		api.HistoryQuery{ExecutionID: metadata.ExecutionID},
+	)
+	require.NoError(t, err)
+	var scheduled *api.HistoryTaskScheduledEvent
+	for _, event := range history.Events {
+		if event.TaskScheduled != nil {
+			scheduled = event.TaskScheduled
+			break
+		}
+	}
+	require.NotNil(t, scheduled)
+	require.Equal(t, "activity", scheduled.Tags["scope"])
+	require.Equal(t, "true", scheduled.Tags["activity"])
+	require.Equal(t, "true", scheduled.Tags["parent"])
+}
+
 func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
 	const (
 		unit            = 2 * time.Second
@@ -1098,6 +1155,128 @@ func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
 		}
 	}
 	require.Equal(t, expectedTimers, timerCount)
+}
+
+func TestDTSEmulatorPartialEventConsumption(t *testing.T) {
+	const eventCount = 64
+	registry := task.NewTaskRegistry()
+	var activityExecutions atomic.Int32
+	require.NoError(t, registry.AddActivityN("DTSPartialActivity", func(task.ActivityContext) (any, error) {
+		activityExecutions.Add(1)
+		return nil, nil
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSPartialEvents", func(ctx *task.OrchestrationContext) (any, error) {
+		if err := ctx.CallActivity("DTSPartialActivity").Await(nil); err != nil {
+			return nil, err
+		}
+		results := make([]int, 0, eventCount)
+		for range eventCount {
+			var value int
+			if err := ctx.WaitForSingleEvent("value", -1).Await(&value); err != nil {
+				return nil, err
+			}
+			results = append(results, value)
+		}
+		return results, nil
+	}))
+	options := emulatorOptions(t)
+	var (
+		countsMu      sync.Mutex
+		partialCounts []int32
+	)
+	options.UnaryInterceptors = append(options.UnaryInterceptors, func(
+		ctx context.Context,
+		method string,
+		request any,
+		reply any,
+		connection *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		callOptions ...grpc.CallOption,
+	) error {
+		if method == protos.TaskHubSidecarService_CompleteOrchestratorTask_FullMethodName {
+			if response, ok := request.(*protos.OrchestratorResponse); ok &&
+				response.NumEventsProcessed != nil {
+				countsMu.Lock()
+				partialCounts = append(partialCounts, response.GetNumEventsProcessed().GetValue())
+				countsMu.Unlock()
+			}
+		}
+		return invoker(ctx, method, request, reply, connection, callOptions...)
+	})
+	logger := api.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	workerOptions := []durabletaskclient.TaskHubGrpcWorkerOption{
+		durabletaskclient.WithTaskExecutorOptions(
+			task.WithOrchestrationOptions(task.OrchestrationOptions{MaxEventsPerTurn: 1}),
+		),
+	}
+	worker, err := durabletaskscheduler.NewWorker(options, registry, logger, workerOptions...)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = worker.Shutdown(shutdownCtx)
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSPartialEvents",
+		api.WithInstanceID(uniqueInstanceID("go-partial-events")),
+	)
+	require.NoError(t, err)
+	_, err = managementClient.WaitForOrchestrationStart(ctx, instanceID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return activityExecutions.Load() == 1
+	}, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, managementClient.SuspendOrchestration(ctx, instanceID, "partial-budget-test"))
+	require.Eventually(t, func() bool {
+		metadata, fetchErr := managementClient.FetchOrchestrationMetadata(ctx, instanceID)
+		return fetchErr == nil && metadata.RuntimeStatus == api.RUNTIME_STATUS_SUSPENDED
+	}, 10*time.Second, 50*time.Millisecond)
+
+	var raises sync.WaitGroup
+	raiseErrors := make(chan error, eventCount)
+	for index := range eventCount {
+		raises.Add(1)
+		go func(value int) {
+			defer raises.Done()
+			raiseErrors <- managementClient.RaiseEvent(
+				ctx,
+				instanceID,
+				"value",
+				api.WithEventPayload(value),
+			)
+		}(index)
+	}
+	raises.Wait()
+	close(raiseErrors)
+	for raiseErr := range raiseErrors {
+		require.NoError(t, raiseErr)
+	}
+	require.NoError(t, managementClient.ResumeOrchestration(ctx, instanceID, "partial-budget-test"))
+
+	completed, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID, api.WithFetchPayloads(true))
+	require.NoError(t, err)
+	var results []int
+	require.NoError(t, json.Unmarshal([]byte(completed.SerializedOutput), &results))
+	slices.Sort(results)
+	require.Equal(t, eventCount, len(results))
+	for index, value := range results {
+		require.Equal(t, index, value)
+	}
+	require.EqualValues(t, 1, activityExecutions.Load())
+	countsMu.Lock()
+	defer countsMu.Unlock()
+	require.NotEmpty(t, partialCounts, "DTS did not deliver a batch large enough for partial consumption")
+	for _, count := range partialCounts {
+		require.EqualValues(t, 1, count)
+	}
 }
 
 func TestDTSEmulatorSubOrchestrationRetryAndContinueAsNew(t *testing.T) {

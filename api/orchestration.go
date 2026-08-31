@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,16 +25,6 @@ var (
 	EmptyInstanceID = InstanceID("")
 )
 
-// CreateOrchestrationAction controls how DTS handles an existing orchestration
-// whose runtime status matches an ID reuse policy.
-type CreateOrchestrationAction int32
-
-const (
-	REUSE_ID_ACTION_ERROR CreateOrchestrationAction = iota
-	REUSE_ID_ACTION_IGNORE
-	REUSE_ID_ACTION_TERMINATE
-)
-
 type OrchestrationStatus = protos.OrchestrationStatus
 
 const (
@@ -47,11 +38,16 @@ const (
 	RUNTIME_STATUS_SUSPENDED        OrchestrationStatus = protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED
 )
 
-// OrchestrationIdReusePolicy controls instance ID reuse without exposing the
-// transport-specific protobuf representation.
-type OrchestrationIdReusePolicy struct {
-	Action          CreateOrchestrationAction
-	OperationStatus []OrchestrationStatus
+// OrchestrationIDReusePolicy controls deduplication when an orchestration with
+// the requested instance ID already exists.
+//
+// A nil DedupeStatuses slice uses the service default. An empty, non-nil slice
+// allows every configurable status to be replaced. Otherwise, an existing
+// instance whose status appears in DedupeStatuses causes scheduling to fail.
+// ContinuedAsNew is not configurable because it is an execution transition
+// rather than a stable instance status.
+type OrchestrationIDReusePolicy struct {
+	DedupeStatuses []OrchestrationStatus
 }
 
 // InstanceID is a unique identifier for an orchestration instance.
@@ -103,28 +99,43 @@ func WithInstanceID(id InstanceID) NewOrchestrationOptions {
 	}
 }
 
-// WithOrchestrationIdReusePolicy configures Orchestration ID reuse policy.
-func WithOrchestrationIdReusePolicy(policy *OrchestrationIdReusePolicy) NewOrchestrationOptions {
+// WithOrchestrationIDReusePolicy configures orchestration instance-ID reuse.
+func WithOrchestrationIDReusePolicy(policy *OrchestrationIDReusePolicy) NewOrchestrationOptions {
 	return func(req *protos.CreateInstanceRequest, _ DataConverter) error {
-		if policy == nil {
+		if policy == nil || policy.DedupeStatuses == nil {
 			req.OrchestrationIdReusePolicy = nil
 			return nil
 		}
-		switch policy.Action {
-		case REUSE_ID_ACTION_ERROR, REUSE_ID_ACTION_IGNORE, REUSE_ID_ACTION_TERMINATE:
-		default:
-			return invalidArgument(fmt.Sprintf("invalid orchestration ID reuse action: %d", policy.Action))
+		for _, status := range policy.DedupeStatuses {
+			if !isReusableOrchestrationStatus(status) {
+				return invalidArgument(fmt.Sprintf("invalid orchestration dedupe status: %s", status))
+			}
 		}
-
-		wirePolicy := &protos.OrchestrationIdReusePolicy{
-			ReplaceableStatus: append([]protos.OrchestrationStatus(nil), policy.OperationStatus...),
+		replaceable := make([]protos.OrchestrationStatus, 0, len(reusableOrchestrationStatuses))
+		for _, status := range reusableOrchestrationStatuses {
+			if !slices.Contains(policy.DedupeStatuses, status) {
+				replaceable = append(replaceable, status)
+			}
 		}
-		if err := protos.SetLegacyOrchestrationIDReuseAction(wirePolicy, int32(policy.Action)); err != nil {
-			return fmt.Errorf("failed to encode orchestration ID reuse action: %w", err)
+		req.OrchestrationIdReusePolicy = &protos.OrchestrationIdReusePolicy{
+			ReplaceableStatus: replaceable,
 		}
-		req.OrchestrationIdReusePolicy = wirePolicy
 		return nil
 	}
+}
+
+var reusableOrchestrationStatuses = [...]OrchestrationStatus{
+	RUNTIME_STATUS_RUNNING,
+	RUNTIME_STATUS_COMPLETED,
+	RUNTIME_STATUS_FAILED,
+	RUNTIME_STATUS_CANCELED,
+	RUNTIME_STATUS_TERMINATED,
+	RUNTIME_STATUS_PENDING,
+	RUNTIME_STATUS_SUSPENDED,
+}
+
+func isReusableOrchestrationStatus(status OrchestrationStatus) bool {
+	return slices.Contains(reusableOrchestrationStatuses[:], status)
 }
 
 // WithInput configures an input for the orchestration. The specified input must be serializable.

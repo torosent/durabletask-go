@@ -22,6 +22,53 @@ func Test_API_WithInstanceID_AllowsNormalValue(t *testing.T) {
 	require.Equal(t, "my-instance", req.InstanceId)
 }
 
+func Test_API_WithOrchestrationIDReusePolicy_RejectsInvalidStatus(t *testing.T) {
+	req := &protos.CreateInstanceRequest{}
+	err := WithOrchestrationIDReusePolicy(&OrchestrationIDReusePolicy{
+		DedupeStatuses: []OrchestrationStatus{OrchestrationStatus(99)},
+	})(req, DefaultDataConverter())
+	require.ErrorContains(t, err, "invalid orchestration dedupe status")
+}
+
+func Test_API_WithOrchestrationIDReusePolicy_DeduplicatesStatuses(t *testing.T) {
+	req := &protos.CreateInstanceRequest{}
+	err := WithOrchestrationIDReusePolicy(&OrchestrationIDReusePolicy{
+		DedupeStatuses: []OrchestrationStatus{
+			RUNTIME_STATUS_RUNNING,
+			RUNTIME_STATUS_RUNNING,
+		},
+	})(req, DefaultDataConverter())
+	require.NoError(t, err)
+	require.NotContains(
+		t,
+		req.OrchestrationIdReusePolicy.ReplaceableStatus,
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING,
+	)
+	require.Len(t, req.OrchestrationIdReusePolicy.ReplaceableStatus, len(reusableOrchestrationStatuses)-1)
+}
+
+func Test_API_WithOrchestrationIDReusePolicy_AllStatusesReplaceNothing(t *testing.T) {
+	req := &protos.CreateInstanceRequest{}
+	err := WithOrchestrationIDReusePolicy(&OrchestrationIDReusePolicy{
+		DedupeStatuses: append([]OrchestrationStatus(nil), reusableOrchestrationStatuses[:]...),
+	})(req, DefaultDataConverter())
+	require.NoError(t, err)
+	require.NotNil(t, req.OrchestrationIdReusePolicy)
+	require.Empty(t, req.OrchestrationIdReusePolicy.ReplaceableStatus)
+}
+
+func Test_API_ReusableOrchestrationStatusesTrackStableProtoStatuses(t *testing.T) {
+	require.Len(t, reusableOrchestrationStatuses, len(protos.OrchestrationStatus_name)-1)
+	for status := range protos.OrchestrationStatus_name {
+		value := OrchestrationStatus(status)
+		if value == RUNTIME_STATUS_CONTINUED_AS_NEW {
+			require.False(t, isReusableOrchestrationStatus(value))
+			continue
+		}
+		require.True(t, isReusableOrchestrationStatus(value), value.String())
+	}
+}
+
 // WithRecursiveTerminate and WithRecursivePurge are the only way callers reach
 // the DTS-side recursive flags, so both directions must survive on the wire.
 func Test_API_WithRecursiveTerminate_SetsWireFlag(t *testing.T) {
