@@ -40,28 +40,29 @@ type OrchestrationContext struct {
 	IsReplaying    bool
 	CurrentTimeUtc time.Time
 
-	baseContext              context.Context
-	contextFields            api.ContextFields
-	errorProperties          api.ErrorPropertiesProvider
-	orchestrationTags        map[string]string
-	logger                   *slog.Logger
-	metrics                  MetricsHooks
-	orchestrationOptions     OrchestrationOptions
-	parentInstanceID         api.InstanceID
-	executionID              string
-	registry                 *TaskRegistry
-	rawInput                 []byte
-	oldEvents                []*protos.HistoryEvent
-	newEvents                []*protos.HistoryEvent
-	suspendedEvents          []replayEvent
-	resumedEvents            []replayEvent
-	isSuspended              bool
-	isTerminated             bool
-	historyIndex             int
+	baseContext          context.Context
+	contextFields        api.ContextFields
+	errorProperties      api.ErrorPropertiesProvider
+	orchestrationTags    map[string]string
+	logger               *slog.Logger
+	metrics              MetricsHooks
+	orchestrationOptions OrchestrationOptions
+	parentInstanceID     api.InstanceID
+	executionID          string
+	registry             *TaskRegistry
+	rawInput             []byte
+	oldEvents            []*protos.HistoryEvent
+	newEvents            []*protos.HistoryEvent
+	suspendedEvents      []replayEvent
+	resumedEvents        []replayEvent
+	isSuspended          bool
+	isTerminated         bool
+	historyIndex         int
+	// processedEventsThisTurn follows DTS numEventsProcessed semantics and
+	// excludes orchestration control markers.
 	processedEventsThisTurn  int
 	maxEventsPerTurnExceeded bool
 	maxHistoryEventsExceeded bool
-	historyLimitExceeded     bool
 	sequenceNumber           int32
 	newGuidCounter           uint64
 	pendingActions           map[int32]*protos.OrchestratorAction
@@ -178,13 +179,8 @@ func WithSubOrchestrationVersion(version string) SubOrchestratorOption {
 // WithSubOrchestrationTags adds user tags to a sub-orchestration.
 func WithSubOrchestrationTags(tags map[string]string) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
-		for key := range tags {
-			if key == "" {
-				return errors.New("sub-orchestration tag key cannot be empty")
-			}
-			if err := checkUnreservedKey("tag", key); err != nil {
-				return err
-			}
+		if err := validateUnreservedKeys("sub-orchestration tag", tags); err != nil {
+			return err
 		}
 		opts.tags = maps.Clone(tags)
 		return nil
@@ -195,17 +191,31 @@ func WithSubOrchestrationTags(tags map[string]string) SubOrchestratorOption {
 // sub-orchestration.
 func WithSubOrchestrationContextFields(fields api.ContextFields) SubOrchestratorOption {
 	return func(opts *callSubOrchestratorOptions, _ api.DataConverter) error {
-		for key := range fields {
-			if key == "" {
-				return errors.New("sub-orchestration context field key cannot be empty")
-			}
-			if err := checkUnreservedKey("context field", key); err != nil {
-				return err
-			}
+		if err := validateUnreservedKeys("sub-orchestration context field", fields); err != nil {
+			return err
 		}
 		opts.contextFields = maps.Clone(fields)
 		return nil
 	}
+}
+
+// validateUnreservedKeys rejects empty keys and keys that collide with
+// reserved wire prefixes, using kind to build caller-facing error messages.
+func validateUnreservedKeys[M ~map[string]string](kind string, values M) error {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if key == "" {
+			return fmt.Errorf("%s key cannot be empty", kind)
+		}
+		if err := checkUnreservedKey(kind, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkUnreservedKey rejects caller-supplied keys that collide with the
@@ -213,7 +223,7 @@ func WithSubOrchestrationContextFields(fields api.ContextFields) SubOrchestrator
 func checkUnreservedKey(kind, key string) error {
 	if strings.HasPrefix(key, api.ReservedContextFieldPrefix) ||
 		strings.HasPrefix(key, tagcodec.UserTagPrefix) {
-		return fmt.Errorf("sub-orchestration %s %q uses a reserved prefix", kind, key)
+		return fmt.Errorf("%s %q uses a reserved prefix", kind, key)
 	}
 	return nil
 }
@@ -266,7 +276,6 @@ func newOrchestrationContext(
 	}
 	ctx.maxHistoryEventsExceeded = options.MaxHistoryEvents > 0 &&
 		len(oldEvents)+len(newEvents) > options.MaxHistoryEvents
-	ctx.historyLimitExceeded = ctx.maxHistoryEventsExceeded
 	ctx.scope = newCancellationScope(nil)
 	return ctx
 }
@@ -382,7 +391,7 @@ func (ctx *OrchestrationContext) start() (actions []*protos.OrchestratorAction) 
 			markTerminal()
 		}
 	}
-	if ctx.historyLimitExceeded &&
+	if ctx.maxHistoryEventsExceeded &&
 		!ctx.continuedAsNew &&
 		!ctx.isTerminated &&
 		!ctx.hasCompletionAction() {
@@ -436,22 +445,20 @@ func (ctx *OrchestrationContext) getNextHistoryEvent() (*protos.HistoryEvent, bo
 		ctx.IsReplaying = false
 		historyList = ctx.newEvents
 		index -= len(ctx.oldEvents)
-		nextEvent := historyList[index]
-		if countsTowardTurnBudget(nextEvent) &&
-			ctx.orchestrationOptions.MaxEventsPerTurn > 0 &&
+	}
+
+	event := historyList[index]
+	if !ctx.IsReplaying && countsTowardTurnBudget(event) {
+		if ctx.orchestrationOptions.MaxEventsPerTurn > 0 &&
 			ctx.processedEventsThisTurn >= ctx.orchestrationOptions.MaxEventsPerTurn {
 			ctx.maxEventsPerTurnExceeded = true
-			ctx.historyLimitExceeded = true
 			return nil, false
 		}
+		ctx.processedEventsThisTurn++
 	}
 
 	ctx.historyIndex++
-	e := historyList[index]
-	if !ctx.IsReplaying && countsTowardTurnBudget(e) {
-		ctx.processedEventsThisTurn++
-	}
-	return e, true
+	return event, true
 }
 
 func countsTowardTurnBudget(event *protos.HistoryEvent) bool {
@@ -470,9 +477,10 @@ func (ctx *OrchestrationContext) HistoryLength() int {
 	return len(engine.oldEvents) + len(engine.newEvents)
 }
 
-// HistoryLimitExceeded reports whether a configured history budget was exceeded.
+// HistoryLimitExceeded reports whether MaxHistoryEvents was exceeded.
 func (ctx *OrchestrationContext) HistoryLimitExceeded() bool {
-	return ctx.engineContext().historyLimitExceeded
+	engine := ctx.engineContext()
+	return engine.maxHistoryEventsExceeded
 }
 
 func (ctx *OrchestrationContext) processEvent(e *protos.HistoryEvent) error {
@@ -589,7 +597,7 @@ func (octx *OrchestrationContext) GetInput(v any) error {
 // CallActivity schedules an asynchronous invocation of an activity function. The [activity]
 // parameter can be either the name of an activity as a string or can be a pointer to the function
 // that implements the activity, in which case the name is obtained via reflection.
-func (ctx *OrchestrationContext) CallActivity(activity any, opts ...callActivityOption) Task {
+func (ctx *OrchestrationContext) CallActivity(activity any, opts ...CallActivityOption) Task {
 	engine := ctx.engineContext()
 	options := new(callActivityOptions)
 	for _, configure := range opts {
@@ -665,7 +673,7 @@ func (ctx *OrchestrationContext) internalScheduleActivity(
 		Name:             ctx.Name,
 		Version:          ctx.Version,
 		ParentInstanceID: ctx.parentInstanceID,
-	}, ctx.contextFields, ctx.orchestrationTags)
+	}, ctx.contextFields, mergeStringMaps(ctx.orchestrationTags, options.tags))
 
 	ctx.pendingActions[scheduleTaskAction.Id] = scheduleTaskAction
 
@@ -1580,18 +1588,14 @@ func (ctx *OrchestrationContext) enforceHistoryLimit() {
 	}
 
 	input, err := invokeHistoryLimitHandler(handler, HistoryLimitInfo{
-		InstanceID:               ctx.ID,
-		OrchestrationName:        ctx.Name,
-		OrchestrationVersion:     ctx.Version,
-		HistoryLength:            ctx.HistoryLength(),
-		MaxHistoryEvents:         ctx.orchestrationOptions.MaxHistoryEvents,
-		ProcessedEventsThisTurn:  ctx.processedEventsThisTurn,
-		MaxEventsPerTurn:         ctx.orchestrationOptions.MaxEventsPerTurn,
-		MaxHistoryEventsExceeded: ctx.maxHistoryEventsExceeded,
-		MaxEventsPerTurnExceeded: ctx.maxEventsPerTurnExceeded,
-		UnprocessedEventCount:    unprocessedEventCount,
-		SerializedInput:          string(ctx.rawInput),
-		Converter:                ctx.converter,
+		InstanceID:            ctx.ID,
+		OrchestrationName:     ctx.Name,
+		OrchestrationVersion:  ctx.Version,
+		HistoryLength:         ctx.HistoryLength(),
+		MaxHistoryEvents:      ctx.orchestrationOptions.MaxHistoryEvents,
+		UnprocessedEventCount: unprocessedEventCount,
+		SerializedInput:       string(ctx.rawInput),
+		Converter:             ctx.converter,
 	})
 	if err != nil {
 		_ = ctx.setHistoryLimitFailed(ctx.newHistoryLimitError(err))
@@ -1626,12 +1630,10 @@ func invokeHistoryLimitHandler(handler HistoryLimitHandler, info HistoryLimitInf
 
 func (ctx *OrchestrationContext) newHistoryLimitError(policyError error) *HistoryLimitError {
 	return &HistoryLimitError{
-		InstanceID:              ctx.ID,
-		HistoryLength:           ctx.HistoryLength(),
-		MaxHistoryEvents:        ctx.orchestrationOptions.MaxHistoryEvents,
-		ProcessedEventsThisTurn: ctx.processedEventsThisTurn,
-		MaxEventsPerTurn:        ctx.orchestrationOptions.MaxEventsPerTurn,
-		PolicyError:             policyError,
+		InstanceID:       ctx.ID,
+		HistoryLength:    ctx.HistoryLength(),
+		MaxHistoryEvents: ctx.orchestrationOptions.MaxHistoryEvents,
+		PolicyError:      policyError,
 	}
 }
 
@@ -1692,8 +1694,21 @@ func (ctx *OrchestrationContext) setCompleteInternal(
 		nil, // carryoverEvents is assigned later
 		failureDetails,
 	)
+	completed := completedAction.GetCompleteOrchestration()
 	if status == protos.OrchestrationStatus_ORCHESTRATION_STATUS_CONTINUED_AS_NEW {
-		completedAction.GetCompleteOrchestration().NewVersion = ctx.continuedAsNewVersion
+		completed.NewVersion = ctx.continuedAsNewVersion
+		version := ctx.Version
+		if ctx.continuedAsNewVersion != nil {
+			version = ctx.continuedAsNewVersion.GetValue()
+		}
+		completed.Tags = contextprop.Encode(api.OrchestrationContextInfo{
+			InstanceID:       ctx.ID,
+			Name:             ctx.Name,
+			Version:          version,
+			ParentInstanceID: ctx.parentInstanceID,
+		}, ctx.contextFields, ctx.orchestrationTags)
+	} else {
+		completed.Tags = tagcodec.EncodeUserTags(ctx.orchestrationTags)
 	}
 	ctx.pendingActions[sequenceNumber] = completedAction
 	return nil
@@ -1775,8 +1790,8 @@ func (ctx *OrchestrationContext) unprocessedExternalEvents() []*protos.HistoryEv
 		}
 	}
 
-	newEventIndex := max(ctx.historyIndex-len(ctx.oldEvents), 0)
-	for _, event := range ctx.newEvents[newEventIndex:] {
+	firstUnprocessedNewEvent := max(ctx.historyIndex-len(ctx.oldEvents), 0)
+	for _, event := range ctx.newEvents[firstUnprocessedNewEvent:] {
 		if event.GetEventRaised() != nil {
 			events = append(events, event)
 		}

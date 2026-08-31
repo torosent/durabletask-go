@@ -41,6 +41,12 @@ func expectedTraceParent(span trace.Span) string {
 	return fmt.Sprintf("00-%s-%s-%s", spanContext.TraceID(), spanContext.SpanID(), spanContext.TraceFlags())
 }
 
+func traceParentSpanID(t *testing.T, traceParent string) string {
+	t.Helper()
+	require.Len(t, traceParent, 55, "unexpected traceparent format %q", traceParent)
+	return traceParent[36:52]
+}
+
 func fetchHistory(t *testing.T, ctx context.Context, client *durabletaskscheduler.Client, id api.InstanceID, executionID string) []*api.HistoryEvent {
 	t.Helper()
 	history, err := client.GetOrchestrationHistory(ctx, id, api.HistoryQuery{ExecutionID: executionID})
@@ -231,6 +237,8 @@ func TestDTSEmulatorTracingTreeActivityFailureSubOrchestrationsAndEvents(t *test
 	require.NotNil(t, started.ParentTraceContext, "the scheduler did not persist the caller's trace context")
 	require.Equal(t, expectedTraceParent(callerSpan), started.ParentTraceContext.TraceParent)
 	requireTraceContextsShareTrace(t, parentEvents, callerTraceID)
+	actionSpanIDs := make(map[string]struct{})
+	childTraceParents := make(map[api.InstanceID]string)
 
 	// Durable timers and raised events are recorded on the parent's history, but the
 	// emulator does not stamp a trace context on those records, so they can only be
@@ -239,6 +247,18 @@ func TestDTSEmulatorTracingTreeActivityFailureSubOrchestrationsAndEvents(t *test
 	require.Equal(t, 1, countEvents(parentEvents, api.HistoryEventTimerFired))
 	require.Equal(t, 1, countEvents(parentEvents, api.HistoryEventEventRaised))
 	require.Equal(t, 2, countEvents(parentEvents, api.HistoryEventSubOrchestrationInstanceCreated))
+	for _, event := range parentEvents {
+		if created := event.SubOrchestrationInstanceCreated; created != nil {
+			require.NotNil(t, created.ParentTraceContext)
+			require.Contains(t, created.ParentTraceContext.TraceParent, callerTraceID)
+			spanID := traceParentSpanID(t, created.ParentTraceContext.TraceParent)
+			require.NotEqual(t, callerSpan.SpanContext().SpanID().String(), spanID)
+			require.NotEqual(t, started.OrchestrationSpanID, spanID)
+			require.NotContains(t, actionSpanIDs, spanID)
+			actionSpanIDs[spanID] = struct{}{}
+			childTraceParents[created.InstanceID] = created.ParentTraceContext.TraceParent
+		}
+	}
 
 	// The orchestration-sent event lands on the receiver as a raised event. Cross-instance
 	// causality is not carried on the wire by the emulator, so the receiving instance keeps
@@ -246,15 +266,27 @@ func TestDTSEmulatorTracingTreeActivityFailureSubOrchestrationsAndEvents(t *test
 	receiverEvents := fetchHistory(t, ctx, managementClient, receiverID, receiverMetadata.ExecutionID)
 	require.Equal(t, 1, countEvents(receiverEvents, api.HistoryEventEventRaised))
 
-	// Emulator limitation: sub-orchestration starts are not stamped with the parent's trace
-	// context, so their history begins a fresh trace. Assert the weaker invariant that holds
-	// either way: if a trace context is present it must belong to the caller's trace.
 	for _, childID := range []api.InstanceID{parentID + "_ok", parentID + "_failed"} {
 		childEvents := fetchHistory(t, ctx, managementClient, childID, "")
 		childStarted := executionStarted(t, childEvents)
-		if childStarted.ParentTraceContext != nil && childStarted.ParentTraceContext.TraceParent != "" {
-			requireTraceContextsShareTrace(t, childEvents, callerTraceID)
+		require.NotNil(t, childStarted.ParentTraceContext)
+		require.Contains(t, childStarted.ParentTraceContext.TraceParent, callerTraceID)
+		require.Equal(t, childTraceParents[childID], childStarted.ParentTraceContext.TraceParent)
+		var foundActivityTrace bool
+		for _, event := range childEvents {
+			if scheduled := event.TaskScheduled; scheduled != nil {
+				require.NotNil(t, scheduled.ParentTraceContext)
+				require.Contains(t, scheduled.ParentTraceContext.TraceParent, callerTraceID)
+				spanID := traceParentSpanID(t, scheduled.ParentTraceContext.TraceParent)
+				require.NotEqual(t, callerSpan.SpanContext().SpanID().String(), spanID)
+				require.NotEqual(t, childStarted.OrchestrationSpanID, spanID)
+				require.NotContains(t, actionSpanIDs, spanID)
+				actionSpanIDs[spanID] = struct{}{}
+				foundActivityTrace = true
+			}
 		}
+		require.True(t, foundActivityTrace)
+		requireTraceContextsShareTrace(t, childEvents, callerTraceID)
 	}
 
 	requireNoWorkerEmittedSpans(t, exporter)
@@ -313,6 +345,7 @@ func TestDTSEmulatorTracingTreeVersionMigration(t *testing.T) {
 		callerCtx,
 		"DTSTraceVersioned",
 		api.WithInstanceID(uniqueInstanceID("go-trace-version")),
+		api.WithTags(map[string]string{"migration": "preserved"}),
 	)
 	require.NoError(t, err)
 	callerSpan.End()
@@ -322,6 +355,7 @@ func TestDTSEmulatorTracingTreeVersionMigration(t *testing.T) {
 	require.Equal(t, api.RUNTIME_STATUS_COMPLETED, metadata.RuntimeStatus)
 	require.Equal(t, "2.0", metadata.Version)
 	require.Equal(t, `"v1-activity+v2"`, metadata.SerializedOutput)
+	require.Equal(t, "preserved", metadata.Tags["migration"])
 
 	// The migrated generation is a new execution, and it must still carry the trace context
 	// of the client call that started generation 1.

@@ -111,7 +111,7 @@ func WithOrchestratorNotFoundStrategy(strategy OrchestratorNotFoundStrategy) Tas
 }
 
 // WithOrchestrationOptions configures deterministic orchestration engine
-// policies. It panics when MaximumTimerInterval is negative.
+// policies. It panics when a duration or event limit is negative.
 func WithOrchestrationOptions(options OrchestrationOptions) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.orchestrationOptions = normalizeOrchestrationOptions(options)
@@ -308,6 +308,9 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 			CustomStatus: wrapperspb.String(orchestrationCtx.customStatus),
 		},
 	}
+	if orchestrationCtx.maxEventsPerTurnExceeded && !orchestrationCtx.hasCompletionAction() {
+		results.Response.NumEventsProcessed = wrapperspb.Int32(int32(orchestrationCtx.processedEventsThisTurn))
+	}
 	return results, nil
 }
 
@@ -451,6 +454,7 @@ func (te *taskExecutor) newEntityContext(
 		ctx:         ctx,
 		logger:      logger,
 		converter:   te.converter,
+		parentTrace: helpers.CloneTraceContext(operation.GetTraceContext()),
 	}
 }
 

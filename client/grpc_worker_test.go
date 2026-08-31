@@ -313,6 +313,97 @@ func TestTaskHubGrpcWorkerAdvertisesCapabilitiesAndCompletesActivity(t *testing.
 	require.NoError(t, worker.Shutdown(context.Background()))
 }
 
+func TestPopulateOrchestratorActionTraceContexts(t *testing.T) {
+	parent := &protos.TraceContext{
+		TraceParent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+		TraceState:  wrapperspb.String("vendor=value"),
+	}
+	started := helpers.NewExecutionStartedEvent(
+		"orchestration",
+		"instance",
+		nil,
+		nil,
+		parent,
+		nil,
+	)
+	actions := []*protos.OrchestratorAction{
+		helpers.NewScheduleTaskAction(1, "activity", nil),
+		helpers.NewCreateSubOrchestrationAction(2, "child", "child-id", nil),
+	}
+
+	require.NoError(t, populateOrchestratorActionTraceContexts(
+		actions,
+		[]*protos.HistoryEvent{started},
+		nil,
+	))
+	activityTrace := actions[0].GetScheduleTask().GetParentTraceContext()
+	childTrace := actions[1].GetCreateSubOrchestration().GetParentTraceContext()
+	require.NotNil(t, activityTrace)
+	require.NotNil(t, childTrace)
+	require.Contains(t, activityTrace.TraceParent, "0123456789abcdef0123456789abcdef")
+	require.Contains(t, childTrace.TraceParent, "0123456789abcdef0123456789abcdef")
+	require.NotEqual(t, parent.TraceParent, activityTrace.TraceParent)
+	require.NotEqual(t, activityTrace.TraceParent, childTrace.TraceParent)
+	require.Equal(t, "vendor=value", activityTrace.GetTraceState().GetValue())
+
+	existing := helpers.NewScheduleTaskAction(3, "existing", nil)
+	existing.GetScheduleTask().ParentTraceContext = parent
+	require.NoError(t, populateOrchestratorActionTraceContexts(
+		[]*protos.OrchestratorAction{existing},
+		[]*protos.HistoryEvent{started},
+		nil,
+	))
+	require.Same(t, parent, existing.GetScheduleTask().GetParentTraceContext())
+}
+
+func TestTaskHubGrpcWorkerSendsNumEventsProcessedForPartialTurn(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddOrchestratorN("partial", func(ctx *task.OrchestrationContext) (any, error) {
+		ctx.CallActivity("activity")
+		return nil, ctx.WaitForSingleEvent("second", -1).Await(nil)
+	}))
+	require.NoError(t, registry.AddActivityN("activity", func(task.ActivityContext) (any, error) {
+		return nil, nil
+	}))
+	stream := newFakeWorkItemStream(1)
+	scheduler := &fakeSchedulerClient{stream: stream}
+	worker := newFakeWorker(t, scheduler)
+	worker.executor = task.NewTaskExecutor(
+		registry,
+		task.WithOrchestrationOptions(task.OrchestrationOptions{MaxEventsPerTurn: 1}),
+	)
+	stream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_OrchestratorRequest{OrchestratorRequest: &protos.OrchestratorRequest{
+			InstanceId: "partial-instance",
+			NewEvents: []*protos.HistoryEvent{
+				helpers.NewOrchestratorStartedEvent(),
+				helpers.NewExecutionStartedEvent("partial", "partial-instance", nil, nil, nil, nil),
+				helpers.NewEventRaisedEvent("first", wrapperspb.String(`"one"`)),
+				helpers.NewEventRaisedEvent("second", wrapperspb.String(`"two"`)),
+			},
+		}},
+		CompletionToken: "partial-token",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool {
+		scheduler.mu.Lock()
+		defer scheduler.mu.Unlock()
+		return len(scheduler.orchestrationCompletions) == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
+
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	response := scheduler.orchestrationCompletions[0]
+	require.Equal(t, "partial-token", response.CompletionToken)
+	require.EqualValues(t, 1, response.GetNumEventsProcessed().GetValue())
+	require.Len(t, response.Actions, 1)
+	require.NotNil(t, response.Actions[0].GetScheduleTask())
+}
+
 func TestTaskHubGrpcWorkerDoesNotAbandonExpiredActivityLease(t *testing.T) {
 	stream := newFakeWorkItemStream(1)
 	client := &fakeSchedulerClient{

@@ -26,51 +26,56 @@ func TestGrpcClientDefaultVersionAndExplicitUnversionedOverride(t *testing.T) {
 	require.Empty(t, scheduler.start.GetVersion().GetValue())
 }
 
-func TestPrepareOrchestrationIDReusePolicy(t *testing.T) {
+func TestOrchestrationIDReusePolicyUsesCurrentDedupeSemantics(t *testing.T) {
 	tests := []struct {
-		name       string
-		action     api.CreateOrchestrationAction
-		wantPolicy bool
-		wantErr    bool
+		name        string
+		statuses    []api.OrchestrationStatus
+		wantPolicy  bool
+		replaceable []protos.OrchestrationStatus
 	}{
 		{
-			name:       "terminate maps to replaceable statuses",
-			action:     api.REUSE_ID_ACTION_TERMINATE,
-			wantPolicy: true,
-		},
-		{
-			name:       "error maps to absent wire policy",
-			action:     api.REUSE_ID_ACTION_ERROR,
+			name:       "nil uses service default",
+			statuses:   nil,
 			wantPolicy: false,
 		},
 		{
-			// DTS reads the shared status field as a replacement policy, so
-			// IGNORE cannot be expressed on the wire and must fail closed.
-			name:    "ignore fails closed for the DTS wire contract",
-			action:  api.REUSE_ID_ACTION_IGNORE,
-			wantErr: true,
+			name:       "empty allows every reusable status",
+			statuses:   []api.OrchestrationStatus{},
+			wantPolicy: true,
+			replaceable: []protos.OrchestrationStatus{
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_CANCELED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_PENDING,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED,
+			},
+		},
+		{
+			name:       "dedupe statuses are removed from replaceable statuses",
+			statuses:   []api.OrchestrationStatus{api.RUNTIME_STATUS_RUNNING, api.RUNTIME_STATUS_PENDING},
+			wantPolicy: true,
+			replaceable: []protos.OrchestrationStatus{
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_CANCELED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_TERMINATED,
+				protos.OrchestrationStatus_ORCHESTRATION_STATUS_SUSPENDED,
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &protos.CreateInstanceRequest{}
-			configure := api.WithOrchestrationIdReusePolicy(&api.OrchestrationIdReusePolicy{
-				Action:          tt.action,
-				OperationStatus: []api.OrchestrationStatus{api.RUNTIME_STATUS_RUNNING},
+			configure := api.WithOrchestrationIDReusePolicy(&api.OrchestrationIDReusePolicy{
+				DedupeStatuses: tt.statuses,
 			})
 			require.NoError(t, configure(req, api.DefaultDataConverter()))
-
-			c := &TaskHubGrpcClient{}
-			err := c.prepareOrchestrationIDReusePolicy(req)
-			if tt.wantErr {
-				require.ErrorIs(t, err, ErrUnsupportedOrchestrationIDReusePolicy)
-				return
-			}
-			require.NoError(t, err)
 			if tt.wantPolicy {
 				require.NotNil(t, req.OrchestrationIdReusePolicy)
-				require.Equal(t, []protos.OrchestrationStatus{protos.OrchestrationStatus_ORCHESTRATION_STATUS_RUNNING}, req.OrchestrationIdReusePolicy.ReplaceableStatus)
+				require.Equal(t, tt.replaceable, req.OrchestrationIdReusePolicy.ReplaceableStatus)
 			} else {
 				require.Nil(t, req.OrchestrationIdReusePolicy)
 			}

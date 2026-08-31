@@ -17,23 +17,19 @@ var ErrHistoryLimitExceeded = errors.New("orchestration history limit exceeded")
 
 // HistoryLimitError describes the history budget that was exceeded.
 type HistoryLimitError struct {
-	InstanceID              api.InstanceID
-	HistoryLength           int
-	MaxHistoryEvents        int
-	ProcessedEventsThisTurn int
-	MaxEventsPerTurn        int
-	PolicyError             error
+	InstanceID       api.InstanceID
+	HistoryLength    int
+	MaxHistoryEvents int
+	PolicyError      error
 }
 
 func (e *HistoryLimitError) Error() string {
 	message := fmt.Sprintf(
-		"%v for instance %q: history=%d max_history=%d processed_this_turn=%d max_per_turn=%d",
+		"%v for instance %q: history=%d max_history=%d",
 		ErrHistoryLimitExceeded,
 		e.InstanceID,
 		e.HistoryLength,
 		e.MaxHistoryEvents,
-		e.ProcessedEventsThisTurn,
-		e.MaxEventsPerTurn,
 	)
 	if e.PolicyError != nil {
 		return fmt.Sprintf("%s: history limit handler failed: %v", message, e.PolicyError)
@@ -55,18 +51,14 @@ func (*HistoryLimitError) NonRetriable() bool {
 
 // HistoryLimitInfo is the immutable input passed to a history limit handler.
 type HistoryLimitInfo struct {
-	InstanceID               api.InstanceID
-	OrchestrationName        string
-	OrchestrationVersion     string
-	HistoryLength            int
-	MaxHistoryEvents         int
-	ProcessedEventsThisTurn  int
-	MaxEventsPerTurn         int
-	MaxHistoryEventsExceeded bool
-	MaxEventsPerTurnExceeded bool
-	UnprocessedEventCount    int
-	SerializedInput          string
-	Converter                api.DataConverter
+	InstanceID            api.InstanceID
+	OrchestrationName     string
+	OrchestrationVersion  string
+	HistoryLength         int
+	MaxHistoryEvents      int
+	UnprocessedEventCount int
+	SerializedInput       string
+	Converter             api.DataConverter
 }
 
 // GetInput unmarshals the current orchestration input.
@@ -93,16 +85,20 @@ type OrchestrationOptions struct {
 	// orchestrations that have timers longer than either the old or new value.
 	MaximumTimerInterval time.Duration
 
-	// MaxEventsPerTurn limits new history events processed in one execution turn.
-	// Zero disables the limit. Old replay history is always processed.
+	// MaxEventsPerTurn limits new DTS work-item events processed in one
+	// execution turn. Orchestration control markers are outside DTS's processed
+	// event count. Remaining events are left for DTS to redeliver. Zero
+	// disables the limit. Old replay history is always processed.
 	MaxEventsPerTurn int
 
 	// MaxHistoryEvents limits the total old and new history supplied to an execution.
 	// Zero disables the limit.
 	MaxHistoryEvents int
 
-	// OnHistoryLimitExceeded opts into ContinueAsNew by supplying serializable state.
-	// When nil, exceeding either limit fails with a non-retriable HistoryLimitExceeded failure.
+	// OnHistoryLimitExceeded handles MaxHistoryEvents when the orchestration
+	// remains incomplete after the turn. It opts into ContinueAsNew by supplying
+	// serializable state; when nil, the orchestration fails with a non-retriable
+	// HistoryLimitExceeded failure.
 	OnHistoryLimitExceeded HistoryLimitHandler
 }
 
@@ -112,6 +108,12 @@ func normalizeOrchestrationOptions(options OrchestrationOptions) OrchestrationOp
 	}
 	if options.MaximumTimerInterval == 0 {
 		options.MaximumTimerInterval = DefaultMaximumTimerInterval
+	}
+	if options.MaxEventsPerTurn < 0 {
+		panic("maximum events per turn cannot be negative")
+	}
+	if options.MaxHistoryEvents < 0 {
+		panic("maximum history events cannot be negative")
 	}
 	return options
 }

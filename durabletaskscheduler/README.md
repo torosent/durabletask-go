@@ -310,8 +310,7 @@ cancels them only if the shutdown context expires.
 | Azure Blob `blob:v2` payloads | Supported with connection-string or identity authentication and .NET-compatible gzip/token semantics |
 | Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
-| DTS instance-ID replacement (`TERMINATE`) | Supported |
-| Legacy instance-ID `IGNORE` | Unsupported by DTS because the current wire format is ambiguous |
+| Status-based instance-ID deduplication and replacement | Supported through `api.OrchestrationIDReusePolicy.DedupeStatuses` |
 | History export jobs (preview) | Supported through the top-level [`exporthistory`](../exporthistory) package; register the system tasks and opt in with `exporthistory.WithExportHistory()` |
 
 The current V2 protobuf cannot carry per-operation trace context or request time
