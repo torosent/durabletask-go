@@ -234,7 +234,7 @@ func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) SubOrchestratorOption 
 	}
 	snapshot := *policy
 	return func(opt *callSubOrchestratorOptions, _ api.DataConverter) error {
-		normalized, err := normalizeRetryPolicy(snapshot)
+		normalized, err := snapshot.Normalized()
 		if err != nil {
 			return err
 		}
@@ -791,11 +791,6 @@ func (ctx *OrchestrationContext) internalScheduleTaskWithRetries(
 				}
 				return
 			}
-			if !ctx.IsReplaying && policy.RetryTimeout != math.MaxInt64 &&
-				ctx.CurrentTimeUtc.After(initialAttempt.Add(policy.RetryTimeout)) {
-				result.completeFrom(current, err)
-				return
-			}
 			count++
 			current = schedule()
 		}
@@ -830,6 +825,10 @@ func (t *completableTask) completeFrom(source Task, fallback error) {
 	}
 }
 
+// computeNextDelay returns the delay before the next retry attempt, or zero to
+// stop retrying. Every input is derived from replayed history, so the same
+// failure event always yields the same decision. A delay that would push the
+// next attempt past RetryTimeout stops the retries instead.
 func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int, firstAttempt time.Time, err error) time.Duration {
 	if errors.Is(err, ErrTaskCanceled) {
 		return 0

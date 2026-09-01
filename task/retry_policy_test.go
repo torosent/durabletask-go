@@ -110,11 +110,15 @@ func TestRetryOptionDoesNotReadCallerPolicyAfterConstruction(t *testing.T) {
 	writers.Wait()
 }
 
-func TestRetryDoesNotStartAfterDelayedTimerPassesDeadline(t *testing.T) {
+// TestRetryDoesNotScheduleTimerPastRetryTimeout proves the retry loop stops
+// instead of creating a durable timer whose delay would carry the next attempt
+// past RetryTimeout. Bounding the timer at creation keeps the decision on the
+// failure event, where every input is replayed from history.
+func TestRetryDoesNotScheduleTimerPastRetryTimeout(t *testing.T) {
 	registry := NewTaskRegistry()
-	if err := registry.AddOrchestratorN("late-retry", func(ctx *OrchestrationContext) (any, error) {
+	if err := registry.AddOrchestratorN("bounded-retry", func(ctx *OrchestrationContext) (any, error) {
 		return nil, ctx.CallActivity("flaky", WithActivityRetryPolicy(&RetryPolicy{
-			MaxAttempts:          2,
+			MaxAttempts:          3,
 			InitialRetryInterval: 10 * time.Second,
 			RetryTimeout:         time.Minute,
 		})).Await(nil)
@@ -123,49 +127,55 @@ func TestRetryDoesNotStartAfterDelayedTimerPassesDeadline(t *testing.T) {
 	}
 
 	firstAttempt := time.Unix(1_700_000_000, 0).UTC()
-	fireAt := timestamppb.New(firstAttempt.Add(10 * time.Second))
 	startedTurn := helpers.NewOrchestratorStartedEvent()
 	startedTurn.Timestamp = timestamppb.New(firstAttempt)
-	lateTurn := helpers.NewOrchestratorStartedEvent()
-	lateTurn.Timestamp = timestamppb.New(firstAttempt.Add(2 * time.Minute))
-	instanceID := api.InstanceID("late-retry-instance")
+	// Only five seconds of the retry budget remain, so the ten-second backoff
+	// would fire after the deadline.
+	failureTurn := helpers.NewOrchestratorStartedEvent()
+	failureTurn.Timestamp = timestamppb.New(firstAttempt.Add(55 * time.Second))
+	instanceID := api.InstanceID("bounded-retry-instance")
 	result, err := NewTaskExecutor(registry).ExecuteOrchestrator(
 		context.Background(),
 		instanceID,
 		[]*protos.HistoryEvent{
 			startedTurn,
-			helpers.NewExecutionStartedEvent("late-retry", string(instanceID), nil, nil, nil, nil),
+			helpers.NewExecutionStartedEvent("bounded-retry", string(instanceID), nil, nil, nil, nil),
 			helpers.NewTaskScheduledEvent(0, "flaky", nil, nil, nil),
+		},
+		[]*protos.HistoryEvent{
+			failureTurn,
 			helpers.NewTaskFailedEvent(0, &protos.TaskFailureDetails{
 				ErrorType:    "TransientFailure",
 				ErrorMessage: "retry me",
 			}),
-			helpers.NewTimerCreatedEvent(1, fireAt),
-		},
-		[]*protos.HistoryEvent{
-			lateTurn,
-			helpers.NewTimerFiredEvent(1, fireAt, nil),
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, action := range result.Response.Actions {
+		if action.GetCreateTimer() != nil {
+			t.Fatal("retry timer scheduled past RetryTimeout")
+		}
 		if scheduled := action.GetScheduleTask(); scheduled != nil {
-			t.Fatalf("late retry scheduled activity %q after RetryTimeout", scheduled.GetName())
+			t.Fatalf("retry scheduled activity %q past RetryTimeout", scheduled.GetName())
 		}
 	}
-	completed := completionAction(t, result.Response)
-	if completed.GetOrchestrationStatus() != protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED {
+	if completed := completionAction(t, result.Response); completed.GetOrchestrationStatus() !=
+		protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED {
 		t.Fatalf("orchestration status = %v, want FAILED", completed.GetOrchestrationStatus())
 	}
 }
 
-func TestRetryReplaysLateAttemptRecordedBeforeDeadlineFix(t *testing.T) {
+// TestRetryDecisionIsStableWhenCompletionIsRedelivered pins the replay contract
+// the retry loop depends on: when a completion response is lost and DTS
+// redelivers the work item, the same events must produce the same retry
+// actions even though they arrive as replayed history.
+func TestRetryDecisionIsStableWhenCompletionIsRedelivered(t *testing.T) {
 	registry := NewTaskRegistry()
-	if err := registry.AddOrchestratorN("late-retry-replay", func(ctx *OrchestrationContext) (any, error) {
+	if err := registry.AddOrchestratorN("stable-retry", func(ctx *OrchestrationContext) (any, error) {
 		return nil, ctx.CallActivity("flaky", WithActivityRetryPolicy(&RetryPolicy{
-			MaxAttempts:          2,
+			MaxAttempts:          3,
 			InitialRetryInterval: 10 * time.Second,
 			RetryTimeout:         time.Minute,
 		})).Await(nil)
@@ -174,34 +184,61 @@ func TestRetryReplaysLateAttemptRecordedBeforeDeadlineFix(t *testing.T) {
 	}
 
 	firstAttempt := time.Unix(1_700_000_000, 0).UTC()
-	fireAt := timestamppb.New(firstAttempt.Add(10 * time.Second))
+	failureTurn := helpers.NewOrchestratorStartedEvent()
+	failureTurn.Timestamp = timestamppb.New(firstAttempt.Add(5 * time.Second))
 	startedTurn := helpers.NewOrchestratorStartedEvent()
 	startedTurn.Timestamp = timestamppb.New(firstAttempt)
-	lateTurn := helpers.NewOrchestratorStartedEvent()
-	lateTurn.Timestamp = timestamppb.New(firstAttempt.Add(2 * time.Minute))
-	instanceID := api.InstanceID("late-retry-replay-instance")
-	result, err := NewTaskExecutor(registry).ExecuteOrchestrator(
-		context.Background(),
-		instanceID,
-		[]*protos.HistoryEvent{
-			startedTurn,
-			helpers.NewExecutionStartedEvent("late-retry-replay", string(instanceID), nil, nil, nil, nil),
-			helpers.NewTaskScheduledEvent(0, "flaky", nil, nil, nil),
-			helpers.NewTaskFailedEvent(0, &protos.TaskFailureDetails{
-				ErrorType:    "TransientFailure",
-				ErrorMessage: "retry me",
-			}),
-			helpers.NewTimerCreatedEvent(1, fireAt),
-			lateTurn,
-			helpers.NewTimerFiredEvent(1, fireAt, nil),
-			helpers.NewTaskScheduledEvent(2, "flaky", nil, nil, nil),
-		},
-		nil,
-	)
+	committed := []*protos.HistoryEvent{
+		startedTurn,
+		helpers.NewExecutionStartedEvent("stable-retry", string(instanceIDStableRetry), nil, nil, nil, nil),
+		helpers.NewTaskScheduledEvent(0, "flaky", nil, nil, nil),
+	}
+	delivered := []*protos.HistoryEvent{
+		failureTurn,
+		helpers.NewTaskFailedEvent(0, &protos.TaskFailureDetails{
+			ErrorType:    "TransientFailure",
+			ErrorMessage: "retry me",
+		}),
+	}
+	executor := NewTaskExecutor(registry)
+
+	// First delivery: the failure arrives as a new event.
+	first, err := executor.ExecuteOrchestrator(
+		context.Background(), instanceIDStableRetry, committed, delivered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Response.Actions) != 0 {
-		t.Fatalf("replay emitted actions for recorded late retry: %v", result.Response.Actions)
+	// Redelivery after a lost response: the identical failure is now replayed
+	// history, so IsReplaying flips while the decision must not.
+	second, err := executor.ExecuteOrchestrator(
+		context.Background(), instanceIDStableRetry, append(committed, delivered...), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	firstTimer := singleRetryTimer(t, first.Response)
+	secondTimer := singleRetryTimer(t, second.Response)
+	if !firstTimer.GetFireAt().AsTime().Equal(secondTimer.GetFireAt().AsTime()) {
+		t.Fatalf("retry timer moved across redelivery: %v then %v",
+			firstTimer.GetFireAt().AsTime(), secondTimer.GetFireAt().AsTime())
+	}
+}
+
+const instanceIDStableRetry = api.InstanceID("stable-retry-instance")
+
+func singleRetryTimer(t *testing.T, response *protos.OrchestratorResponse) *protos.CreateTimerAction {
+	t.Helper()
+	var timer *protos.CreateTimerAction
+	for _, action := range response.GetActions() {
+		if created := action.GetCreateTimer(); created != nil {
+			if timer != nil {
+				t.Fatal("more than one retry timer action")
+			}
+			timer = created
+		}
+	}
+	if timer == nil {
+		t.Fatalf("no retry timer action in %v", response.GetActions())
+	}
+	return timer
 }

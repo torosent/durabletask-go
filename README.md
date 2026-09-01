@@ -305,7 +305,9 @@ if errors.As(err, &failed) {
 
 Retry handlers receive deterministic failure data and run during orchestration replay, so handlers must not
 perform I/O or depend on wall-clock time. Retry options snapshot the supplied policy when the option is created;
-validation does not mutate caller-owned policies, and retries that would begin after `RetryTimeout` are not scheduled.
+validation does not mutate caller-owned policies. A backoff that would carry the next attempt past `RetryTimeout`
+stops the retries rather than scheduling that timer, and because the decision is made on the failure event it is
+stable across replay and work-item redelivery.
 
 `OrchestrationContext.Context()` is intentionally isolated from the worker's host context. It contains only persisted
 orchestration identity and context fields—never host values, deadlines, or cancellation. Use durable timers and task

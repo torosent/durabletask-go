@@ -65,36 +65,33 @@ type RetryContext struct {
 	TotalRetryTime time.Duration
 }
 
-func normalizeRetryPolicy(policy RetryPolicy) (RetryPolicy, error) {
-	if policy.InitialRetryInterval <= 0 {
-		return RetryPolicy{}, fmt.Errorf("%w: InitialRetryInterval must be greater than 0", api.ErrInvalidArgument)
-	}
-	if policy.MaxAttempts <= 0 {
-		// setting 1 max attempt is equivalent to not retrying
-		policy.MaxAttempts = 1
-	}
-	if policy.BackoffCoefficient <= 0 {
-		policy.BackoffCoefficient = 1
-	}
-	if policy.MaxRetryInterval <= 0 {
-		policy.MaxRetryInterval = math.MaxInt64
-	}
-	if policy.RetryTimeout <= 0 {
-		policy.RetryTimeout = math.MaxInt64
-	}
-	if policy.Handle == nil {
-		policy.Handle = func(RetryContext) bool { return true }
-	}
-	return policy, nil
-}
-
 // Normalized validates the retry policy and returns an independent copy with
 // default values applied. The receiver is not modified.
 func (policy *RetryPolicy) Normalized() (RetryPolicy, error) {
 	if policy == nil {
 		return RetryPolicy{}, fmt.Errorf("%w: retry policy cannot be nil", api.ErrInvalidArgument)
 	}
-	return normalizeRetryPolicy(*policy)
+	normalized := *policy
+	if normalized.InitialRetryInterval <= 0 {
+		return RetryPolicy{}, fmt.Errorf("%w: InitialRetryInterval must be greater than 0", api.ErrInvalidArgument)
+	}
+	if normalized.MaxAttempts <= 0 {
+		// setting 1 max attempt is equivalent to not retrying
+		normalized.MaxAttempts = 1
+	}
+	if normalized.BackoffCoefficient <= 0 {
+		normalized.BackoffCoefficient = 1
+	}
+	if normalized.MaxRetryInterval <= 0 {
+		normalized.MaxRetryInterval = math.MaxInt64
+	}
+	if normalized.RetryTimeout <= 0 {
+		normalized.RetryTimeout = math.MaxInt64
+	}
+	if normalized.Handle == nil {
+		normalized.Handle = func(RetryContext) bool { return true }
+	}
+	return normalized, nil
 }
 
 // Validate reports whether the retry policy is valid without modifying it.
@@ -144,7 +141,7 @@ func WithActivityRetryPolicy(policy *RetryPolicy) CallActivityOption {
 	}
 	snapshot := *policy
 	return func(opt *callActivityOptions, _ api.DataConverter) error {
-		normalized, err := normalizeRetryPolicy(snapshot)
+		normalized, err := snapshot.Normalized()
 		if err != nil {
 			return err
 		}

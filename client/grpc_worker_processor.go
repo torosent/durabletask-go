@@ -308,19 +308,16 @@ func failOversizedOrchestratorResponse(
 	if responseSize <= maxBytes {
 		return response
 	}
+	boundMiB := float64(maxBytes) / (1024 * 1024)
 	message := fmt.Sprintf(
 		"orchestrator response with %d actions exceeds the %.2f MiB worker completion bound: %.2f MiB; reduce per-turn fan-out or configure large-payload externalization for action payloads",
-		len(response.Actions),
-		float64(maxBytes)/(1024*1024),
-		float64(responseSize)/(1024*1024),
+		len(response.Actions), boundMiB, float64(responseSize)/(1024*1024),
 	)
 	for _, action := range response.Actions {
 		if actionSize := proto.Size(action); actionSize > maxBytes {
 			message = fmt.Sprintf(
 				"orchestrator action %d exceeds the %.2f MiB worker completion bound: %.2f MiB; configure large-payload externalization for oversized action payloads",
-				action.GetId(),
-				float64(maxBytes)/(1024*1024),
-				float64(actionSize)/(1024*1024),
+				action.GetId(), boundMiB, float64(actionSize)/(1024*1024),
 			)
 			break
 		}
