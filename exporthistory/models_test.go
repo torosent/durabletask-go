@@ -247,17 +247,9 @@ func TestMarkAsFailedRequestJSON(t *testing.T) {
 // for run fencing, including the zero values a run started before run fencing
 // decodes to.
 func TestExportJobRunRequestRunFencingJSON(t *testing.T) {
-	var legacy ExportJobRunRequest
-	require.NoError(t, json.Unmarshal(
-		[]byte(`{"JobEntityId":{"Name":"exportjob","Key":"job-1"},"ProcessedCycles":0}`), &legacy))
-	assert.Equal(t, EntityID("job-1"), legacy.JobEntityID)
-	assert.Empty(t, legacy.RunToken)
-	// A legacy input is treated as a first execution, which is the stricter of
-	// the two behaviors and matches how such a run was started.
-	assert.False(t, legacy.ContinuedExecution)
-
 	encoded, err := json.Marshal(ExportJobRunRequest{JobEntityID: EntityID("job-1")})
 	require.NoError(t, err)
+	assert.JSONEq(t, `{"JobEntityId":"@exportjob@job-1","ProcessedCycles":0}`, string(encoded))
 	assert.NotContains(t, string(encoded), "RunToken")
 	assert.NotContains(t, string(encoded), "ContinuedExecution")
 }

@@ -17,6 +17,8 @@ const (
 	versionMismatchErrorType          = api.ErrorTypeVersionMismatch
 )
 
+var errEntitiesUnsupported = errors.New("durable entities are not supported by the current backend configuration")
+
 // TaskFailedError is returned when an activity or sub-orchestration fails.
 type TaskFailedError struct {
 	TaskName       string
@@ -187,6 +189,18 @@ type workItemAbandonDelayProvider interface {
 	WorkItemAbandonDelay() time.Duration
 }
 
+type unsupportedEntityParametersError struct {
+	message string
+}
+
+func (e *unsupportedEntityParametersError) Error() string {
+	return e.message
+}
+
+func (*unsupportedEntityParametersError) WorkItemAbandonDelay() time.Duration {
+	return time.Second
+}
+
 var _ error = (*TaskFailedError)(nil)
 var _ error = (*EntityOperationFailedError)(nil)
 var _ api.DurableTaskErrorTypeProvider = (*TaskFailedError)(nil)
@@ -199,5 +213,6 @@ var _ api.DurableTaskErrorTypeProvider = (*taskNotRegisteredError)(nil)
 var _ api.NonRetriable = (*taskNotRegisteredError)(nil)
 var _ workItemAbandonDelayProvider = (*taskNotRegisteredError)(nil)
 var _ workItemAbandonDelayProvider = (*VersionMismatchError)(nil)
+var _ workItemAbandonDelayProvider = (*unsupportedEntityParametersError)(nil)
 var _ api.DurableTaskErrorTypeProvider = (*panicFailureError)(nil)
 var _ api.DurableTaskStackTraceProvider = (*panicFailureError)(nil)

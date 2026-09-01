@@ -11,6 +11,10 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+func presentEntityPayload(value string) entityPayload {
+	return entityPayload{value: []byte(value), present: true}
+}
+
 func Test_EntityContext_State(t *testing.T) {
 	t.Run("no state initially", func(t *testing.T) {
 		ctx := &EntityContext{
@@ -45,6 +49,15 @@ func Test_EntityContext_State(t *testing.T) {
 		assert.False(t, ctx.HasState())
 	})
 
+	t.Run("delete state with typed nil", func(t *testing.T) {
+		ctx := &EntityContext{
+			state: entityState{value: []byte("42"), hasValue: true},
+		}
+		var state *int
+		require.NoError(t, ctx.SetState(state))
+		assert.False(t, ctx.HasState())
+	})
+
 	t.Run("set struct state", func(t *testing.T) {
 		type MyState struct {
 			Count int    `json:"count"`
@@ -68,12 +81,17 @@ func Test_EntityContext_GetInput(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("test", "key1"),
 		Operation: "op",
-		rawInput:  []byte(`"hello"`),
+		rawInput:  presentEntityPayload(`"hello"`),
 	}
 
 	var input string
 	require.NoError(t, ctx.GetInput(&input))
 	assert.Equal(t, "hello", input)
+
+	require.Error(t, (&EntityContext{}).GetInput(&input))
+	require.Error(t, (&EntityContext{
+		rawInput: presentEntityPayload(""),
+	}).GetInput(&input))
 }
 
 func Test_EntityContext_RawState(t *testing.T) {
@@ -111,6 +129,30 @@ func Test_EntityContext_SignalEntity(t *testing.T) {
 	assert.Equal(t, "5", signal.Input.GetValue())
 	assert.Equal(t, parentTrace, signal.ParentTraceContext)
 	assert.NotSame(t, parentTrace, signal.ParentTraceContext)
+}
+
+func Test_EntityContext_TypedNilSignalInputIsAbsent(t *testing.T) {
+	ctx := &EntityContext{}
+	var input *int
+	require.NoError(t, ctx.SignalEntity(api.NewEntityID("other", "key"), "operation", input))
+	require.Len(t, ctx.actions, 1)
+	require.Nil(t, ctx.actions[0].GetSendSignal().Input)
+}
+
+func Test_EntityTypedNilOptionsAreAbsent(t *testing.T) {
+	var input *int
+
+	callOptions := new(callEntityOptions)
+	require.NoError(t, WithEntityInput(input)(callOptions, api.DefaultDataConverter()))
+	require.Nil(t, callOptions.rawInput)
+
+	signalOptions := new(signalEntityOptions)
+	require.NoError(t, WithSignalEntityInput(input)(signalOptions, api.DefaultDataConverter()))
+	require.Nil(t, signalOptions.rawInput)
+
+	startOptions := new(entityStartOrchestrationOptions)
+	require.NoError(t, WithEntityStartOrchestrationInput(input)(startOptions, api.DefaultDataConverter()))
+	require.Nil(t, startOptions.rawInput)
 }
 
 func Test_EntityContext_SignalEntity_RejectsInvalidEntityID(t *testing.T) {

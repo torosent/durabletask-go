@@ -122,7 +122,7 @@ func TestMissingOrchestratorRejectsWorkItem(t *testing.T) {
 		helpers.NewExecutionStartedEvent("missing", "instance", nil, nil, nil, nil),
 	}
 
-	_, err := executor.ExecuteOrchestrator(context.Background(), "instance", nil, events)
+	_, err := executor.ExecuteOrchestrator(context.Background(), "instance", nil, events, nil)
 	if !errors.Is(err, api.ErrTaskNotRegistered) {
 		t.Fatalf("ExecuteOrchestrator() error = %v", err)
 	}
@@ -134,7 +134,7 @@ func TestMissingOrchestratorFailsByDefault(t *testing.T) {
 		helpers.NewExecutionStartedEvent("missing", "instance", nil, nil, nil, nil),
 	}
 
-	result, err := executor.ExecuteOrchestrator(context.Background(), "instance", nil, events)
+	result, err := executor.ExecuteOrchestrator(context.Background(), "instance", nil, events, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

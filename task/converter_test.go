@@ -76,8 +76,8 @@ func TestDataConverterCoversOrchestrationActivityEventsAndContinueAsNew(t *testi
 			nil,
 			nil,
 			nil,
-		)},
-	)
+		)}, nil)
+
 	require.NoError(t, err)
 	requireConvertedValue(t, converter, result.Response.CustomStatus.GetValue(), 2)
 	for _, action := range result.Response.Actions {
@@ -101,8 +101,8 @@ func TestDataConverterCoversOrchestrationActivityEventsAndContinueAsNew(t *testi
 			nil,
 			nil,
 			nil,
-		)},
-	)
+		)}, nil)
+
 	require.NoError(t, err)
 	requireConvertedValue(t, converter, completionAction(t, result.Response).GetResult().GetValue(), 11)
 
@@ -114,8 +114,8 @@ func TestDataConverterCoversOrchestrationActivityEventsAndContinueAsNew(t *testi
 		[]*protos.HistoryEvent{
 			helpers.NewExecutionStartedEvent("event", "event-instance", nil, nil, nil, nil),
 			helpers.NewEventRaisedEvent("signal", wrapperspb.String(eventPayload)),
-		},
-	)
+		}, nil)
+
 	require.NoError(t, err)
 	requireConvertedValue(t, converter, completionAction(t, result.Response).GetResult().GetValue(), 20)
 }

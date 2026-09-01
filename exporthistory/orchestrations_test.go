@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -72,7 +73,13 @@ func newOrchestrationDriver(
 // history.
 func (d *orchestrationDriver) turn() {
 	d.t.Helper()
-	results, err := d.executor.ExecuteOrchestrator(context.Background(), d.instanceID, d.oldEvents, d.newEvents)
+	results, err := d.executor.ExecuteOrchestrator(
+		context.Background(),
+		d.instanceID,
+		d.oldEvents,
+		d.newEvents,
+		&protos.OrchestratorEntityParameters{EntityMessageReorderWindow: durationpb.New(0)},
+	)
 	require.NoError(d.t, err)
 
 	history := append(append([]*protos.HistoryEvent{}, d.oldEvents...), d.newEvents...)

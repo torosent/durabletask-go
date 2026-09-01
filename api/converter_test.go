@@ -76,6 +76,13 @@ func TestPayloadOptionsUseConfiguredConverterAndRawOptionsBypassIt(t *testing.T)
 	require.Empty(t, failing.serialized)
 }
 
+func TestEntityTypedNilInputIsAbsent(t *testing.T) {
+	var input *int
+	request := new(protos.SignalEntityRequest)
+	require.NoError(t, WithSignalInput(input)(request, DefaultDataConverter()))
+	require.Nil(t, request.Input)
+}
+
 func TestMetadataUsesConfiguredConverter(t *testing.T) {
 	converter := new(recordingConverter)
 	metadata := &OrchestrationMetadata{
@@ -92,7 +99,12 @@ func TestMetadataUsesConfiguredConverter(t *testing.T) {
 	require.NoError(t, metadata.ReadCustomStatus(&value))
 	require.Equal(t, "status", value)
 
-	entity := &EntityMetadata{SerializedState: "state", Converter: converter}
+	entity := &EntityMetadata{
+		StateIncluded:   true,
+		HasState:        true,
+		SerializedState: "state",
+		Converter:       converter,
+	}
 	require.NoError(t, entity.ReadState(&value))
 	require.Equal(t, "state", value)
 	require.Equal(t, []string{"input", "output", "status", "state"}, converter.deserialized)

@@ -73,7 +73,7 @@ func TestOrchestrationContextPropagatesOnlyPersistedIdentityAndFields(t *testing
 
 	run := func(workerField string) string {
 		executor := NewTaskExecutor(registry, WithContextFields(api.ContextFields{"worker": workerField}))
-		result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events)
+		result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,8 +253,8 @@ func TestOrchestrationContextExcludesHostContextState(t *testing.T) {
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("isolated-context", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}

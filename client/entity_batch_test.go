@@ -10,9 +10,9 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func TestEntityBatchFromRequestV2OmitsMissingParentDestination(t *testing.T) {
+func TestEntityBatchFromRequestV2RejectsMissingParentDestination(t *testing.T) {
 	requestID := uuid.NewString()
-	batch, infos, err := entityBatchFromRequestV2(&protos.EntityRequest{
+	_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{
 		InstanceId: "@counter@key",
 		OperationRequests: []*protos.HistoryEvent{{
 			EventType: &protos.HistoryEvent_EntityOperationCalled{
@@ -23,10 +23,7 @@ func TestEntityBatchFromRequestV2OmitsMissingParentDestination(t *testing.T) {
 			},
 		}},
 	})
-	require.NoError(t, err)
-	require.Len(t, batch.Operations, 1)
-	require.Len(t, infos, 1)
-	require.Nil(t, infos[0].ResponseDestination)
+	require.ErrorContains(t, err, "missing its response destination")
 }
 
 func TestEntityBatchFromRequestV2Validation(t *testing.T) {
@@ -76,6 +73,18 @@ func TestEntityBatchFromRequestV2Validation(t *testing.T) {
 			}},
 		})
 		require.ErrorContains(t, err, "invalid entity call request ID")
+	})
+
+	t.Run("unsupported-history-event", func(t *testing.T) {
+		_, _, err := entityBatchFromRequestV2(&protos.EntityRequest{
+			InstanceId: "@counter@key",
+			OperationRequests: []*protos.HistoryEvent{{
+				EventType: &protos.HistoryEvent_TimerCreated{
+					TimerCreated: &protos.TimerCreatedEvent{},
+				},
+			}},
+		})
+		require.ErrorContains(t, err, "unsupported entity operation history event")
 	})
 }
 

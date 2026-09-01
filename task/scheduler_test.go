@@ -52,8 +52,8 @@ func TestCoroutineSchedulerRunsReadyCoroutinesInIDOrder(t *testing.T) {
 		context.Background(),
 		instanceID,
 		nil,
-		[]*protos.HistoryEvent{started, executionStarted},
-	)
+		[]*protos.HistoryEvent{started, executionStarted}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestCoroutineSchedulerRunsReadyCoroutinesInIDOrder(t *testing.T) {
 		helpers.NewTaskCompletedEvent(0, wrapperspb.String(`"one"`)),
 		helpers.NewTaskCompletedEvent(1, wrapperspb.String(`"two"`)),
 	}
-	secondTurn, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, newEvents)
+	secondTurn, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, newEvents, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,8 +134,8 @@ func TestCoroutineSchedulerUsesHistoryCompletionOrder(t *testing.T) {
 		context.Background(),
 		instanceID,
 		oldEvents,
-		newEvents,
-	)
+		newEvents, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +165,8 @@ func TestCoroutinePanicFailsOrchestration(t *testing.T) {
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("panic", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestCoroutineReplayIsByteDeterministic(t *testing.T) {
 
 	var expected []byte
 	for i := 0; i < 100; i++ {
-		result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events)
+		result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +272,7 @@ func TestCoroutineSchedulerDoesNotLeakAcrossTurns(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	for i := 0; i < 10_000; i++ {
-		if _, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events); err != nil {
+		if _, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

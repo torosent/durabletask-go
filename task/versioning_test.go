@@ -65,8 +65,8 @@ func TestVersionMismatchRejectsOrchestration(t *testing.T) {
 				nil,
 				wrapperspb.String("2.0"),
 			),
-		},
-	)
+		}, nil)
+
 	var mismatch *VersionMismatchError
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("error = %v, want VersionMismatchError", err)
@@ -95,8 +95,8 @@ func TestVersionMismatchFailsOrchestration(t *testing.T) {
 				nil,
 				wrapperspb.String("2.0"),
 			),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,8 +167,8 @@ func TestVersionedRegistryDispatchAndSchedulingDefaults(t *testing.T) {
 				nil,
 				wrapperspb.String("v1"),
 			),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +216,8 @@ func TestAllowedUnversionedSystemOrchestratorBypassesStrictVersionMatch(t *testi
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewExecutionStartedEvent("system", "system-instance", nil, nil, nil, nil, wrapperspb.String("")),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,8 +284,8 @@ func TestSubOrchestrationOptionsAddTagsAndContextFields(t *testing.T) {
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,8 +319,8 @@ func TestActivityTagsOverrideOrchestrationTagsAndAreCloned(t *testing.T) {
 		context.Background(),
 		"parent-instance",
 		nil,
-		[]*protos.HistoryEvent{started},
-	)
+		[]*protos.HistoryEvent{started}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,8 +395,8 @@ func TestContinueAsNewCarriesTagsAndNextVersion(t *testing.T) {
 		context.Background(),
 		"eternal-instance",
 		nil,
-		[]*protos.HistoryEvent{started},
-	)
+		[]*protos.HistoryEvent{started}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,8 +439,8 @@ func TestExplicitUnversionedSchedulingOverridesDefaults(t *testing.T) {
 			nil,
 			nil,
 			wrapperspb.String("v1"),
-		)},
-	)
+		)}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestVersionedReplayAcceptsLegacyUnversionedChildHistory(t *testing.T) {
 		helpers.NewSubOrchestrationCreatedEvent(1, "child", nil, nil, "child-instance", nil),
 	}
 
-	if _, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, nil); err != nil {
+	if _, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, nil, nil); err != nil {
 		t.Fatalf("legacy unversioned child history failed replay: %v", err)
 	}
 }

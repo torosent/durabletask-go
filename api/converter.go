@@ -27,7 +27,7 @@ func (JSONDataConverter) Serialize(value any) (string, error) {
 }
 
 func (JSONDataConverter) Deserialize(payload string, target any) error {
-	if target == nil || payload == "" {
+	if target == nil {
 		return nil
 	}
 	if err := json.Unmarshal([]byte(payload), target); err != nil {

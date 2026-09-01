@@ -278,6 +278,85 @@ func Test_Executor_EntityPanic(t *testing.T) {
 	assert.Contains(t, result.Results[0].GetFailure().GetFailureDetails().GetErrorMessage(), "oh no!")
 }
 
+type reflectedPanickyEntity struct{}
+
+func (*reflectedPanickyEntity) Explode() {
+	panic("reflected boom")
+}
+
+func Test_Executor_ReflectedEntityPanicPreservesClassificationAndStack(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddEntityN("panicky", task.NewEntityFor[reflectedPanickyEntity]()))
+
+	result, err := newEntityExecutor(registry).ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
+		InstanceId: "@panicky@key",
+		Operations: []*protos.OperationRequest{{Operation: "Explode"}},
+	})
+	require.NoError(t, err)
+	failure := result.Results[0].GetFailure().GetFailureDetails()
+	require.Equal(t, "EntityOperationPanic", failure.ErrorType)
+	require.Contains(t, failure.ErrorMessage, "reflected boom")
+	require.Contains(t, failure.GetStackTrace().GetValue(), "reflectedPanickyEntity).Explode")
+}
+
+func Test_Executor_EntityConversionFailuresStayPerOperation(t *testing.T) {
+	t.Run("malformed state", func(t *testing.T) {
+		registry := task.NewTaskRegistry()
+		require.NoError(t, registry.AddEntityN("counter", func(ctx *task.EntityContext) (any, error) {
+			var state int
+			if err := ctx.GetState(&state); err != nil {
+				return nil, err
+			}
+			return state, nil
+		}))
+		result, err := newEntityExecutor(registry).ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
+			InstanceId:  "@counter@key",
+			EntityState: wrapperspb.String("not-json"),
+			Operations:  []*protos.OperationRequest{{Operation: "get"}},
+		})
+		require.NoError(t, err)
+		require.Nil(t, result.FailureDetails)
+		require.NotNil(t, result.Results[0].GetFailure())
+		require.Equal(t, "not-json", result.EntityState.GetValue())
+	})
+
+	t.Run("result serialization", func(t *testing.T) {
+		registry := task.NewTaskRegistry()
+		require.NoError(t, registry.AddEntityN("counter", func(ctx *task.EntityContext) (any, error) {
+			if ctx.Operation == "bad" {
+				return make(chan int), nil
+			}
+			return 1, nil
+		}))
+		result, err := newEntityExecutor(registry).ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
+			InstanceId: "@counter@key",
+			Operations: []*protos.OperationRequest{
+				{Operation: "bad"},
+				{Operation: "good"},
+			},
+		})
+		require.NoError(t, err)
+		require.Nil(t, result.FailureDetails)
+		require.NotNil(t, result.Results[0].GetFailure())
+		require.Equal(t, "1", result.Results[1].GetSuccess().GetResult().GetValue())
+	})
+
+	t.Run("typed nil result", func(t *testing.T) {
+		registry := task.NewTaskRegistry()
+		require.NoError(t, registry.AddEntityN("counter", func(*task.EntityContext) (any, error) {
+			var result *int
+			return result, nil
+		}))
+		result, err := newEntityExecutor(registry).ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
+			InstanceId: "@counter@key",
+			Operations: []*protos.OperationRequest{{Operation: "get"}},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result.Results[0].GetSuccess())
+		require.Nil(t, result.Results[0].GetSuccess().Result)
+	})
+}
+
 func Test_Executor_EntityNotRegistered(t *testing.T) {
 	r := task.NewTaskRegistry()
 	executor := newEntityExecutor(r)

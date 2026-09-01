@@ -31,8 +31,8 @@ func TestSetCustomStatusStoresRawStringVerbatim(t *testing.T) {
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("raw-status", "raw-status-instance", nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	require.NoError(t, err)
 	require.Equal(t, `{"stage":"halfway"}`, results.Response.GetCustomStatus().GetValue())
 }
@@ -54,8 +54,8 @@ func TestSetCustomStatusValueSerializesWithConverter(t *testing.T) {
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("typed-status", "typed-status-instance", nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	require.NoError(t, err)
 	require.JSONEq(t, `{"stage":"halfway"}`, results.Response.GetCustomStatus().GetValue())
 }
@@ -105,8 +105,8 @@ func TestSubOrchestratorInputOptionsProduceExpectedWireInput(t *testing.T) {
 				[]*protos.HistoryEvent{
 					helpers.NewOrchestratorStartedEvent(),
 					helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil),
-				},
-			)
+				}, nil)
+
 			require.NoError(t, err)
 			created := createSubOrchestrationAction(results.Response.Actions)
 			require.NotNil(t, created)
@@ -136,8 +136,8 @@ func TestWithSubOrchestratorInputReportsSerializationFailure(t *testing.T) {
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("parent", "parent-instance", nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	require.NoError(t, err)
 	require.Error(t, awaitErr)
 	require.ErrorContains(t, awaitErr, "failed to serialize input")
@@ -182,8 +182,8 @@ func TestRawAndTypedCustomStatusDifferForStringValues(t *testing.T) {
 			[]*protos.HistoryEvent{
 				helpers.NewOrchestratorStartedEvent(),
 				helpers.NewExecutionStartedEvent(name, name+"-instance", nil, nil, nil, nil),
-			},
-		)
+			}, nil)
+
 		require.NoError(t, err)
 		return results.Response.GetCustomStatus().GetValue()
 	}

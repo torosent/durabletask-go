@@ -38,7 +38,7 @@ type TaskRegistry struct {
 	mu            sync.RWMutex
 	orchestrators map[taskVersionKey]taskRegistration[Orchestrator]
 	activities    map[taskVersionKey]taskRegistration[Activity]
-	entities      map[string]Entity
+	entities      map[string]EntityFactory
 }
 
 // NewTaskRegistry returns a new [TaskRegistry] struct.
@@ -46,7 +46,7 @@ func NewTaskRegistry() *TaskRegistry {
 	return &TaskRegistry{
 		orchestrators: make(map[taskVersionKey]taskRegistration[Orchestrator]),
 		activities:    make(map[taskVersionKey]taskRegistration[Activity]),
-		entities:      make(map[string]Entity),
+		entities:      make(map[string]EntityFactory),
 	}
 }
 
@@ -123,10 +123,29 @@ func (r *TaskRegistry) AddEntity(e Entity) error {
 	return r.AddEntityN(helpers.GetTaskFunctionName(e), e)
 }
 
-// AddEntityN adds an entity function to the registry with a specified name.
+// AddEntityN adds a shared entity function with a specified name. The function
+// can be invoked concurrently by different entity batches and must be thread-safe.
 func (r *TaskRegistry) AddEntityN(name string, e Entity) error {
 	if e == nil {
 		return fmt.Errorf("entity function must not be nil")
+	}
+	return r.AddEntityFactoryN(name, func(EntityFactoryContext) (EntityBatch, error) {
+		return EntityBatch{Entity: e}, nil
+	})
+}
+
+// AddEntityFactory adds an entity factory whose name is determined using reflection.
+func (r *TaskRegistry) AddEntityFactory(factory EntityFactory) error {
+	if factory == nil {
+		return fmt.Errorf("entity factory must not be nil")
+	}
+	return r.AddEntityFactoryN(helpers.GetTaskFunctionName(factory), factory)
+}
+
+// AddEntityFactoryN adds a named factory that creates one entity implementation per batch.
+func (r *TaskRegistry) AddEntityFactoryN(name string, factory EntityFactory) error {
+	if factory == nil {
+		return fmt.Errorf("entity factory must not be nil")
 	}
 	if name != "*" {
 		if err := helpers.ValidateEntityName(name); err != nil {
@@ -139,7 +158,7 @@ func (r *TaskRegistry) AddEntityN(name string, e Entity) error {
 	if _, ok := r.entities[name]; ok {
 		return fmt.Errorf("entity named '%s' is already registered", name)
 	}
-	r.entities[name] = e
+	r.entities[name] = factory
 	return nil
 }
 
@@ -160,17 +179,17 @@ func (r *TaskRegistry) hasOrchestrator(name, version string) bool {
 	return ok
 }
 
-func (r *TaskRegistry) getEntity(name string) (Entity, bool) {
+func (r *TaskRegistry) getEntityFactory(name string) (EntityFactory, bool) {
 	if name != "*" {
 		name = strings.ToLower(name)
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	entity, ok := r.entities[name]
+	factory, ok := r.entities[name]
 	if !ok {
-		entity, ok = r.entities["*"]
+		factory, ok = r.entities["*"]
 	}
-	return entity, ok
+	return factory, ok
 }
 
 // Snapshot returns a deterministic, immutable view of the registry.

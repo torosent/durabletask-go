@@ -42,7 +42,7 @@ func TestRetryObservabilityReportsNewRetryMetric(t *testing.T) {
 			ErrorMessage: "try again",
 		}),
 	}
-	result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, newEvents)
+	result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, oldEvents, newEvents, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +77,7 @@ func TestRetryMetricIsSuppressedDuringReplay(t *testing.T) {
 			metricCount++
 		},
 	})).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		[]*protos.HistoryEvent{
@@ -89,8 +90,8 @@ func TestRetryMetricIsSuppressedDuringReplay(t *testing.T) {
 			}),
 			helpers.NewTimerCreatedEvent(1, nil),
 		},
-		nil,
-	)
+		nil, nil)
+
 	if err != nil && !errors.Is(err, ErrTaskBlocked) {
 		t.Fatal(err)
 	}

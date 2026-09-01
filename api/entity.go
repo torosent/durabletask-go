@@ -1,7 +1,10 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -9,6 +12,13 @@ import (
 	"github.com/microsoft/durabletask-go/internal/protos"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+var (
+	// ErrEntityStateNotIncluded indicates that entity state was excluded from a metadata response.
+	ErrEntityStateNotIncluded = errors.New("entity state was not included")
+	// ErrEntityHasNoState indicates that an entity metadata response contains no application state.
+	ErrEntityHasNoState = errors.New("entity has no state")
 )
 
 // EntityID uniquely identifies an entity by its name and key.
@@ -30,6 +40,31 @@ func (e EntityID) String() string {
 	return fmt.Sprintf("@%s@%s", strings.ToLower(e.Name), e.Key)
 }
 
+// MarshalJSON serializes entity IDs using the cross-SDK compact instance ID format.
+func (e EntityID) MarshalJSON() ([]byte, error) {
+	if err := helpers.ValidateEntityName(e.Name); err != nil {
+		return nil, err
+	}
+	return json.Marshal(e.String())
+}
+
+// UnmarshalJSON parses an entity ID from the cross-SDK compact instance ID format.
+func (e *EntityID) UnmarshalJSON(data []byte) error {
+	if e == nil {
+		return fmt.Errorf("entity ID target must not be nil")
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("entity ID must be a compact string: %w", err)
+	}
+	parsed, err := EntityIDFromString(value)
+	if err != nil {
+		return err
+	}
+	*e = parsed
+	return nil
+}
+
 // EntityIDFromString parses an entity instance ID string in the format "@<name>@<key>".
 func EntityIDFromString(s string) (EntityID, error) {
 	name, key, err := helpers.ParseEntityInstanceID(s)
@@ -45,6 +80,8 @@ type EntityMetadata struct {
 	LastModifiedTime time.Time
 	BacklogQueueSize int32
 	LockedBy         string
+	StateIncluded    bool
+	HasState         bool
 	SerializedState  string
 	Converter        DataConverter `json:"-"`
 }
@@ -55,12 +92,29 @@ type SignalEntityOptions func(*protos.SignalEntityRequest, DataConverter) error
 // WithSignalInput configures the input for an entity signal.
 func WithSignalInput(input any) SignalEntityOptions {
 	return func(req *protos.SignalEntityRequest, converter DataConverter) error {
+		if isNilEntityValue(input) {
+			req.Input = nil
+			return nil
+		}
 		payload, err := SerializeData(converter, input)
 		if err != nil {
 			return err
 		}
 		req.Input = wrapperspb.String(payload)
 		return nil
+	}
+}
+
+func isNilEntityValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -82,7 +136,21 @@ func WithSignalScheduledTime(t time.Time) SignalEntityOptions {
 
 // ReadState deserializes entity state with the metadata converter.
 func (m *EntityMetadata) ReadState(target any) error {
-	return deserializePayload(m.Converter, m.SerializedState, target)
+	if !m.StateIncluded {
+		return ErrEntityStateNotIncluded
+	}
+	if !m.HasState {
+		return ErrEntityHasNoState
+	}
+	if target == nil {
+		return nil
+	}
+	return NormalizeDataConverter(m.Converter).Deserialize(m.SerializedState, target)
+}
+
+// GetEntityOptions controls an entity metadata request. The zero value includes state.
+type GetEntityOptions struct {
+	ExcludeState bool
 }
 
 // EntityQuery defines filter criteria for querying entities.
@@ -93,8 +161,8 @@ type EntityQuery struct {
 	LastModifiedFrom time.Time
 	// LastModifiedTo filters entities modified before this time.
 	LastModifiedTo time.Time
-	// IncludeState whether to include entity state in the results.
-	IncludeState bool
+	// ExcludeState omits entity state from the results. State is included by default.
+	ExcludeState bool
 	// IncludeTransient whether to include transient (stateless) entities.
 	IncludeTransient bool
 	// PageSize limits the number of entities returned per page.
@@ -109,14 +177,17 @@ type EntityQueryResults struct {
 	ContinuationToken string
 }
 
-// CleanEntityStorageRequest contains options for cleaning entity storage.
-type CleanEntityStorageRequest struct {
+// CleanEntityStorageOptions controls entity storage cleanup. The zero value
+// removes empty entities, releases orphaned locks, and continues to completion.
+type CleanEntityStorageOptions struct {
 	// ContinuationToken for resuming a previous cleanup operation.
 	ContinuationToken string
-	// RemoveEmptyEntities removes entities with no state and no locks.
-	RemoveEmptyEntities bool
-	// ReleaseOrphanedLocks releases locks held by non-running orchestrations.
-	ReleaseOrphanedLocks bool
+	// PreserveEmptyEntities disables removal of entities with no state and no locks.
+	PreserveEmptyEntities bool
+	// PreserveOrphanedLocks disables release of locks held by non-running orchestrations.
+	PreserveOrphanedLocks bool
+	// SinglePage returns after one backend cleanup request.
+	SinglePage bool
 }
 
 // CleanEntityStorageResult contains the results of a cleanup operation.

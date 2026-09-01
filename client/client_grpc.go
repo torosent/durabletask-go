@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -318,12 +319,20 @@ func (c *TaskHubGrpcClient) SignalEntity(ctx context.Context, entityID api.Entit
 	return nil
 }
 
-// FetchEntityMetadata retrieves metadata for an entity instance.
-// api.ErrInstanceNotFound is returned when the entity doesn't exist.
-func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error) {
+// GetEntity retrieves metadata for an entity instance or returns nil when it doesn't exist.
+// State is included unless ExcludeState is set.
+func (c *TaskHubGrpcClient) GetEntity(
+	ctx context.Context,
+	entityID api.EntityID,
+	options ...api.GetEntityOptions,
+) (*api.EntityMetadata, error) {
 	if err := helpers.ValidateEntityName(entityID.Name); err != nil {
 		return nil, api.WrapInvalidArgument(err)
 	}
+	if len(options) > 1 {
+		return nil, api.WrapInvalidArgument(errors.New("at most one entity metadata options value may be supplied"))
+	}
+	includeState := len(options) == 0 || !options[0].ExcludeState
 	response, err := c.client.GetEntity(ctx, &protos.GetEntityRequest{
 		InstanceId:   entityID.String(),
 		IncludeState: includeState,
@@ -332,19 +341,25 @@ func (c *TaskHubGrpcClient) FetchEntityMetadata(ctx context.Context, entityID ap
 		return nil, clientRPCError(ctx, "failed to get entity metadata", err)
 	}
 	if !response.Exists || response.Entity == nil {
-		return nil, api.ErrInstanceNotFound
+		return nil, nil
 	}
-	return entityMetadataFromProto(ctx, c.largePayloads, c.converter, response.Entity)
+	return entityMetadataFromProto(ctx, c.largePayloads, c.converter, response.Entity, includeState)
 }
 
 // QueryEntities queries entities matching the supplied filters.
 func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error) {
+	if query.PageSize < 0 {
+		return nil, api.WrapInvalidArgument(errors.New("entity query page size must not be negative"))
+	}
+	if err := api.ValidateTimeRange(query.LastModifiedFrom, query.LastModifiedTo); err != nil {
+		return nil, err
+	}
 	protoQuery := &protos.EntityQuery{
-		IncludeState:     query.IncludeState,
+		IncludeState:     !query.ExcludeState,
 		IncludeTransient: query.IncludeTransient,
 	}
 	if query.InstanceIDStartsWith != "" {
-		protoQuery.InstanceIdStartsWith = wrapperspb.String(query.InstanceIDStartsWith)
+		protoQuery.InstanceIdStartsWith = wrapperspb.String(normalizeEntityQueryPrefix(query.InstanceIDStartsWith))
 	}
 	if !query.LastModifiedFrom.IsZero() {
 		protoQuery.LastModifiedFrom = timestamppb.New(query.LastModifiedFrom)
@@ -367,7 +382,13 @@ func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQ
 		ContinuationToken: response.ContinuationToken.GetValue(),
 	}
 	for _, entity := range response.Entities {
-		metadata, err := entityMetadataFromProto(ctx, c.largePayloads, c.converter, entity)
+		metadata, err := entityMetadataFromProto(
+			ctx,
+			c.largePayloads,
+			c.converter,
+			entity,
+			!query.ExcludeState,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -377,23 +398,47 @@ func (c *TaskHubGrpcClient) QueryEntities(ctx context.Context, query api.EntityQ
 }
 
 // CleanEntityStorage removes empty entities and releases orphaned locks.
-func (c *TaskHubGrpcClient) CleanEntityStorage(ctx context.Context, request api.CleanEntityStorageRequest) (*api.CleanEntityStorageResult, error) {
-	protoRequest := &protos.CleanEntityStorageRequest{
-		RemoveEmptyEntities:  request.RemoveEmptyEntities,
-		ReleaseOrphanedLocks: request.ReleaseOrphanedLocks,
+func (c *TaskHubGrpcClient) CleanEntityStorage(
+	ctx context.Context,
+	options ...api.CleanEntityStorageOptions,
+) (*api.CleanEntityStorageResult, error) {
+	if len(options) > 1 {
+		return nil, api.WrapInvalidArgument(errors.New("at most one entity cleanup options value may be supplied"))
 	}
-	if request.ContinuationToken != "" {
-		protoRequest.ContinuationToken = wrapperspb.String(request.ContinuationToken)
+	var option api.CleanEntityStorageOptions
+	if len(options) == 1 {
+		option = options[0]
 	}
-	response, err := c.client.CleanEntityStorage(ctx, protoRequest)
-	if err != nil {
-		return nil, clientRPCError(ctx, "failed to clean entity storage", err)
+	result := new(api.CleanEntityStorageResult)
+	continuationToken := option.ContinuationToken
+	seenTokens := make(map[string]struct{})
+	if continuationToken != "" {
+		seenTokens[continuationToken] = struct{}{}
 	}
-	return &api.CleanEntityStorageResult{
-		ContinuationToken:     response.ContinuationToken.GetValue(),
-		EmptyEntitiesRemoved:  response.EmptyEntitiesRemoved,
-		OrphanedLocksReleased: response.OrphanedLocksReleased,
-	}, nil
+	for {
+		request := &protos.CleanEntityStorageRequest{
+			RemoveEmptyEntities:  !option.PreserveEmptyEntities,
+			ReleaseOrphanedLocks: !option.PreserveOrphanedLocks,
+		}
+		if continuationToken != "" {
+			request.ContinuationToken = wrapperspb.String(continuationToken)
+		}
+		response, err := c.client.CleanEntityStorage(ctx, request)
+		if err != nil {
+			return nil, clientRPCError(ctx, "failed to clean entity storage", err)
+		}
+		result.EmptyEntitiesRemoved += response.EmptyEntitiesRemoved
+		result.OrphanedLocksReleased += response.OrphanedLocksReleased
+		result.ContinuationToken = response.ContinuationToken.GetValue()
+		if option.SinglePage || result.ContinuationToken == "" {
+			return result, nil
+		}
+		if _, duplicate := seenTokens[result.ContinuationToken]; duplicate {
+			return nil, fmt.Errorf("entity cleanup returned repeated continuation token %q", result.ContinuationToken)
+		}
+		seenTokens[result.ContinuationToken] = struct{}{}
+		continuationToken = result.ContinuationToken
+	}
 }
 
 func entityMetadataFromProto(
@@ -401,6 +446,7 @@ func entityMetadataFromProto(
 	options *api.LargePayloadOptions,
 	converter api.DataConverter,
 	entity *protos.EntityMetadata,
+	includeState bool,
 ) (*api.EntityMetadata, error) {
 	if entity == nil {
 		return nil, fmt.Errorf("entity metadata must not be nil")
@@ -413,11 +459,15 @@ func entityMetadataFromProto(
 		InstanceID:       entityID,
 		BacklogQueueSize: entity.BacklogQueueSize,
 		LockedBy:         entity.LockedBy.GetValue(),
-		SerializedState:  entity.SerializedState.GetValue(),
+		StateIncluded:    includeState,
+		HasState:         includeState && entity.SerializedState != nil,
 		Converter:        converter,
 	}
 	if entity.LastModifiedTime != nil {
 		metadata.LastModifiedTime = entity.LastModifiedTime.AsTime()
+	}
+	if !metadata.HasState {
+		return metadata, nil
 	}
 	state, err := largepayload.Hydrate(ctx, options, entity.SerializedState)
 	if err != nil {
@@ -425,6 +475,16 @@ func entityMetadataFromProto(
 	}
 	metadata.SerializedState = state.GetValue()
 	return metadata, nil
+}
+
+func normalizeEntityQueryPrefix(value string) string {
+	value = strings.TrimPrefix(value, "@")
+	name, key, hasKey := strings.Cut(value, "@")
+	prefix := "@" + strings.ToLower(name)
+	if hasKey {
+		return prefix + "@" + key
+	}
+	return prefix
 }
 
 func makeGetInstanceRequest(id api.InstanceID, opts []api.FetchOrchestrationMetadataOptions) *protos.GetInstanceRequest {
