@@ -10,17 +10,18 @@ import (
 type ErrorType string
 
 const (
-	ErrorTypeActivityTaskNotFound     ErrorType = "ActivityTaskNotFound"
-	ErrorTypeEntityTaskNotFound       ErrorType = "EntityTaskNotFound"
-	ErrorTypeOrchestratorTaskNotFound ErrorType = "OrchestratorTaskNotFound"
-	ErrorTypeTaskFailed               ErrorType = "TaskFailedException"
-	ErrorTypeEntityOperationFailed    ErrorType = "EntityOperationFailedException"
-	ErrorTypeVersionMismatch          ErrorType = "VersionMismatch"
-	ErrorTypeVersionError             ErrorType = "VersionError"
-	ErrorTypeHistoryLimitExceeded     ErrorType = "HistoryLimitExceeded"
-	ErrorTypeActivityPanic            ErrorType = "TaskActivityPanic"
-	ErrorTypeEntityOperationPanic     ErrorType = "EntityOperationPanic"
-	ErrorTypeOrchestratorPanic        ErrorType = "OrchestratorPanic"
+	ErrorTypeActivityTaskNotFound         ErrorType = "ActivityTaskNotFound"
+	ErrorTypeEntityTaskNotFound           ErrorType = "EntityTaskNotFound"
+	ErrorTypeOrchestratorTaskNotFound     ErrorType = "OrchestratorTaskNotFound"
+	ErrorTypeTaskFailed                   ErrorType = "TaskFailedException"
+	ErrorTypeEntityOperationFailed        ErrorType = "EntityOperationFailedException"
+	ErrorTypeVersionMismatch              ErrorType = "VersionMismatch"
+	ErrorTypeVersionError                 ErrorType = "VersionError"
+	ErrorTypeHistoryLimitExceeded         ErrorType = "HistoryLimitExceeded"
+	ErrorTypeOrchestratorResponseTooLarge ErrorType = "OrchestratorResponseTooLarge"
+	ErrorTypeActivityPanic                ErrorType = "TaskActivityPanic"
+	ErrorTypeEntityOperationPanic         ErrorType = "EntityOperationPanic"
+	ErrorTypeOrchestratorPanic            ErrorType = "OrchestratorPanic"
 )
 
 // MaxFailureDetailsDepth bounds failure chains in JSON and protobuf payloads.

@@ -99,4 +99,7 @@ func TestRetryableWaitRPCErrorIncludesServerLongPollAndTransientFailures(t *test
 	if retryableWaitRPCError(status.Error(codes.InvalidArgument, "invalid")) {
 		t.Fatal("InvalidArgument should not be retryable")
 	}
+	if retryableWaitRPCError(status.Error(codes.NotFound, "missing instance")) {
+		t.Fatal("NotFound should return ErrInstanceNotFound without retrying")
+	}
 }

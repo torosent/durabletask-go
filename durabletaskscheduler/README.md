@@ -74,7 +74,16 @@ initial backoff, 250 ms cap, and multiplier 2. Worker channels do not, because
 the worker owns its own reconnect loop.
 
 Individual gRPC messages are bounded to 64 MiB by default through
-`Options.MaxReceiveMessageSize` and `Options.MaxSendMessageSize`. Active streams
+`Options.MaxReceiveMessageSize` and `Options.MaxSendMessageSize`. The worker uses a
+3.9 MiB safety bound below the service ceiling. When
+`Options.MaxSendMessageSize` is lower, that configured send limit becomes the
+bound instead. The worker validates the final response after large-payload
+externalization and fails an orchestration once
+with `OrchestratorResponseTooLarge` if it still exceeds that limit. The legacy
+`isPartial`/`chunkIndex` response fields are deprecated; the Go worker does not
+use them because validation against the current DTS emulator did not provide a
+portable chunking path. Configure large-payload storage or reduce per-turn
+fan-out instead. Active streams
 use a two-minute keepalive with a 20-second acknowledgement timeout; set
 `Options.KeepaliveTime` to zero to disable it. The timeout is ignored while
 keepalive is disabled. Values below 30 seconds are rejected to avoid
@@ -100,7 +109,10 @@ closes retired channels after their in-flight completions drain.
 `client.NewTaskHubGrpcWorkerWithConnectionFactory` provides the same lifecycle
 when its factory returns a non-nil closer, which transfers ownership to the
 worker. Use an owning configuration to recover from a permanently wedged
-channel. See `client.NewTaskHubGrpcWorker` for the full ownership contract.
+channel. After a worker has started, `Unauthenticated` and `PermissionDenied`
+stream or reconnect-handshake responses are retried with backoff so token
+refresh and RBAC propagation can recover without restarting the worker. See
+`client.NewTaskHubGrpcWorker` for the full ownership contract.
 
 Reconnect and RPC retry delays are deterministic and always stay within
 `[baseDelay, maxDelay]`. A stream that delivers at least one message before it
@@ -176,6 +188,10 @@ budget in mind. Exceeding either limit delays and abandons the work item until
 the worker is reconfigured with a larger bounded limit.
 
 ### Recurring scheduled tasks
+
+> **Mixed-SDK constraint:** this surface uses Go SDK-owned system entity and
+> orchestrator names and state. Use it only in Go-only task hubs; interoperability
+> with .NET workers sharing those system names and state is not defined.
 
 Scheduled tasks use recurring UTC intervals, not cron expressions. Register the
 system entity and orchestrators before creating the worker:
@@ -299,19 +315,21 @@ cancels them only if the shutdown context expires.
 | Bounded orchestration/activity/entity concurrency | Supported |
 | Work-item filters for orchestrations, activities, and entities | Supported |
 | Completion tokens and abandon RPCs | Supported |
-| Health pings, silent-disconnect detection, and channel recreation | Supported |
+| Oversized orchestration responses | Blob-externalized before send; residual responses above the effective limit fail once with non-retriable guidance; the Go worker does not use deprecated legacy chunking |
+| Health pings, silent-disconnect detection, auth/RBAC recovery, and channel recreation | Supported |
 | Public orchestration history | Supported through buffered and callback-streaming API-owned records |
 | Version-aware registry dispatch and controlled unversioned fallback | Supported |
 | Default versions, activity inheritance, and ContinueAsNew migration | Supported; DTS must honor `newVersion` |
 | Name/version work-item filters | Supported, auto-generated or explicit, advertised, and locally enforced |
 | Pluggable application data conversion | Supported with shared client/worker configuration; default is JSON |
-| Recurring interval schedules | Supported: create/get/list/describe/update/pause/resume/delete, start/end times, versions, tags/context, and retries |
+| Recurring interval schedules | Supported in Go-only task hubs; mixed-SDK interoperability for the SDK-owned system entity state is not defined |
 | Scheduled-task capability | Supported; register system tasks and opt in with `durabletaskscheduler.WithScheduledTasks()` |
 | Azure Blob `blob:v2` payloads | Supported with connection-string or identity authentication and .NET-compatible gzip/token semantics |
 | Large-payload capability | Supported and advertised only when a store/resolver is configured |
 | Durable entities | Supported: legacy and V2 work items, scheduled signals, calls, queries, and critical sections |
 | Status-based instance-ID deduplication and replacement | Supported through `api.OrchestrationIDReusePolicy.DedupeStatuses` |
-| History export jobs (preview) | Supported through the top-level [`exporthistory`](../exporthistory) package; register the system tasks and opt in with `exporthistory.WithExportHistory()` |
+| History export jobs (preview) | Buffers each complete history in worker memory and writes `api.HistoryEvent` JSON/JSONL; the schema version defaults to preview value `1.0` and is caller-configurable, so assess memory and schema compatibility before enabling |
+| Sandbox worker profiles | Not implemented |
 
 The current V2 protobuf cannot carry per-operation trace context or request time
 to an entity worker, and it has no properties map for legacy extended-session

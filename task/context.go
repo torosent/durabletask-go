@@ -22,21 +22,18 @@ func mergeStringMaps[M ~map[string]string](base, overrides M) M {
 	return merged
 }
 
-// Context returns an immutable Go context with orchestration identity and caller fields.
+// Context returns a replay-stable Go context containing only persisted
+// orchestration identity and caller fields. Host values, deadlines, and
+// cancellation are intentionally excluded from deterministic orchestrator code.
 func (ctx *OrchestrationContext) Context() context.Context {
 	engine := ctx.engineContext()
-	base := engine.baseContext
-	if base == nil {
-		base = context.Background()
-	}
-	base = api.ContextWithFields(base, engine.contextFields)
-	base = api.WithOrchestrationContextInfo(base, api.OrchestrationContextInfo{
+	base := api.ContextWithFields(context.Background(), engine.contextFields)
+	return api.WithOrchestrationContextInfo(base, api.OrchestrationContextInfo{
 		InstanceID:       engine.ID,
 		Name:             engine.Name,
 		Version:          engine.Version,
 		ParentInstanceID: engine.parentInstanceID,
 	})
-	return context.WithValue(base, taskLoggerKey{}, ctx.Logger())
 }
 
 // Logger returns a slog logger that suppresses output while replaying history.
@@ -59,7 +56,9 @@ func (ctx *OrchestrationContext) Logger() *slog.Logger {
 	)
 }
 
-// LoggerFromContext returns the task logger associated with ctx, or slog.Default.
+// LoggerFromContext returns the task logger associated with an activity or
+// entity context, or slog.Default. Orchestrators must use
+// [OrchestrationContext.Logger]; their replay-stable Context excludes loggers.
 func LoggerFromContext(ctx context.Context) *slog.Logger {
 	if logger, ok := ctx.Value(taskLoggerKey{}).(*slog.Logger); ok && logger != nil {
 		return logger

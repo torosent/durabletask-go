@@ -145,7 +145,10 @@ func WithMetricsHooks(hooks MetricsHooks) TaskExecutorOption {
 	}
 }
 
-// WithContextFields configures immutable fields propagated into task contexts.
+// WithContextFields configures worker-local fields for activity and entity
+// contexts. Root-orchestration fields must use [api.WithContextFields], and
+// child fields must use [WithSubOrchestrationContextFields], so they are
+// persisted and remain stable across replay and worker deployments.
 func WithContextFields(fields api.ContextFields) TaskExecutorOption {
 	return func(executor *taskExecutor) {
 		executor.contextFields = make(api.ContextFields, len(fields))
@@ -251,7 +254,7 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 }
 
 // ExecuteOrchestrator implements Executor and executes an orchestrator function in the current goroutine.
-func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*ExecutionResults, error) {
+func (te *taskExecutor) ExecuteOrchestrator(_ context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*ExecutionResults, error) {
 	started := startedEvent(oldEvents, newEvents)
 	name := started.GetName()
 	version := started.GetVersion().GetValue()
@@ -285,7 +288,6 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		}
 	}
 	orchestrationCtx := newOrchestrationContext(
-		ctx,
 		te.Registry,
 		id,
 		oldEvents,
@@ -293,7 +295,6 @@ func (te *taskExecutor) ExecuteOrchestrator(ctx context.Context, id api.Instance
 		te.orchestrationOptions,
 		te.logger,
 		te.metrics,
-		te.contextFields,
 		te.errorProperties,
 		te.versioning.defaultVersion(),
 		te.converter,

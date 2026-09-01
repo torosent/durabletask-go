@@ -38,6 +38,10 @@ func NewWorker(
 		durabletaskclient.WithWorkerHelloTimeout(prepared.HelloTimeout),
 		durabletaskclient.WithWorkerDataConverter(prepared.DataConverter),
 		durabletaskclient.WithMaximumTimerInterval(prepared.MaximumTimerInterval),
+		durabletaskclient.WithMaxOrchestratorCompletionBytes(min(
+			prepared.MaxSendMessageSize,
+			durabletaskclient.DefaultMaxOrchestratorCompletionBytes,
+		)),
 	}
 	if prepared.LargePayloads != nil {
 		configuredOptions = append(

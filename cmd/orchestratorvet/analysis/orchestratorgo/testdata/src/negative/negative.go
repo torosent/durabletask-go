@@ -110,8 +110,8 @@ func replaySafeLogging(ctx *task.OrchestrationContext) (any, error) {
 	return nil, nil
 }
 
-// activityBody holds hazards that are never analyzed because activities run
-// exactly once and are not replayed.
+// activityBody holds hazards that are never analyzed because activities are
+// not replayed. Activities are delivered at least once and must be idempotent.
 func activityBody(ctx task.ActivityContext) (any, error) {
 	go func() {}()
 	return time.Now(), nil

@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Missing-instance orchestration waits now return `api.ErrInstanceNotFound` immediately instead of retrying `NotFound` until the caller deadline.
+- After a worker has started, it reconnects with bounded backoff after `Unauthenticated` or `PermissionDenied` stream and reconnect-handshake responses so refreshed credentials and propagated RBAC can recover without a process restart. The initial `Hello` remains fail-fast.
+- Oversized orchestration responses are checked after large-payload externalization against the smaller of the 3.9 MiB worker safety bound and the configured gRPC send limit. The Go worker intentionally does not use the deprecated response-chunking fields; a response that still exceeds the effective limit now fails once with non-retriable `api.ErrorTypeOrchestratorResponseTooLarge` guidance instead of repeatedly hitting `ResourceExhausted`.
+- `OrchestrationContext.Context()` now contains only persisted orchestration identity and context fields; host values, deadlines, cancellation, worker-local `task.WithContextFields`, and loggers are excluded from deterministic orchestrator code. Use `ctx.Logger()` for replay-safe orchestration logging.
+- Activity and sub-orchestration retry options snapshot and normalize caller policies without mutation. A retry backoff that would carry the next attempt past `RetryTimeout` now stops the retries instead of creating that durable timer. The decision is made on the failure event from replayed history, so it is stable across replay and work-item redelivery. This is a replay-contract change: an in-flight orchestration that already recorded such a timer under an earlier release fails on replay, so drain instances that use `RetryTimeout` before upgrading.
+- Corrected analyzer guidance to describe activities as at-least-once and require idempotency.
+
 - Replaced legacy action-based orchestration ID reuse options with the current status-based `OrchestrationIDReusePolicy.DedupeStatuses` contract. Nil uses the DTS default, an empty set permits all reusable statuses, and listed statuses reject duplicate starts.
 - `MaxEventsPerTurn` now sends `numEventsProcessed` for bounded partial event consumption, allowing DTS to redeliver the unprocessed work-item events instead of failing or continuing the orchestration as new.
 - Every runnable sample now targets Durable Task Scheduler and is configured with `DTS_CONNECTION_STRING`. The shared `samples/internal/dtssample` helper owns their client and worker setup, except in `samples/exporthistory`, which needs its client before it can register the export system tasks.

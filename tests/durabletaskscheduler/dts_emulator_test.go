@@ -1157,6 +1157,80 @@ func TestDTSEmulatorLongTimerSplitting(t *testing.T) {
 	require.Equal(t, expectedTimers, timerCount)
 }
 
+func TestDTSEmulatorFailsOversizedCompletionWithoutRetryLoop(t *testing.T) {
+	const activityInputBytes = 2 * 1024 * 1024
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSOversizedActivity", func(task.ActivityContext) (any, error) {
+		return nil, errors.New("oversized actions should never be dispatched")
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSOversizedFanout", func(ctx *task.OrchestrationContext) (any, error) {
+		input := strings.Repeat("x", activityInputBytes)
+		first := ctx.CallActivity("DTSOversizedActivity", task.WithActivityInput(input))
+		second := ctx.CallActivity("DTSOversizedActivity", task.WithActivityInput(input))
+		return nil, ctx.WhenAll(first, second)
+	}))
+	managementClient, _, _ := startEmulatorClientAndWorker(t, registry)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSOversizedFanout",
+		api.WithInstanceID(uniqueInstanceID("go-oversized-fanout")),
+	)
+	require.NoError(t, err)
+	completed, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, api.RUNTIME_STATUS_FAILED, completed.RuntimeStatus)
+	require.NotNil(t, completed.FailureDetails)
+	require.Equal(t, api.ErrorTypeOrchestratorResponseTooLarge, completed.FailureDetails.ErrorType)
+	require.True(t, completed.FailureDetails.NonRetriable())
+	require.Contains(t, completed.FailureDetails.ErrorMessage, "large-payload externalization")
+}
+
+func TestDTSEmulatorCompletionRespectsConfiguredSendLimit(t *testing.T) {
+	registry := task.NewTaskRegistry()
+	require.NoError(t, registry.AddActivityN("DTSSendLimitActivity", func(task.ActivityContext) (any, error) {
+		return nil, errors.New("oversized action should never be dispatched")
+	}))
+	require.NoError(t, registry.AddOrchestratorN("DTSSendLimit", func(ctx *task.OrchestrationContext) (any, error) {
+		return nil, ctx.CallActivity(
+			"DTSSendLimitActivity",
+			task.WithActivityInput(strings.Repeat("x", 96*1024)),
+		).Await(nil)
+	}))
+
+	options := emulatorOptions(t)
+	options.MaxSendMessageSize = 64 * 1024
+	logger := api.DefaultLogger()
+	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
+	require.NoError(t, err)
+	worker, err := durabletaskscheduler.NewWorker(options, registry, logger)
+	require.NoError(t, err)
+	require.NoError(t, worker.Start(context.Background()))
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		require.NoError(t, worker.Shutdown(shutdownCtx))
+		require.NoError(t, managementClient.Close())
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	instanceID, err := managementClient.ScheduleNewOrchestration(
+		ctx,
+		"DTSSendLimit",
+		api.WithInstanceID(uniqueInstanceID("go-send-limit")),
+	)
+	require.NoError(t, err)
+	completed, err := managementClient.WaitForOrchestrationCompletion(ctx, instanceID)
+	require.NoError(t, err)
+	require.Equal(t, api.RUNTIME_STATUS_FAILED, completed.RuntimeStatus)
+	require.NotNil(t, completed.FailureDetails)
+	require.Equal(t, api.ErrorTypeOrchestratorResponseTooLarge, completed.FailureDetails.ErrorType)
+	require.Contains(t, completed.FailureDetails.ErrorMessage, "0.06 MiB worker completion bound")
+}
+
 func TestDTSEmulatorPartialEventConsumption(t *testing.T) {
 	const eventCount = 64
 	registry := task.NewTaskRegistry()
@@ -1507,11 +1581,22 @@ func TestDTSEmulatorAzuriteBlobV2RoundTrip(t *testing.T) {
 		if err := ctx.GetInput(&input); err != nil {
 			return nil, err
 		}
-		var result string
-		if err := ctx.CallActivity("DTSBlobV2Echo", task.WithActivityInput(input)).Await(&result); err != nil {
+		first := ctx.CallActivity("DTSBlobV2Echo", task.WithActivityInput(input))
+		second := ctx.CallActivity("DTSBlobV2Echo", task.WithActivityInput(input))
+		if err := ctx.WhenAll(first, second); err != nil {
 			return nil, err
 		}
-		return result, nil
+		var firstResult, secondResult string
+		if err := first.Await(&firstResult); err != nil {
+			return nil, err
+		}
+		if err := second.Await(&secondResult); err != nil {
+			return nil, err
+		}
+		if firstResult != secondResult {
+			return nil, errors.New("large-payload activity results did not match")
+		}
+		return firstResult, nil
 	}))
 	logger := api.DefaultLogger()
 	managementClient, err := durabletaskscheduler.NewClient(context.Background(), options, logger)
@@ -1533,7 +1618,9 @@ func TestDTSEmulatorAzuriteBlobV2RoundTrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	input := strings.Repeat("blob-v2-large-payload-", 20_000)
+	// Two inline actions of this size would exceed the DTS completion limit.
+	// Blob externalization must reduce the fan-out response before it is sent.
+	input := strings.Repeat("blob-v2-large-payload-", 100_000)
 	instanceID, err := managementClient.ScheduleNewOrchestration(
 		ctx,
 		"DTSBlobV2",

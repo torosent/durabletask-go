@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -527,3 +528,17 @@ func (prefixedConverter) Deserialize(payload string, target any) error {
 
 var _ scheduledTaskBackend = (*scheduleClientBackend)(nil)
 var _ durabletaskclient.TaskHubGrpcWorkerOption = WithScheduledTasks()
+
+func TestScheduleRetryPolicyFromPublicAppliesDefaultsWithoutMutation(t *testing.T) {
+	public := &ScheduleRetryPolicy{InitialRetryInterval: time.Second}
+	normalized, err := scheduleRetryPolicyFromPublic(public)
+	require.NoError(t, err)
+	require.Equal(t, 1, normalized.MaxAttempts)
+	require.Equal(t, 1.0, normalized.BackoffCoefficient)
+	require.Equal(t, dotNetSpan(math.MaxInt64), normalized.MaxRetryInterval)
+	require.Equal(t, dotNetSpan(math.MaxInt64), normalized.RetryTimeout)
+	require.Zero(t, public.MaxAttempts)
+	require.Zero(t, public.BackoffCoefficient)
+	require.Zero(t, public.MaxRetryInterval)
+	require.Zero(t, public.RetryTimeout)
+}
