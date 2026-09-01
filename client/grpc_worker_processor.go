@@ -82,7 +82,7 @@ func (w *TaskHubGrpcWorker) receiveWorkItem(connection *grpcWorkerConnection) (*
 // A terminal error that races the timeout is only rewritten to
 // errSilentDisconnect when it is the cancellation the timer itself induced.
 // Any other status, such as Unauthenticated or PermissionDenied, is propagated
-// so a genuinely non-retryable failure is never masked as a retryable silence.
+// rather than masked as a silent disconnect.
 func recvBeforeSilenceTimeout[T any](recv func() (T, error), cancelStream context.CancelFunc, timeout time.Duration) (T, error) {
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(timeout, func() {
@@ -278,6 +278,7 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		return
 	}
 
+	response = failOversizedOrchestratorResponse(response, w.options.maxOrchestratorCompletionBytes)
 	err = w.executeRPCWithRetry(ctx, "complete orchestration task", func(callCtx context.Context) error {
 		_, callErr := client.CompleteOrchestratorTask(callCtx, response)
 		return callErr
@@ -289,6 +290,56 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		}
 		w.logger.Errorf("%s: failed to complete orchestration work item: %v", request.InstanceId, err)
 		w.abandonOrchestration(ctx, client, completionToken)
+	}
+}
+
+// failOversizedOrchestratorResponse converts a response that modern DTS cannot
+// accept into a small, non-retriable orchestration failure. The Go worker does
+// not use the deprecated legacy response-chunking fields; validation against the
+// current DTS emulator confirmed that splitting is not a portable recovery path.
+func failOversizedOrchestratorResponse(
+	response *protos.OrchestratorResponse,
+	maxBytes int,
+) *protos.OrchestratorResponse {
+	if response == nil || maxBytes <= 0 {
+		return response
+	}
+	responseSize := proto.Size(response)
+	if responseSize <= maxBytes {
+		return response
+	}
+	message := fmt.Sprintf(
+		"orchestrator response with %d actions exceeds the %.2f MiB worker completion bound: %.2f MiB; reduce per-turn fan-out or configure large-payload externalization for action payloads",
+		len(response.Actions),
+		float64(maxBytes)/(1024*1024),
+		float64(responseSize)/(1024*1024),
+	)
+	for _, action := range response.Actions {
+		if actionSize := proto.Size(action); actionSize > maxBytes {
+			message = fmt.Sprintf(
+				"orchestrator action %d exceeds the %.2f MiB worker completion bound: %.2f MiB; configure large-payload externalization for oversized action payloads",
+				action.GetId(),
+				float64(maxBytes)/(1024*1024),
+				float64(actionSize)/(1024*1024),
+			)
+			break
+		}
+	}
+	return &protos.OrchestratorResponse{
+		InstanceId:                response.InstanceId,
+		CompletionToken:           response.CompletionToken,
+		OrchestrationTraceContext: response.OrchestrationTraceContext,
+		Actions: []*protos.OrchestratorAction{helpers.NewCompleteOrchestrationAction(
+			-1,
+			protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED,
+			nil,
+			nil,
+			&protos.TaskFailureDetails{
+				ErrorType:      string(api.ErrorTypeOrchestratorResponseTooLarge),
+				ErrorMessage:   message,
+				IsNonRetriable: true,
+			},
+		)},
 	}
 }
 

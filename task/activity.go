@@ -65,9 +65,9 @@ type RetryContext struct {
 	TotalRetryTime time.Duration
 }
 
-func (policy *RetryPolicy) Validate() error {
+func normalizeRetryPolicy(policy RetryPolicy) (RetryPolicy, error) {
 	if policy.InitialRetryInterval <= 0 {
-		return fmt.Errorf("%w: InitialRetryInterval must be greater than 0", api.ErrInvalidArgument)
+		return RetryPolicy{}, fmt.Errorf("%w: InitialRetryInterval must be greater than 0", api.ErrInvalidArgument)
 	}
 	if policy.MaxAttempts <= 0 {
 		// setting 1 max attempt is equivalent to not retrying
@@ -83,11 +83,24 @@ func (policy *RetryPolicy) Validate() error {
 		policy.RetryTimeout = math.MaxInt64
 	}
 	if policy.Handle == nil {
-		policy.Handle = func(RetryContext) bool {
-			return true
-		}
+		policy.Handle = func(RetryContext) bool { return true }
 	}
-	return nil
+	return policy, nil
+}
+
+// Normalized validates the retry policy and returns an independent copy with
+// default values applied. The receiver is not modified.
+func (policy *RetryPolicy) Normalized() (RetryPolicy, error) {
+	if policy == nil {
+		return RetryPolicy{}, fmt.Errorf("%w: retry policy cannot be nil", api.ErrInvalidArgument)
+	}
+	return normalizeRetryPolicy(*policy)
+}
+
+// Validate reports whether the retry policy is valid without modifying it.
+func (policy *RetryPolicy) Validate() error {
+	_, err := policy.Normalized()
+	return err
 }
 
 // WithActivityInput configures an input for an activity invocation.
@@ -123,16 +136,19 @@ func WithActivityTags(tags map[string]string) CallActivityOption {
 	}
 }
 
+// WithActivityRetryPolicy snapshots policy when this option is created. Later
+// caller mutations do not affect activity retries.
 func WithActivityRetryPolicy(policy *RetryPolicy) CallActivityOption {
+	if policy == nil {
+		return func(*callActivityOptions, api.DataConverter) error { return nil }
+	}
+	snapshot := *policy
 	return func(opt *callActivityOptions, _ api.DataConverter) error {
-		if policy == nil {
-			return nil
-		}
-		err := policy.Validate()
+		normalized, err := normalizeRetryPolicy(snapshot)
 		if err != nil {
 			return err
 		}
-		opt.retryPolicy = policy
+		opt.retryPolicy = &normalized
 		return nil
 	}
 }

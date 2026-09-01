@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/contextprop"
@@ -36,7 +37,7 @@ func TestReplaySafeLoggerSuppressesReplayOutput(t *testing.T) {
 	}
 }
 
-func TestOrchestrationContextPropagatesIdentityAndFields(t *testing.T) {
+func TestOrchestrationContextPropagatesOnlyPersistedIdentityAndFields(t *testing.T) {
 	registry := NewTaskRegistry()
 	if err := registry.AddOrchestratorN("context-test", func(ctx *OrchestrationContext) (any, error) {
 		info, ok := api.OrchestrationContextInfoFromContext(ctx.Context())
@@ -55,36 +56,39 @@ func TestOrchestrationContextPropagatesIdentityAndFields(t *testing.T) {
 	}
 
 	fields := api.ContextFields{"tenant": "alpha"}
-	executor := NewTaskExecutor(registry, WithContextFields(fields))
-	fields["tenant"] = "mutated"
 	instanceID := api.InstanceID("context-instance")
 	parent := helpers.NewParentInfo(4, "parent", "parent-instance")
-	result, err := executor.ExecuteOrchestrator(
-		context.Background(),
-		instanceID,
+	started := helpers.NewExecutionStartedEvent(
+		"context-test",
+		string(instanceID),
 		nil,
-		[]*protos.HistoryEvent{
-			helpers.NewOrchestratorStartedEvent(),
-			helpers.NewExecutionStartedEvent(
-				"context-test",
-				string(instanceID),
-				nil,
-				parent,
-				nil,
-				nil,
-				wrapperspb.String("v2"),
-			),
-		},
+		parent,
+		nil,
+		nil,
+		wrapperspb.String("v2"),
 	)
-	if err != nil {
-		t.Fatal(err)
+	started.GetExecutionStarted().Tags = contextprop.Encode(api.OrchestrationContextInfo{}, fields)
+	fields["tenant"] = "mutated"
+	events := []*protos.HistoryEvent{helpers.NewOrchestratorStartedEvent(), started}
+
+	run := func(workerField string) string {
+		executor := NewTaskExecutor(registry, WithContextFields(api.ContextFields{"worker": workerField}))
+		result, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, events)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return completionAction(t, result.Response).GetResult().GetValue()
+	}
+	first, second := run("first-worker"), run("second-worker")
+	if first != second {
+		t.Fatalf("orchestration output changed across worker context: first=%s second=%s", first, second)
 	}
 
 	var output struct {
 		Info   api.OrchestrationContextInfo
 		Fields api.ContextFields
 	}
-	if err := json.Unmarshal([]byte(completionAction(t, result.Response).GetResult().GetValue()), &output); err != nil {
+	if err := json.Unmarshal([]byte(first), &output); err != nil {
 		t.Fatal(err)
 	}
 	if output.Info.InstanceID != instanceID ||
@@ -93,8 +97,8 @@ func TestOrchestrationContextPropagatesIdentityAndFields(t *testing.T) {
 		output.Info.ParentInstanceID != "parent-instance" {
 		t.Fatalf("unexpected orchestration info: %+v", output.Info)
 	}
-	if output.Fields["tenant"] != "alpha" {
-		t.Fatalf("context field = %q, want alpha", output.Fields["tenant"])
+	if output.Fields["tenant"] != "alpha" || output.Fields["worker"] != "" {
+		t.Fatalf("orchestration fields are not purely persisted: %#v", output.Fields)
 	}
 }
 
@@ -205,5 +209,64 @@ func TestActivityContextDecodesDurableContextTags(t *testing.T) {
 	}
 	if output.Fields["tenant"] != "tagged" {
 		t.Fatalf("tenant = %q, want tagged", output.Fields["tenant"])
+	}
+}
+
+type hostContextKey struct{}
+
+func TestOrchestrationContextExcludesHostContextState(t *testing.T) {
+	type contextState struct {
+		HasHostValue bool
+		HasDeadline  bool
+		HasDone      bool
+		HasInfo      bool
+		InstanceID   api.InstanceID
+		HasLogger    bool
+	}
+	registry := NewTaskRegistry()
+	if err := registry.AddOrchestratorN("isolated-context", func(ctx *OrchestrationContext) (any, error) {
+		deterministic := ctx.Context()
+		info, hasInfo := api.OrchestrationContextInfoFromContext(deterministic)
+		_, hasDeadline := deterministic.Deadline()
+		return contextState{
+			HasHostValue: deterministic.Value(hostContextKey{}) != nil,
+			HasDeadline:  hasDeadline,
+			HasDone:      deterministic.Done() != nil,
+			HasInfo:      hasInfo,
+			InstanceID:   info.InstanceID,
+			HasLogger:    LoggerFromContext(deterministic) != slog.Default(),
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	host, cancel := context.WithTimeout(
+		context.WithValue(context.Background(), hostContextKey{}, "host-only"),
+		time.Hour,
+	)
+	defer cancel()
+	instanceID := api.InstanceID("isolated-context-instance")
+	result, err := NewTaskExecutor(registry).ExecuteOrchestrator(
+		host,
+		instanceID,
+		nil,
+		[]*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent("isolated-context", string(instanceID), nil, nil, nil, nil),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var output contextState
+	if err := json.Unmarshal([]byte(completionAction(t, result.Response).GetResult().GetValue()), &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.HasHostValue || output.HasDeadline || output.HasDone || output.HasLogger {
+		t.Fatalf("host context leaked into orchestrator context: %+v", output)
+	}
+	if !output.HasInfo || output.InstanceID != instanceID {
+		t.Fatalf("persisted orchestration identity missing: %+v", output)
 	}
 }

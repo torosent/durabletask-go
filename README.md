@@ -304,7 +304,13 @@ if errors.As(err, &failed) {
 ```
 
 Retry handlers receive deterministic failure data and run during orchestration replay, so handlers must not
-perform I/O or depend on wall-clock time.
+perform I/O or depend on wall-clock time. Retry options snapshot the supplied policy when the option is created;
+validation does not mutate caller-owned policies, and retries that would begin after `RetryTimeout` are not scheduled.
+
+`OrchestrationContext.Context()` is intentionally isolated from the worker's host context. It contains only persisted
+orchestration identity and context fields—never host values, deadlines, or cancellation. Use durable timers and task
+cancellation scopes for orchestration control flow, `ctx.Logger()` for replay-safe logging, and activity contexts for
+host cancellation or outbound I/O.
 
 ```go
 policy := &task.RetryPolicy{

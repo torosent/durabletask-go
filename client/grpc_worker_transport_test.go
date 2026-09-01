@@ -493,7 +493,7 @@ func TestSilenceTimeoutOnlyRewritesItsOwnCancellation(t *testing.T) {
 func TestSilenceTimeoutRacingNonRetryableStatusStopsTheWorker(t *testing.T) {
 	streamCtx, cancelStream := context.WithCancel(context.Background())
 	defer cancelStream()
-	authFailure := status.Error(codes.Unauthenticated, "token expired")
+	authFailure := status.Error(codes.InvalidArgument, "invalid worker request")
 
 	worker := newFakeWorker(
 		t,
@@ -511,7 +511,7 @@ func TestSilenceTimeoutRacingNonRetryableStatusStopsTheWorker(t *testing.T) {
 		cancelStream: cancelStream,
 	})
 	require.ErrorContains(t, err, "non-retryable error")
-	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.NotErrorIs(t, err, errSilentDisconnect)
 	run.retired.Wait()
 }
@@ -645,6 +645,8 @@ func TestWorkerLimitOptionValidation(t *testing.T) {
 		{"excessive streamed history events", WithMaxStreamedHistoryEvents(MaxStreamedHistoryEvents + 1)},
 		{"zero streamed history bytes", WithMaxStreamedHistoryBytes(0)},
 		{"excessive streamed history bytes", WithMaxStreamedHistoryBytes(MaxStreamedHistoryBytes + 1)},
+		{"small orchestrator completion bytes", WithMaxOrchestratorCompletionBytes(minOrchestratorCompletionBytes - 1)},
+		{"excessive orchestrator completion bytes", WithMaxOrchestratorCompletionBytes(DefaultMaxOrchestratorCompletionBytes + 1)},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			options := defaultTaskHubGrpcWorkerOptions()
@@ -673,6 +675,10 @@ func TestWorkerLimitOptionValidation(t *testing.T) {
 	require.EqualValues(t, math.MaxInt32, int32(options.maxConcurrentOrchestrations))
 	require.Equal(t, DefaultMaxStreamedHistoryEvents, options.maxStreamedHistoryEvents)
 	require.Equal(t, DefaultMaxStreamedHistoryBytes, options.maxStreamedHistoryBytes)
+	require.Equal(t, DefaultMaxOrchestratorCompletionBytes, options.maxOrchestratorCompletionBytes)
+	require.NoError(t, WithMaxOrchestratorCompletionBytes(64*1024)(&options))
+	require.NoError(t, WithMaxOrchestratorCompletionBytes(DefaultMaxOrchestratorCompletionBytes)(&options))
+	require.Equal(t, 64*1024, options.maxOrchestratorCompletionBytes)
 }
 
 func TestWorkerOptionValidationRejectsInvalidConfiguration(t *testing.T) {

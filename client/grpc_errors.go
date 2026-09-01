@@ -114,5 +114,16 @@ func clientErrorReasonCategory(reason string) error {
 }
 
 func retryableWaitRPCError(err error) bool {
-	return isTransientWorkerGRPCCode(status.Code(err))
+	switch status.Code(err) {
+	case codes.Canceled,
+		codes.DeadlineExceeded,
+		codes.ResourceExhausted,
+		codes.Aborted,
+		codes.Internal,
+		codes.Unavailable,
+		codes.Unknown:
+		return true
+	default:
+		return false
+	}
 }

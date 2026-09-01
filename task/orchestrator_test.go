@@ -1,7 +1,6 @@
 package task
 
 import (
-	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -17,7 +16,6 @@ func newTestOrchestrationContext(
 	newEvents []*protos.HistoryEvent,
 ) *OrchestrationContext {
 	return newOrchestrationContext(
-		context.Background(),
 		registry,
 		id,
 		oldEvents,
@@ -25,7 +23,6 @@ func newTestOrchestrationContext(
 		OrchestrationOptions{},
 		slog.Default(),
 		MetricsHooks{},
-		nil,
 		nil,
 		"",
 		api.DefaultDataConverter(),

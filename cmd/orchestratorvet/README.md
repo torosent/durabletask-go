@@ -93,8 +93,9 @@ package functions and `*http.Client` request methods, `net.Dial*`, `net.Listen*`
 `net.Lookup*`, and `net.Resolve*`, `os/exec` and `*exec.Cmd` execution methods,
 and every `syscall` function.
 
-Move the side effect into an activity, which runs exactly once and whose result
-is recorded in history.
+Move the side effect into an activity, whose result is recorded in history.
+Activities are delivered at least once and must be idempotent because a worker
+can finish the side effect but lose its completion response before DTS records it.
 
 ### Replay-unsafe logging
 

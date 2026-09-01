@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -1135,18 +1137,39 @@ func TestTaskHubGrpcWorkerRecreatesConnectionAfterTransientDisconnect(t *testing
 	require.NoError(t, worker.Shutdown(context.Background()))
 }
 
-func TestTaskHubGrpcWorkerStopsOnAuthenticationError(t *testing.T) {
-	stream := newFakeWorkItemStream(1)
-	stream.results <- fakeWorkItemResult{err: status.Error(codes.Unauthenticated, "bad token")}
-	client := &fakeSchedulerClient{stream: stream}
-	worker := newFakeWorker(t, client)
+func TestTaskHubGrpcWorkerReconnectsAfterAuthenticationError(t *testing.T) {
+	firstStream := newFakeWorkItemStream(1)
+	firstStream.results <- fakeWorkItemResult{err: status.Error(codes.Unauthenticated, "expired token")}
+	secondStream := newFakeWorkItemStream(0)
+	thirdStream := newFakeWorkItemStream(1)
+	thirdStream.results <- fakeWorkItemResult{item: &protos.WorkItem{
+		Request: &protos.WorkItem_HealthPing{HealthPing: &protos.HealthPing{}},
+	}}
+	clients := []*fakeSchedulerClient{
+		{stream: firstStream},
+		{stream: secondStream, helloErr: status.Error(codes.Unauthenticated, "refresh pending")},
+		{stream: thirdStream},
+	}
+	var factoryCalls atomic.Int32
 
-	require.NoError(t, worker.Start(context.Background()))
-	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := worker.Wait(waitCtx)
-	require.ErrorContains(t, err, "non-retryable")
-	require.ErrorContains(t, err, "Unauthenticated")
+	worker, err := newTaskHubGrpcWorker(
+		func(context.Context) (protos.TaskHubSidecarServiceClient, io.Closer, error) {
+			index := min(int(factoryCalls.Add(1))-1, len(clients)-1)
+			return clients[index], nil, nil
+		},
+		task.NewTaskRegistry(),
+		api.DefaultLogger(),
+		WithWorkerHelloTimeout(time.Second),
+		WithWorkerSilentDisconnectTimeout(time.Second),
+		WithWorkerReconnectBackoff(time.Millisecond, 5*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, worker.Start(ctx))
+	require.Eventually(t, func() bool { return factoryCalls.Load() >= 3 }, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, worker.Shutdown(context.Background()))
 }
 
 func TestTaskHubGrpcWorkerGracefulDrainKeepsCompletionContextAlive(t *testing.T) {
@@ -1221,6 +1244,8 @@ func TestTransientWorkerGRPCCodes(t *testing.T) {
 		codes.Canceled,
 		codes.DeadlineExceeded,
 		codes.NotFound,
+		codes.Unauthenticated,
+		codes.PermissionDenied,
 		codes.ResourceExhausted,
 		codes.Aborted,
 		codes.Internal,
@@ -1230,8 +1255,6 @@ func TestTransientWorkerGRPCCodes(t *testing.T) {
 		require.True(t, isTransientWorkerGRPCCode(code), code.String())
 	}
 	for _, code := range []codes.Code{
-		codes.Unauthenticated,
-		codes.PermissionDenied,
 		codes.InvalidArgument,
 	} {
 		require.False(t, isTransientWorkerGRPCCode(code), code.String())
@@ -1248,4 +1271,58 @@ func TestTransientWorkerGRPCCodes(t *testing.T) {
 	require.False(t, isTransientWorkerError(
 		status.Error(codes.Canceled, "grpc: the client connection is closing"),
 	))
+}
+
+func TestFailOversizedOrchestratorResponsePreservesValidResponse(t *testing.T) {
+	response := &protos.OrchestratorResponse{
+		InstanceId:      "instance",
+		CompletionToken: "token",
+		Actions: []*protos.OrchestratorAction{
+			helpers.NewScheduleTaskAction(1, "small", wrapperspb.String("input")),
+		},
+	}
+	require.Same(t, response, failOversizedOrchestratorResponse(response, DefaultMaxOrchestratorCompletionBytes))
+}
+
+func TestFailOversizedOrchestratorResponseFailsLargeFanout(t *testing.T) {
+	const maxBytes = 1024
+	response := &protos.OrchestratorResponse{
+		InstanceId:                "fanout",
+		CompletionToken:           "token",
+		OrchestrationTraceContext: &protos.OrchestrationTraceContext{SpanID: wrapperspb.String("0123456789abcdef")},
+		Actions: []*protos.OrchestratorAction{
+			helpers.NewScheduleTaskAction(1, "one", wrapperspb.String(strings.Repeat("a", 600))),
+			helpers.NewScheduleTaskAction(2, "two", wrapperspb.String(strings.Repeat("b", 600))),
+		},
+	}
+	require.Greater(t, proto.Size(response), maxBytes)
+
+	bounded := failOversizedOrchestratorResponse(response, maxBytes)
+	require.NotSame(t, response, bounded)
+	require.LessOrEqual(t, proto.Size(bounded), maxBytes)
+	require.Equal(t, response.InstanceId, bounded.InstanceId)
+	require.Equal(t, response.CompletionToken, bounded.CompletionToken)
+	require.Same(t, response.OrchestrationTraceContext, bounded.OrchestrationTraceContext)
+	require.Len(t, bounded.Actions, 1)
+	failure := bounded.Actions[0].GetCompleteOrchestration()
+	require.NotNil(t, failure)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_FAILED, failure.GetOrchestrationStatus())
+	require.Equal(t, string(api.ErrorTypeOrchestratorResponseTooLarge), failure.GetFailureDetails().GetErrorType())
+	require.True(t, failure.GetFailureDetails().GetIsNonRetriable())
+	require.Contains(t, failure.GetFailureDetails().GetErrorMessage(), "reduce per-turn fan-out")
+}
+
+func TestFailOversizedOrchestratorResponseIdentifiesOversizedAction(t *testing.T) {
+	const maxBytes = 256
+	response := &protos.OrchestratorResponse{
+		InstanceId:      "instance",
+		CompletionToken: "token",
+		Actions: []*protos.OrchestratorAction{
+			helpers.NewScheduleTaskAction(42, "oversized", wrapperspb.String(strings.Repeat("x", maxBytes*2))),
+		},
+	}
+	bounded := failOversizedOrchestratorResponse(response, maxBytes)
+	failure := bounded.Actions[0].GetCompleteOrchestration().GetFailureDetails()
+	require.Contains(t, failure.GetErrorMessage(), "action 42")
+	require.Contains(t, failure.GetErrorMessage(), "large-payload externalization")
 }

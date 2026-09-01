@@ -2,7 +2,6 @@ package task
 
 import (
 	"container/list"
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,7 +39,6 @@ type OrchestrationContext struct {
 	IsReplaying    bool
 	CurrentTimeUtc time.Time
 
-	baseContext          context.Context
 	contextFields        api.ContextFields
 	errorProperties      api.ErrorPropertiesProvider
 	orchestrationTags    map[string]string
@@ -228,22 +226,24 @@ func checkUnreservedKey(kind, key string) error {
 	return nil
 }
 
+// WithSubOrchestrationRetryPolicy snapshots policy when this option is created.
+// Later caller mutations do not affect sub-orchestration retries.
 func WithSubOrchestrationRetryPolicy(policy *RetryPolicy) SubOrchestratorOption {
+	if policy == nil {
+		return func(*callSubOrchestratorOptions, api.DataConverter) error { return nil }
+	}
+	snapshot := *policy
 	return func(opt *callSubOrchestratorOptions, _ api.DataConverter) error {
-		if policy == nil {
-			return nil
-		}
-		err := policy.Validate()
+		normalized, err := normalizeRetryPolicy(snapshot)
 		if err != nil {
 			return err
 		}
-		opt.retryPolicy = policy
+		opt.retryPolicy = &normalized
 		return nil
 	}
 }
 
 func newOrchestrationContext(
-	baseContext context.Context,
 	registry *TaskRegistry,
 	id api.InstanceID,
 	oldEvents []*protos.HistoryEvent,
@@ -251,15 +251,12 @@ func newOrchestrationContext(
 	options OrchestrationOptions,
 	logger *slog.Logger,
 	metrics MetricsHooks,
-	contextFields api.ContextFields,
 	errorProperties api.ErrorPropertiesProvider,
 	defaultVersion string,
 	converter api.DataConverter,
 ) *OrchestrationContext {
 	ctx := &OrchestrationContext{
 		ID:                        id,
-		baseContext:               baseContext,
-		contextFields:             contextFields,
 		errorProperties:           errorProperties,
 		logger:                    logger,
 		metrics:                   metrics,
@@ -794,6 +791,11 @@ func (ctx *OrchestrationContext) internalScheduleTaskWithRetries(
 				}
 				return
 			}
+			if !ctx.IsReplaying && policy.RetryTimeout != math.MaxInt64 &&
+				ctx.CurrentTimeUtc.After(initialAttempt.Add(policy.RetryTimeout)) {
+				result.completeFrom(current, err)
+				return
+			}
 			count++
 			current = schedule()
 		}
@@ -840,8 +842,12 @@ func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int,
 	if totalRetryTime < 0 {
 		totalRetryTime = 0
 	}
-	if policy.RetryTimeout != math.MaxInt64 && currentTimeUtc.After(firstAttempt.Add(policy.RetryTimeout)) {
-		return 0
+	remaining := time.Duration(math.MaxInt64)
+	if policy.RetryTimeout != math.MaxInt64 {
+		remaining = firstAttempt.Add(policy.RetryTimeout).Sub(currentTimeUtc)
+		if remaining <= 0 {
+			return 0
+		}
 	}
 	if policy.Handle != nil && !policy.Handle(RetryContext{
 		LastAttemptNumber: attempt + 1,
@@ -851,10 +857,14 @@ func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int,
 		return 0
 	}
 	nextDelayMs := float64(policy.InitialRetryInterval.Milliseconds()) * math.Pow(policy.BackoffCoefficient, float64(attempt))
+	nextDelay := policy.MaxRetryInterval
 	if nextDelayMs < float64(policy.MaxRetryInterval.Milliseconds()) {
-		return time.Duration(int64(nextDelayMs) * int64(time.Millisecond))
+		nextDelay = time.Duration(int64(nextDelayMs) * int64(time.Millisecond))
 	}
-	return policy.MaxRetryInterval
+	if nextDelay > remaining {
+		return 0
+	}
+	return nextDelay
 }
 
 // CreateTimer schedules a durable timer that expires after the specified delay.

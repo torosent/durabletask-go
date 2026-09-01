@@ -60,6 +60,11 @@ const (
 	// worker replay-history limits.
 	MaxStreamedHistoryEvents       = api.MaxHistoryMaxEvents
 	MaxStreamedHistoryBytes  int64 = api.MaxHistoryMaxBytes
+
+	// DefaultMaxOrchestratorCompletionBytes leaves headroom below the modern DTS
+	// orchestration-completion message limit.
+	DefaultMaxOrchestratorCompletionBytes = 4_089_446
+	minOrchestratorCompletionBytes        = 64 * 1024
 )
 
 type WorkItemFilter struct {
@@ -77,31 +82,32 @@ type WorkItemFilters struct {
 }
 
 type taskHubGrpcWorkerOptions struct {
-	maxConcurrentOrchestrations int
-	maxConcurrentActivities     int
-	maxConcurrentEntities       int
-	helloTimeout                time.Duration
-	silentDisconnectTimeout     time.Duration
-	rpcTimeout                  time.Duration
-	reconnectBaseDelay          time.Duration
-	reconnectMaxDelay           time.Duration
-	transientRetryMaxAttempts   int
-	transientRetryBaseDelay     time.Duration
-	transientRetryMaxDelay      time.Duration
-	maxStreamedHistoryEvents    int
-	maxStreamedHistoryBytes     int64
-	maximumTimerInterval        *time.Duration
-	taskExecutorOptions         []task.TaskExecutorOption
-	versioning                  *task.VersioningOptions
-	capabilities                []WorkerCapability
-	workItemFilters             *WorkItemFilters
-	workItemFiltersConfigured   bool
-	autoWorkItemFilters         bool
-	largePayloads               *api.LargePayloadOptions
-	converter                   api.DataConverter
-	unversionedOrchestrators    map[string]struct{}
-	unversionedActivities       map[string]struct{}
-	reconnectRandom             randomInt64N
+	maxConcurrentOrchestrations    int
+	maxConcurrentActivities        int
+	maxConcurrentEntities          int
+	helloTimeout                   time.Duration
+	silentDisconnectTimeout        time.Duration
+	rpcTimeout                     time.Duration
+	reconnectBaseDelay             time.Duration
+	reconnectMaxDelay              time.Duration
+	transientRetryMaxAttempts      int
+	transientRetryBaseDelay        time.Duration
+	transientRetryMaxDelay         time.Duration
+	maxStreamedHistoryEvents       int
+	maxStreamedHistoryBytes        int64
+	maxOrchestratorCompletionBytes int
+	maximumTimerInterval           *time.Duration
+	taskExecutorOptions            []task.TaskExecutorOption
+	versioning                     *task.VersioningOptions
+	capabilities                   []WorkerCapability
+	workItemFilters                *WorkItemFilters
+	workItemFiltersConfigured      bool
+	autoWorkItemFilters            bool
+	largePayloads                  *api.LargePayloadOptions
+	converter                      api.DataConverter
+	unversionedOrchestrators       map[string]struct{}
+	unversionedActivities          map[string]struct{}
+	reconnectRandom                randomInt64N
 	// waitFn overrides every delay the worker imposes on itself: reconnect
 	// backoff, transient RPC retry backoff, and work-item abandon delays. It is
 	// only set by tests so the deterministic delay schedule can be observed
@@ -112,21 +118,22 @@ type taskHubGrpcWorkerOptions struct {
 func defaultTaskHubGrpcWorkerOptions() taskHubGrpcWorkerOptions {
 	defaultConcurrency := 100 * runtime.GOMAXPROCS(0)
 	return taskHubGrpcWorkerOptions{
-		maxConcurrentOrchestrations: defaultConcurrency,
-		maxConcurrentActivities:     defaultConcurrency,
-		maxConcurrentEntities:       defaultConcurrency,
-		helloTimeout:                30 * time.Second,
-		silentDisconnectTimeout:     2 * time.Minute,
-		rpcTimeout:                  30 * time.Second,
-		reconnectBaseDelay:          200 * time.Millisecond,
-		reconnectMaxDelay:           15 * time.Second,
-		transientRetryMaxAttempts:   10,
-		transientRetryBaseDelay:     200 * time.Millisecond,
-		transientRetryMaxDelay:      15 * time.Second,
-		maxStreamedHistoryEvents:    DefaultMaxStreamedHistoryEvents,
-		maxStreamedHistoryBytes:     DefaultMaxStreamedHistoryBytes,
-		reconnectRandom:             rand.Int64N,
-		capabilities:                []WorkerCapability{WorkerCapabilityHistoryStreaming},
+		maxConcurrentOrchestrations:    defaultConcurrency,
+		maxConcurrentActivities:        defaultConcurrency,
+		maxConcurrentEntities:          defaultConcurrency,
+		helloTimeout:                   30 * time.Second,
+		silentDisconnectTimeout:        2 * time.Minute,
+		rpcTimeout:                     30 * time.Second,
+		reconnectBaseDelay:             200 * time.Millisecond,
+		reconnectMaxDelay:              15 * time.Second,
+		transientRetryMaxAttempts:      10,
+		transientRetryBaseDelay:        200 * time.Millisecond,
+		transientRetryMaxDelay:         15 * time.Second,
+		maxStreamedHistoryEvents:       DefaultMaxStreamedHistoryEvents,
+		maxStreamedHistoryBytes:        DefaultMaxStreamedHistoryBytes,
+		maxOrchestratorCompletionBytes: DefaultMaxOrchestratorCompletionBytes,
+		reconnectRandom:                rand.Int64N,
+		capabilities:                   []WorkerCapability{WorkerCapabilityHistoryStreaming},
 	}
 }
 
@@ -187,6 +194,23 @@ func WithMaxStreamedHistoryBytes(n int64) TaskHubGrpcWorkerOption {
 			)
 		}
 		options.maxStreamedHistoryBytes = n
+		return nil
+	}
+}
+
+// WithMaxOrchestratorCompletionBytes lowers the post-externalization response
+// bound used before completing an orchestration work item. Multiple options are
+// monotonic: a later option cannot raise an earlier transport-derived cap.
+func WithMaxOrchestratorCompletionBytes(n int) TaskHubGrpcWorkerOption {
+	return func(options *taskHubGrpcWorkerOptions) error {
+		if n < minOrchestratorCompletionBytes || n > DefaultMaxOrchestratorCompletionBytes {
+			return fmt.Errorf(
+				"maximum orchestrator completion bytes must be between %d and %d",
+				minOrchestratorCompletionBytes,
+				DefaultMaxOrchestratorCompletionBytes,
+			)
+		}
+		options.maxOrchestratorCompletionBytes = min(options.maxOrchestratorCompletionBytes, n)
 		return nil
 	}
 }
@@ -959,6 +983,9 @@ func (w *TaskHubGrpcWorker) runLoop(run *grpcWorkerRun, connection *grpcWorkerCo
 		if !isTransientWorkerError(err) {
 			return fmt.Errorf("work item stream stopped with a non-retryable error: %w", err)
 		}
+		if code := status.Code(err); code == codes.Unauthenticated || code == codes.PermissionDenied {
+			w.logger.Warnf("gRPC worker authentication or authorization failed; reconnecting so refreshed credentials or RBAC can recover: %v", err)
+		}
 		if observedMessage {
 			// The stream proved the endpoint healthy before it ended, so this is
 			// a drain rather than a poisoned connection and the escalating
@@ -1241,6 +1268,8 @@ func isTransientWorkerGRPCCode(code codes.Code) bool {
 	case codes.Canceled,
 		codes.DeadlineExceeded,
 		codes.NotFound,
+		codes.Unauthenticated,
+		codes.PermissionDenied,
 		codes.ResourceExhausted,
 		codes.Aborted,
 		codes.Internal,

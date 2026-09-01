@@ -586,8 +586,8 @@ func scheduleRetryPolicyFromPublic(policy *ScheduleRetryPolicy) (*scheduleRetryP
 	if policy == nil {
 		return nil, nil
 	}
-	taskPolicy := policy.taskPolicy()
-	if err := taskPolicy.Validate(); err != nil {
+	taskPolicy, err := policy.taskPolicy().Normalized()
+	if err != nil {
 		return nil, &ScheduleValidationError{Message: err.Error()}
 	}
 	return &scheduleRetryPolicy{
