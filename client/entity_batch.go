@@ -48,19 +48,24 @@ func entityBatchFromRequestV2(request *protos.EntityRequest) (*protos.EntityBatc
 			if _, err := uuid.Parse(event.RequestId); err != nil {
 				return nil, nil, fmt.Errorf("invalid entity call request ID %q: %w", event.RequestId, err)
 			}
+			if event.ParentInstanceId.GetValue() == "" {
+				return nil, nil, fmt.Errorf("entity call %q is missing its response destination", event.RequestId)
+			}
 			batch.Operations = append(batch.Operations, &protos.OperationRequest{
 				Operation: event.Operation,
 				RequestId: event.RequestId,
 				Input:     event.Input,
 			})
-			info := &protos.OperationInfo{RequestId: event.RequestId}
-			if event.ParentInstanceId.GetValue() != "" {
-				info.ResponseDestination = &protos.OrchestrationInstance{
+			info := &protos.OperationInfo{
+				RequestId: event.RequestId,
+				ResponseDestination: &protos.OrchestrationInstance{
 					InstanceId:  event.ParentInstanceId.GetValue(),
 					ExecutionId: event.ParentExecutionId,
-				}
+				},
 			}
 			operationInfos = append(operationInfos, info)
+		default:
+			return nil, nil, fmt.Errorf("unsupported entity operation history event")
 		}
 	}
 	if len(batch.Properties) == 0 {

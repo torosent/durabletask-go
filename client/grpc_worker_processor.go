@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -218,7 +219,13 @@ func (w *TaskHubGrpcWorker) processOrchestration(
 		}
 	}
 
-	results, err := w.executor.ExecuteOrchestrator(ctx, api.InstanceID(request.InstanceId), pastEvents, request.NewEvents)
+	results, err := w.executor.ExecuteOrchestrator(
+		ctx,
+		api.InstanceID(request.InstanceId),
+		pastEvents,
+		request.NewEvents,
+		request.EntityParameters,
+	)
 	var delayed workItemAbandonDelayError
 	if errors.As(err, &delayed) {
 		w.logger.Warnf("%s: orchestration work item rejected; abandoning it: %v", request.InstanceId, err)
@@ -585,7 +592,11 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 	}
 	if err := largepayload.TransformEntityBatchRequest(ctx, w.options.largePayloads, request); err != nil {
 		w.logger.Errorf("%s: failed to hydrate entity batch payloads: %v", request.GetInstanceId(), err)
-		w.abandonEntity(ctx, client, completionToken)
+		if entityProcessingCanceled(ctx, err) {
+			w.abandonEntity(ctx, client, completionToken)
+			return
+		}
+		w.completeEntityBatchFailure(ctx, client, request.GetInstanceId(), completionToken, err)
 		return
 	}
 	executor, ok := w.executor.(task.EntityExecutor)
@@ -594,39 +605,147 @@ func (w *TaskHubGrpcWorker) processEntityBatch(
 		w.abandonEntity(ctx, client, completionToken)
 		return
 	}
-	result, err := executor.ExecuteEntity(ctx, request)
+	result, err := executeEntitySafely(ctx, executor, request)
 	if err != nil {
-		w.logger.Errorf("%s: entity execution failed; abandoning work item: %v", request.GetInstanceId(), err)
-		w.abandonEntity(ctx, client, completionToken)
-		return
-	}
-	if result == nil {
-		w.logger.Errorf("%s: entity executor returned no result; abandoning work item", request.GetInstanceId())
-		w.abandonEntity(ctx, client, completionToken)
-		return
+		if entityProcessingCanceled(ctx, err) {
+			w.logger.Warnf("%s: entity execution canceled; abandoning work item", request.GetInstanceId())
+			w.abandonEntity(ctx, client, completionToken)
+			return
+		}
+		w.logger.Errorf("%s: entity execution failed: %v", request.GetInstanceId(), err)
+		result = newEntityBatchFailure(completionToken, err)
+	} else if result == nil {
+		missingResultErr := errors.New("entity executor returned no result")
+		w.logger.Errorf("%s: %v", request.GetInstanceId(), missingResultErr)
+		result = newEntityBatchFailure(completionToken, missingResultErr)
 	}
 	result.CompletionToken = completionToken
-	if len(operationInfos) > len(result.Results) {
-		operationInfos = operationInfos[:len(result.Results)]
+	if err := validateEntityBatchResult(result, len(request.Operations), operationInfos); err != nil {
+		w.logger.Errorf("%s: invalid entity executor result: %v", request.GetInstanceId(), err)
+		result = newEntityBatchFailure(completionToken, err)
 	}
-	result.OperationInfos = append([]*protos.OperationInfo(nil), operationInfos...)
 	if err := largepayload.TransformEntityBatchResult(ctx, w.options.largePayloads, result); err != nil {
 		w.logger.Errorf("%s: failed to externalize entity batch payloads: %v", request.GetInstanceId(), err)
-		w.abandonEntity(ctx, client, completionToken)
+		if entityProcessingCanceled(ctx, err) {
+			w.abandonEntity(ctx, client, completionToken)
+			return
+		}
+		w.completeEntityBatchFailure(ctx, client, request.GetInstanceId(), completionToken, err)
 		return
 	}
 
-	err = w.executeRPCWithRetry(ctx, "complete entity task", func(callCtx context.Context) error {
+	w.completeEntityBatchResult(ctx, client, request.GetInstanceId(), result)
+}
+
+func executeEntitySafely(
+	ctx context.Context,
+	executor task.EntityExecutor,
+	request *protos.EntityBatchRequest,
+) (result *protos.EntityBatchResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &entityExecutorPanicError{
+				message: fmt.Sprintf("entity executor panic: %v", recovered),
+				stack:   string(debug.Stack()),
+			}
+		}
+	}()
+	return executor.ExecuteEntity(ctx, request)
+}
+
+type entityExecutorPanicError struct {
+	message string
+	stack   string
+}
+
+func (e *entityExecutorPanicError) Error() string {
+	return e.message
+}
+
+func (e *entityExecutorPanicError) DurableTaskStackTrace() string {
+	return e.stack
+}
+
+func newEntityBatchFailure(completionToken string, err error) *protos.EntityBatchResult {
+	return &protos.EntityBatchResult{
+		CompletionToken: completionToken,
+		FailureDetails:  failure.FromError(err),
+	}
+}
+
+func (w *TaskHubGrpcWorker) completeEntityBatchFailure(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	instanceID string,
+	completionToken string,
+	err error,
+) {
+	w.completeEntityBatchResult(ctx, client, instanceID, newEntityBatchFailure(completionToken, err))
+}
+
+func validateEntityBatchResult(
+	result *protos.EntityBatchResult,
+	operationCount int,
+	operationInfos []*protos.OperationInfo,
+) error {
+	if result.FailureDetails != nil || result.RequiresState {
+		if result.FailureDetails != nil && result.RequiresState {
+			return fmt.Errorf("entity result cannot contain both failure details and a state request")
+		}
+		if len(result.Results) != 0 || len(result.Actions) != 0 || result.EntityState != nil ||
+			len(result.OperationInfos) != 0 {
+			return fmt.Errorf("entity batch failures and state requests must not contain partial effects")
+		}
+		result.OperationInfos = nil
+		return nil
+	}
+	if len(result.Results) != operationCount {
+		return fmt.Errorf(
+			"entity result count %d does not match operation count %d",
+			len(result.Results),
+			operationCount,
+		)
+	}
+	if len(result.OperationInfos) != 0 {
+		return fmt.Errorf("entity executor result must not set operation routing metadata")
+	}
+	if operationInfos == nil {
+		return nil
+	}
+	if len(operationInfos) != len(result.Results) {
+		return fmt.Errorf(
+			"V2 entity result count %d does not match operation count %d",
+			len(result.Results),
+			len(operationInfos),
+		)
+	}
+	result.OperationInfos = append([]*protos.OperationInfo(nil), operationInfos...)
+	return nil
+}
+
+func entityProcessingCanceled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+func (w *TaskHubGrpcWorker) completeEntityBatchResult(
+	ctx context.Context,
+	client protos.TaskHubSidecarServiceClient,
+	instanceID string,
+	result *protos.EntityBatchResult,
+) {
+	err := w.executeRPCWithRetry(ctx, "complete entity task", func(callCtx context.Context) error {
 		_, callErr := client.CompleteEntityTask(callCtx, result)
 		return callErr
 	})
 	if err != nil {
 		if isWorkItemGone(err) {
-			w.logger.Warnf("%s: entity work item was no longer available before completion", request.GetInstanceId())
+			w.logger.Warnf("%s: entity work item was no longer available before completion", instanceID)
 			return
 		}
-		w.logger.Errorf("%s: failed to complete entity work item: %v", request.GetInstanceId(), err)
-		w.abandonEntity(ctx, client, completionToken)
+		w.logger.Errorf("%s: failed to complete entity work item: %v", instanceID, err)
+		w.abandonEntity(ctx, client, result.CompletionToken)
 	}
 }
 
@@ -737,7 +856,8 @@ func (w *TaskHubGrpcWorker) abandonEntity(
 		w.logger.Warn("cannot abandon unsupported entity work item without a completion token")
 		return
 	}
-	if err := w.executeRPCWithRetry(ctx, "abandon entity task", func(callCtx context.Context) error {
+	abandonCtx := context.WithoutCancel(ctx)
+	if err := w.executeRPCWithRetry(abandonCtx, "abandon entity task", func(callCtx context.Context) error {
 		_, callErr := client.AbandonTaskEntityWorkItem(callCtx, &protos.AbandonEntityTaskRequest{
 			CompletionToken: completionToken,
 		})

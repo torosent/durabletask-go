@@ -735,10 +735,10 @@ func validateWorkItemFilters(filters *WorkItemFilters, snapshot task.TaskRegistr
 	}
 	entityNames := make(map[string]struct{}, len(snapshot.Entities))
 	for _, name := range snapshot.Entities {
-		entityNames[strings.ToLower(name)] = struct{}{}
+		entityNames[helpers.ToLowerInvariant(name)] = struct{}{}
 	}
 	for _, name := range filters.Entities {
-		if _, ok := entityNames[strings.ToLower(name)]; !ok {
+		if _, ok := entityNames[helpers.ToLowerInvariant(name)]; !ok {
 			return fmt.Errorf("entity work-item filter %q is not registered", name)
 		}
 	}
@@ -1143,7 +1143,7 @@ func cloneEntityFilters(rejectAll bool, names []string) ([]string, error) {
 	}
 	cloned := make([]string, len(names))
 	for i, name := range names {
-		normalized := strings.ToLower(strings.TrimSpace(name))
+		normalized := helpers.ToLowerInvariant(strings.TrimSpace(name))
 		if normalized == "" {
 			return nil, errors.New("entity filter name cannot be empty")
 		}

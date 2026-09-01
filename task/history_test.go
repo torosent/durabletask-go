@@ -24,14 +24,15 @@ func TestHistoryLimitFailsWithNonRetriableFailureByDefault(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxHistoryEvents: 1}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("limited", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +74,7 @@ func TestHistoryLimitHandlerContinuesAsNewAndPreservesExternalEvents(t *testing.
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -82,8 +84,8 @@ func TestHistoryLimitHandlerContinuesAsNewAndPreservesExternalEvents(t *testing.
 			helpers.NewEventRaisedEvent("first", wrapperspb.String("1")),
 			helpers.NewEventRaisedEvent("second", wrapperspb.String("2")),
 			helpers.NewOrchestratorStartedEvent(),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +123,7 @@ func TestMaxEventsPerTurnReportsPartialServiceConsumption(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 1}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -131,8 +134,8 @@ func TestMaxEventsPerTurnReportsPartialServiceConsumption(t *testing.T) {
 			helpers.NewResumeOrchestrationEvent("resume"),
 			helpers.NewEventRaisedEvent("first", wrapperspb.String("1")),
 			helpers.NewEventRaisedEvent("second", wrapperspb.String("2")),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,14 +159,15 @@ func TestMaxEventsPerTurnOmitsCountWhenAllEventsAreConsumed(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 2}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("all-consumed", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +199,7 @@ func TestMaxEventsPerTurnSupportsIncrementalRedelivery(t *testing.T) {
 		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 1}),
 	)
 
-	first, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, allEvents)
+	first, err := executor.ExecuteOrchestrator(context.Background(), instanceID, nil, allEvents, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +211,8 @@ func TestMaxEventsPerTurnSupportsIncrementalRedelivery(t *testing.T) {
 		context.Background(),
 		instanceID,
 		allEvents[:2],
-		allEvents[2:],
-	)
+		allEvents[2:], nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +224,8 @@ func TestMaxEventsPerTurnSupportsIncrementalRedelivery(t *testing.T) {
 		context.Background(),
 		instanceID,
 		allEvents[:3],
-		allEvents[3:],
-	)
+		allEvents[3:], nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,14 +258,15 @@ func TestOrchestratorCanHandleHistoryLimitExplicitly(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxHistoryEvents: 1}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("self-managed", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,14 +298,15 @@ func TestHistoryLimitHandlerFailureUsesWellKnownFailure(t *testing.T) {
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("limited", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,14 +338,15 @@ func TestHistoryMetricReportsTurnUsage(t *testing.T) {
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("metrics", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +373,7 @@ func TestHistoryLimitDoesNotOverrideCompletedOutcome(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxEventsPerTurn: 2}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -374,8 +382,8 @@ func TestHistoryLimitDoesNotOverrideCompletedOutcome(t *testing.T) {
 			helpers.NewExecutionStartedEvent("complete-before-limit", string(instanceID), nil, nil, nil, nil),
 			helpers.NewEventRaisedEvent("go", wrapperspb.String(`"done"`)),
 			helpers.NewEventRaisedEvent("extra", wrapperspb.String("1")),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,14 +413,15 @@ func TestMaxHistoryLimitDoesNotOverrideCompletedOutcome(t *testing.T) {
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
 		[]*protos.HistoryEvent{
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("complete-history-limit", string(instanceID), nil, nil, nil, nil),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,6 +450,7 @@ func TestHistoryLimitDoesNotOverrideTermination(t *testing.T) {
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -450,8 +460,8 @@ func TestHistoryLimitDoesNotOverrideTermination(t *testing.T) {
 			helpers.NewEventRaisedEvent("extra", wrapperspb.String("1")),
 			helpers.NewExecutionTerminatedEvent(wrapperspb.String(`"killed"`), false),
 			helpers.NewEventRaisedEvent("after", wrapperspb.String("2")),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,6 +505,7 @@ func TestMaxHistoryLimitDoesNotOverrideTermination(t *testing.T) {
 		registry,
 		WithOrchestrationOptions(OrchestrationOptions{MaxHistoryEvents: 1}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -502,8 +513,8 @@ func TestMaxHistoryLimitDoesNotOverrideTermination(t *testing.T) {
 			helpers.NewOrchestratorStartedEvent(),
 			helpers.NewExecutionStartedEvent("terminated", string(instanceID), nil, nil, nil, nil),
 			helpers.NewExecutionTerminatedEvent(wrapperspb.String("stop"), false),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,6 +543,7 @@ func TestHistoryLimitHandlerFailsWhenCarryoverCannotFit(t *testing.T) {
 			},
 		}),
 	).ExecuteOrchestrator(
+
 		context.Background(),
 		instanceID,
 		nil,
@@ -540,8 +552,8 @@ func TestHistoryLimitHandlerFailsWhenCarryoverCannotFit(t *testing.T) {
 			helpers.NewExecutionStartedEvent("fixed-point", string(instanceID), nil, nil, nil, nil),
 			helpers.NewEventRaisedEvent("one", wrapperspb.String("1")),
 			helpers.NewEventRaisedEvent("two", wrapperspb.String("2")),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}

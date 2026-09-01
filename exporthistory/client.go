@@ -35,7 +35,7 @@ type taskHubClient interface {
 	) (*api.OrchestrationMetadata, error)
 	TerminateOrchestration(ctx context.Context, id api.InstanceID, opts ...api.TerminateOptions) error
 	PurgeOrchestrationState(ctx context.Context, id api.InstanceID, opts ...api.PurgeOptions) error
-	FetchEntityMetadata(ctx context.Context, entityID api.EntityID, includeState bool) (*api.EntityMetadata, error)
+	GetEntity(ctx context.Context, entityID api.EntityID, options ...api.GetEntityOptions) (*api.EntityMetadata, error)
 	QueryEntities(ctx context.Context, query api.EntityQuery) (*api.EntityQueryResults, error)
 }
 
@@ -151,7 +151,6 @@ func (c *Client) ListJobs(ctx context.Context, query ExportJobQuery) (*ExportJob
 	}
 	entities, err := c.hub.QueryEntities(ctx, api.EntityQuery{
 		InstanceIDStartsWith: strings.ToLower("@"+ExportJobEntityName+"@") + query.JobIDPrefix,
-		IncludeState:         true,
 		PageSize:             pageSize,
 		ContinuationToken:    query.ContinuationToken,
 	})
@@ -302,12 +301,12 @@ func (c *JobClient) Describe(ctx context.Context) (*ExportJobDescription, error)
 	if c == nil || c.hub == nil {
 		return nil, &ValidationError{Message: "export job client is required"}
 	}
-	entity, err := c.hub.FetchEntityMetadata(ctx, EntityID(c.jobID), true)
-	if errors.Is(err, api.ErrInstanceNotFound) {
-		return nil, &NotFoundError{JobID: c.jobID}
-	}
+	entity, err := c.hub.GetEntity(ctx, EntityID(c.jobID))
 	if err != nil {
 		return nil, err
+	}
+	if entity == nil {
+		return nil, &NotFoundError{JobID: c.jobID}
 	}
 	description, err := jobDescription(entity)
 	if err != nil {

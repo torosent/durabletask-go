@@ -341,7 +341,28 @@ To read a long history, use `StreamOrchestrationHistory`. This method reads the 
 A durable entity is an addressable object that holds state. An entity does its operations one at a time.
 
 ```go
-registry.AddEntityN("counter", task.NewEntityFor[Counter]())
+type Counter struct {
+	task.EntityObjectBase[CounterState]
+}
+
+type CounterState struct {
+	Value int `json:"value"`
+}
+
+func (counter *Counter) Add(amount int) {
+	counter.State().Value += amount
+}
+
+func (counter *Counter) Get() int {
+	return counter.State().Value
+}
+
+counterFactory := task.NewEntityObjectFactory[CounterState, *Counter](
+	func(task.EntityFactoryContext) (*Counter, error) {
+		return new(Counter), nil
+	},
+)
+registry.AddEntityFactoryN("counter", counterFactory)
 counter := api.NewEntityID("counter", "orders")
 
 client.SignalEntity(ctx, counter, "Add", api.WithSignalInput(1))
@@ -353,7 +374,11 @@ registry.AddOrchestratorN("read-counter", func(ctx *task.OrchestrationContext) (
 })
 ```
 
-The SDK supports raw entity functions and struct-based dispatch. It also supports scheduled signals, orchestration calls, and entity-to-entity signals. You can query and clean up entities. You can use ordered critical sections across more than one entity.
+The SDK supports raw entity functions, state-struct dispatch, and persistent entity objects with separate durable state. Entity factories run once per operation batch, may run concurrently across batches, and can capture dependencies. A factory can return batch cleanup, and an entity object can implement `task.EntityBatchCloser`. Shared functions registered with `AddEntityN` must be thread-safe. Entity IDs use the compact JSON form `"@name@key"`. Reflected operations can use `task.OptionalEntityInput[T]` when input is optional.
+
+The SDK also supports scheduled signals, orchestration calls, entity-to-entity signals, queries, cleanup, and ordered critical sections across more than one entity.
+
+Entity names and operation names are matched case-insensitively using the same invariant rule as the .NET SDK, so a name resolves to the same entity in both SDKs.
 
 The DTS worker accepts the legacy `EntityBatchRequest` work item and the current `EntityRequestV2` work item.
 

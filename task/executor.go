@@ -14,6 +14,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/failure"
 	"github.com/microsoft/durabletask-go/internal/helpers"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -254,7 +255,17 @@ func (te *taskExecutor) ExecuteActivity(ctx context.Context, id api.InstanceID, 
 }
 
 // ExecuteOrchestrator implements Executor and executes an orchestrator function in the current goroutine.
-func (te *taskExecutor) ExecuteOrchestrator(_ context.Context, id api.InstanceID, oldEvents []*protos.HistoryEvent, newEvents []*protos.HistoryEvent) (*ExecutionResults, error) {
+func (te *taskExecutor) ExecuteOrchestrator(
+	_ context.Context,
+	id api.InstanceID,
+	oldEvents []*protos.HistoryEvent,
+	newEvents []*protos.HistoryEvent,
+	entityParameters *protos.OrchestratorEntityParameters,
+) (*ExecutionResults, error) {
+	entitiesSupported, err := validateEntityParameters(entityParameters)
+	if err != nil {
+		return nil, err
+	}
 	started := startedEvent(oldEvents, newEvents)
 	name := started.GetName()
 	version := started.GetVersion().GetValue()
@@ -298,6 +309,7 @@ func (te *taskExecutor) ExecuteOrchestrator(_ context.Context, id api.InstanceID
 		te.errorProperties,
 		te.versioning.defaultVersion(),
 		te.converter,
+		entitiesSupported,
 	)
 	actions := orchestrationCtx.start()
 	te.reportHistoryMetric(orchestrationCtx)
@@ -315,8 +327,41 @@ func (te *taskExecutor) ExecuteOrchestrator(_ context.Context, id api.InstanceID
 	return results, nil
 }
 
+func validateEntityParameters(parameters *protos.OrchestratorEntityParameters) (bool, error) {
+	if parameters == nil {
+		return false, nil
+	}
+	window := parameters.EntityMessageReorderWindow
+	if window == nil {
+		return false, &unsupportedEntityParametersError{
+			message: "entity message reorder window must be specified",
+		}
+	}
+	if err := window.CheckValid(); err != nil {
+		return false, &unsupportedEntityParametersError{
+			message: fmt.Sprintf("invalid entity message reorder window: %v", err),
+		}
+	}
+	duration := window.AsDuration()
+	switch {
+	case duration < 0:
+		return false, &unsupportedEntityParametersError{
+			message: "entity message reorder window must not be negative",
+		}
+	case duration > 0:
+		return false, &unsupportedEntityParametersError{
+			message: "positive entity message reorder windows are not supported by the DTS protocol",
+		}
+	default:
+		return true, nil
+	}
+}
+
 // ExecuteEntity executes an entity batch in the current goroutine.
-func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+func (te *taskExecutor) ExecuteEntity(
+	ctx context.Context,
+	req *protos.EntityBatchRequest,
+) (result *protos.EntityBatchResult, err error) {
 	if req == nil {
 		return nil, fmt.Errorf("entity batch request must not be nil")
 	}
@@ -324,7 +369,12 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 	if err != nil {
 		return nil, fmt.Errorf("invalid entity instance ID: %w", err)
 	}
-	invoker, ok := te.Registry.getEntity(entityID.Name)
+	if !entityStateIncluded(req.Properties) {
+		// The scheduler omitted the entity state, so the batch cannot run until
+		// it is retransmitted.
+		return &protos.EntityBatchResult{RequiresState: true}, nil
+	}
+	factory, ok := te.Registry.getEntityFactory(entityID.Name)
 	if !ok {
 		result := &protos.EntityBatchResult{
 			EntityState: req.EntityState,
@@ -346,17 +396,27 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 		}
 		return result, nil
 	}
-	if req.EntityState == nil {
-		if property, exists := req.Properties["entityStateIncluded"]; exists && !property.GetBoolValue() {
-			return &protos.EntityBatchResult{RequiresState: true}, nil
-		}
+	batch, err := factory(EntityFactoryContext{Context: ctx, ID: entityID})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create entity %q: %w", entityID.Name, err)
+	}
+	if batch.Close != nil {
+		defer func() {
+			if closeErr := batch.Close(ctx); closeErr != nil {
+				result = nil
+				err = fmt.Errorf("failed to close entity batch %q: %w", entityID.Name, closeErr)
+			}
+		}()
+	}
+	if batch.Entity == nil {
+		return nil, fmt.Errorf("entity factory %q returned a nil implementation", entityID.Name)
 	}
 
 	var state entityState
 	if req.EntityState != nil {
 		state = entityState{value: []byte(req.EntityState.Value), hasValue: true}
 	}
-	result := &protos.EntityBatchResult{
+	result = &protos.EntityBatchResult{
 		Results: make([]*protos.OperationResult, 0, len(req.Operations)),
 		Actions: make([]*protos.OperationAction, 0),
 	}
@@ -374,11 +434,11 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 		startedAt := time.Now().UTC()
 		isSignal := req.Properties[helpers.EntitySignalProperty(operation.RequestId)].GetBoolValue()
 		operationCtx := te.newEntityContext(ctx, entityID, operation, state, nextActionID, startedAt, isSignal)
-		output, operationErr := invokeEntity(invoker, operationCtx)
+		output, operationErr := invokeEntity(batch.Entity, operationCtx)
 		endedAt := time.Now().UTC()
 
 		var rawResult *wrapperspb.StringValue
-		if operationErr == nil && output != nil {
+		if operationErr == nil && !isNilEntityValue(output) {
 			bytes, marshalErr := marshalData(te.converter, output)
 			if marshalErr != nil {
 				operationErr = fmt.Errorf("failed to marshal entity result: %w", marshalErr)
@@ -417,6 +477,20 @@ func (te *taskExecutor) ExecuteEntity(ctx context.Context, req *protos.EntityBat
 	return result, nil
 }
 
+// entityStateIncluded reports whether the scheduler attached entity state to the
+// work item. It mirrors .NET's GrpcInstanceRunnerUtils: a missing property, or
+// one whose value is not a boolean, means the state was included.
+func entityStateIncluded(properties map[string]*structpb.Value) bool {
+	property, exists := properties["IncludeState"]
+	if !exists {
+		return true
+	}
+	if _, isBool := property.GetKind().(*structpb.Value_BoolValue); !isBool {
+		return true
+	}
+	return property.GetBoolValue()
+}
+
 func (te *taskExecutor) newEntityContext(
 	ctx context.Context,
 	entityID api.EntityID,
@@ -444,11 +518,14 @@ func (te *taskExecutor) newEntityContext(
 	)
 	ctx = context.WithValue(ctx, taskLoggerKey{}, logger)
 	return &EntityContext{
-		ID:          entityID,
-		Operation:   operation.Operation,
-		RequestID:   operation.RequestId,
-		IsSignal:    isSignal,
-		rawInput:    []byte(operation.Input.GetValue()),
+		ID:        entityID,
+		Operation: operation.Operation,
+		RequestID: operation.RequestId,
+		IsSignal:  isSignal,
+		rawInput: entityPayload{
+			value:   []byte(operation.Input.GetValue()),
+			present: operation.Input != nil,
+		},
 		state:       state,
 		actionIDSeq: nextActionID,
 		currentTime: currentTime,

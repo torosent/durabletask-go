@@ -72,6 +72,7 @@ type OrchestrationContext struct {
 	customStatus             string
 	defaultVersion           string
 	converter                api.DataConverter
+	entitiesSupported        bool
 	scheduler                *coroutineScheduler
 	root                     *OrchestrationContext
 	scope                    *cancellationScope
@@ -254,6 +255,7 @@ func newOrchestrationContext(
 	errorProperties api.ErrorPropertiesProvider,
 	defaultVersion string,
 	converter api.DataConverter,
+	entitiesSupported bool,
 ) *OrchestrationContext {
 	ctx := &OrchestrationContext{
 		ID:                        id,
@@ -263,6 +265,7 @@ func newOrchestrationContext(
 		orchestrationOptions:      normalizeOrchestrationOptions(options),
 		defaultVersion:            defaultVersion,
 		converter:                 api.NormalizeDataConverter(converter),
+		entitiesSupported:         entitiesSupported,
 		registry:                  registry,
 		oldEvents:                 oldEvents,
 		newEvents:                 newEvents,
@@ -995,6 +998,9 @@ func (ctx *OrchestrationContext) CallEntity(entityID api.EntityID, operationName
 		task.cancel()
 		return task
 	}
+	if !engine.entitiesSupported {
+		return ctx.newFailedTask(engine, errEntitiesUnsupported)
+	}
 	options := new(callEntityOptions)
 	for _, configure := range opts {
 		if err := configure(options, engine.converter); err != nil {
@@ -1053,6 +1059,9 @@ func (ctx *OrchestrationContext) SignalEntity(entityID api.EntityID, operationNa
 	if engine.isTerminated || ctx.scope.isCanceled() {
 		return ErrTaskCanceled
 	}
+	if !engine.entitiesSupported {
+		return errEntitiesUnsupported
+	}
 	options := new(signalEntityOptions)
 	for _, configure := range opts {
 		if err := configure(options, engine.converter); err != nil {
@@ -1089,6 +1098,9 @@ func (ctx *OrchestrationContext) LockEntities(entityIDs ...api.EntityID) (func()
 	engine := ctx.engineContext()
 	if engine.isTerminated || ctx.scope.isCanceled() {
 		return nil, ErrTaskCanceled
+	}
+	if !engine.entitiesSupported {
+		return nil, errEntitiesUnsupported
 	}
 	if engine.criticalSectionID != "" {
 		return nil, fmt.Errorf("nested entity critical sections are not supported")

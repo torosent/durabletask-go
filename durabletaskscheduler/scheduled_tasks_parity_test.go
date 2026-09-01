@@ -16,6 +16,7 @@ import (
 	"github.com/microsoft/durabletask-go/internal/tagcodec"
 	"github.com/microsoft/durabletask-go/task"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -1013,6 +1014,8 @@ func TestScheduleEntityPreservesTextPayloads(t *testing.T) {
 
 			description, err := scheduleDescription(&api.EntityMetadata{
 				InstanceID:      api.NewEntityID(ScheduleEntityName, test.scheduleID),
+				StateIncluded:   true,
+				HasState:        true,
 				SerializedState: updated.EntityState.GetValue(),
 			}, nil)
 			require.NoError(t, err)
@@ -1306,7 +1309,6 @@ func TestScheduleClientNotFoundMatrix(t *testing.T) {
 		wantNil  bool
 		wantDesc bool
 	}{
-		{name: "missing entity", backend: &recordingScheduleBackend{fetchErr: api.ErrInstanceNotFound}, wantErr: true, wantNil: true},
 		{name: "nil metadata", backend: &recordingScheduleBackend{}, wantErr: true, wantNil: true},
 		{
 			name:    "empty serialized state",
@@ -1317,6 +1319,8 @@ func TestScheduleClientNotFoundMatrix(t *testing.T) {
 			name: "present schedule",
 			backend: &recordingScheduleBackend{entity: &api.EntityMetadata{
 				InstanceID:      scheduleEntityID("daily"),
+				StateIncluded:   true,
+				HasState:        true,
 				SerializedState: marshalScheduleState(seededScheduleState(ScheduleStatusActive)).GetValue(),
 			}},
 			wantDesc: true,
@@ -1464,7 +1468,7 @@ func TestScheduleClientListFiltersAndValidates(t *testing.T) {
 			}
 			require.Equal(t, test.want, ids)
 			require.Equal(t, "@schedule@"+test.query.ScheduleIDPrefix, backend.query.InstanceIDStartsWith)
-			require.True(t, backend.query.IncludeState)
+			require.False(t, backend.query.ExcludeState)
 		})
 	}
 }
@@ -1602,6 +1606,8 @@ func listedSchedule(t *testing.T, id string, status ScheduleStatus, created time
 	state.ScheduleConfiguration.ScheduleID = id
 	return &api.EntityMetadata{
 		InstanceID:      scheduleEntityID(id),
+		StateIncluded:   true,
+		HasState:        true,
 		SerializedState: marshalScheduleState(state).GetValue(),
 	}
 }
@@ -1614,7 +1620,13 @@ func executeScheduleOperationTurn(
 ) *protos.OrchestratorResponse {
 	t.Helper()
 	result, err := task.NewTaskExecutor(registry).ExecuteOrchestrator(
-		context.Background(), api.InstanceID("op"), oldEvents, newEvents)
+		context.Background(),
+		api.InstanceID("op"),
+		oldEvents,
+		newEvents,
+		&protos.OrchestratorEntityParameters{EntityMessageReorderWindow: durationpb.New(0)},
+	)
+
 	require.NoError(t, err)
 	return result.Response
 }
@@ -1694,10 +1706,10 @@ func (b *recordingScheduleBackend) WaitForOrchestrationCompletion(
 	return &api.OrchestrationMetadata{RuntimeStatus: api.RUNTIME_STATUS_COMPLETED}, nil
 }
 
-func (b *recordingScheduleBackend) FetchEntityMetadata(
+func (b *recordingScheduleBackend) GetEntity(
 	context.Context,
 	api.EntityID,
-	bool,
+	...api.GetEntityOptions,
 ) (*api.EntityMetadata, error) {
 	return b.entity, b.fetchErr
 }

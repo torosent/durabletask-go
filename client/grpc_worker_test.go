@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -97,10 +98,12 @@ type fakeSchedulerClient struct {
 	activityCompletions      []*protos.ActivityResponse
 	entityCompletions        []*protos.EntityBatchResult
 	activityCompletionErr    error
+	entityCompletionErr      error
 	orchestrationAbandons    int
 	activityAbandons         int
 	entityAbandonAttempts    int
 	entityAbandonFailures    int
+	entityAbandonContextErr  error
 }
 
 func (c *fakeSchedulerClient) Hello(context.Context, *emptypb.Empty, ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -149,7 +152,7 @@ func (c *fakeSchedulerClient) CompleteEntityTask(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entityCompletions = append(c.entityCompletions, response)
-	return &protos.CompleteTaskResponse{}, nil
+	return &protos.CompleteTaskResponse{}, c.entityCompletionErr
 }
 
 func (c *fakeSchedulerClient) StreamInstanceHistory(
@@ -183,12 +186,13 @@ func (c *fakeSchedulerClient) AbandonTaskActivityWorkItem(
 }
 
 func (c *fakeSchedulerClient) AbandonTaskEntityWorkItem(
-	context.Context,
-	*protos.AbandonEntityTaskRequest,
-	...grpc.CallOption,
+	ctx context.Context,
+	_ *protos.AbandonEntityTaskRequest,
+	_ ...grpc.CallOption,
 ) (*protos.AbandonEntityTaskResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.entityAbandonContextErr = ctx.Err()
 	c.entityAbandonAttempts++
 	if c.entityAbandonAttempts <= c.entityAbandonFailures {
 		return nil, status.Error(codes.Unavailable, "transient")
@@ -196,10 +200,23 @@ func (c *fakeSchedulerClient) AbandonTaskEntityWorkItem(
 	return &protos.AbandonEntityTaskResponse{}, nil
 }
 
+func TestTaskHubGrpcWorkerAbandonsEntityWithIndependentContext(t *testing.T) {
+	client := new(fakeSchedulerClient)
+	worker := newFakeWorker(t, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	worker.abandonEntity(ctx, client, "token")
+
+	require.Equal(t, 1, client.entityAbandonAttempts)
+	require.NoError(t, client.entityAbandonContextErr)
+}
+
 type recordingExecutor struct {
 	executeOrchestrator func(context.Context, api.InstanceID, []*protos.HistoryEvent, []*protos.HistoryEvent) (*task.ExecutionResults, error)
 	executeActivity     func(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error)
 	executeEntity       func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
+	entityParameters    *protos.OrchestratorEntityParameters
 }
 
 func (e *recordingExecutor) ExecuteOrchestrator(
@@ -207,7 +224,9 @@ func (e *recordingExecutor) ExecuteOrchestrator(
 	id api.InstanceID,
 	pastEvents []*protos.HistoryEvent,
 	newEvents []*protos.HistoryEvent,
+	entityParameters *protos.OrchestratorEntityParameters,
 ) (*task.ExecutionResults, error) {
+	e.entityParameters = entityParameters
 	return e.executeOrchestrator(ctx, id, pastEvents, newEvents)
 }
 
@@ -445,6 +464,16 @@ func TestTaskHubGrpcWorkerDoesNotAbandonExpiredActivityLease(t *testing.T) {
 	defer client.mu.Unlock()
 	require.Len(t, client.activityCompletions, 1)
 	require.Zero(t, client.activityAbandons)
+}
+
+// Entity work-item filters are normalized with the same invariant rule as entity
+// instance IDs, so a filter keeps matching its own entity name.
+func TestEntityWorkItemFiltersUseInvariantCasing(t *testing.T) {
+	filters, err := cloneWorkItemFilters(&WorkItemFilters{Entities: []string{"İstanbul"}})
+	require.NoError(t, err)
+	entityID, err := api.EntityIDFromString(api.NewEntityID("İstanbul", "key").String())
+	require.NoError(t, err)
+	require.True(t, matchesEntityWorkItemFilters(filters, entityID.Name))
 }
 
 func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
@@ -1031,6 +1060,330 @@ func TestTaskHubGrpcWorkerCompletesLegacyAndV2EntityBatches(t *testing.T) {
 	client.mu.Unlock()
 	cancel()
 	require.NoError(t, worker.Shutdown(context.Background()))
+}
+
+func TestTaskHubGrpcWorkerForwardsEntityParameters(t *testing.T) {
+	client := new(fakeSchedulerClient)
+	worker := newFakeWorker(t, client)
+	executor := &recordingExecutor{
+		executeOrchestrator: func(
+			context.Context,
+			api.InstanceID,
+			[]*protos.HistoryEvent,
+			[]*protos.HistoryEvent,
+		) (*task.ExecutionResults, error) {
+			return &task.ExecutionResults{Response: &protos.OrchestratorResponse{}}, nil
+		},
+	}
+	worker.executor = executor
+	parameters := &protos.OrchestratorEntityParameters{
+		EntityMessageReorderWindow: durationpb.New(0),
+	}
+	worker.processOrchestration(context.Background(), client, "token", &protos.OrchestratorRequest{
+		InstanceId: "instance",
+		NewEvents: []*protos.HistoryEvent{
+			helpers.NewOrchestratorStartedEvent(),
+			helpers.NewExecutionStartedEvent("orchestration", "instance", nil, nil, nil, nil),
+		},
+		EntityParameters: parameters,
+	})
+	require.Same(t, parameters, executor.entityParameters)
+}
+
+func TestTaskHubGrpcWorkerAbandonsUnsupportedEntityParameters(t *testing.T) {
+	tests := map[string]*protos.OrchestratorEntityParameters{
+		"missing-window": {},
+		"negative-window": {
+			EntityMessageReorderWindow: durationpb.New(-time.Second),
+		},
+		"positive-window": {
+			EntityMessageReorderWindow: durationpb.New(time.Second),
+		},
+		"malformed-window": {
+			EntityMessageReorderWindow: &durationpb.Duration{Seconds: 1, Nanos: -1},
+		},
+	}
+	for name, parameters := range tests {
+		t.Run(name, func(t *testing.T) {
+			client := new(fakeSchedulerClient)
+			waits := new(recordedWaits)
+			worker := newFakeWorker(t, client, withRecordedWaits(waits))
+			worker.processOrchestration(context.Background(), client, "token", &protos.OrchestratorRequest{
+				InstanceId: "instance",
+				NewEvents: []*protos.HistoryEvent{
+					helpers.NewOrchestratorStartedEvent(),
+					helpers.NewExecutionStartedEvent("orchestration", "instance", nil, nil, nil, nil),
+				},
+				EntityParameters: parameters,
+			})
+			require.Equal(t, 1, client.orchestrationAbandons)
+			require.Empty(t, client.orchestrationCompletions)
+			require.NotEmpty(t, waits.snapshot())
+		})
+	}
+}
+
+func TestTaskHubGrpcWorkerCompletesEntityFrameworkFailure(t *testing.T) {
+	client := new(fakeSchedulerClient)
+	worker := newFakeWorker(t, client)
+	worker.executor = &recordingExecutor{
+		executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+			return nil, errors.New("framework failed")
+		},
+	}
+
+	worker.processEntityBatch(
+		context.Background(),
+		client,
+		"entity-token",
+		&protos.EntityBatchRequest{
+			InstanceId: "@counter@key",
+			Operations: []*protos.OperationRequest{{Operation: "get"}},
+		},
+		nil,
+	)
+
+	require.Len(t, client.entityCompletions, 1)
+	completion := client.entityCompletions[0]
+	require.Equal(t, "entity-token", completion.CompletionToken)
+	require.Contains(t, completion.FailureDetails.ErrorMessage, "framework failed")
+	require.Empty(t, completion.Results)
+	require.Empty(t, completion.Actions)
+	require.Empty(t, completion.OperationInfos)
+	require.Zero(t, client.entityAbandonAttempts)
+}
+
+func TestTaskHubGrpcWorkerCompletesEntityExecutorPanicAndNilResult(t *testing.T) {
+	tests := []struct {
+		name          string
+		executeEntity func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error)
+		errorContains string
+	}{
+		{
+			name: "panic",
+			executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+				panic("executor panic")
+			},
+			errorContains: "executor panic",
+		},
+		{
+			name: "nil result",
+			executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+				return nil, nil
+			},
+			errorContains: "returned no result",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := new(fakeSchedulerClient)
+			worker := newFakeWorker(t, client)
+			worker.executor = &recordingExecutor{executeEntity: test.executeEntity}
+			worker.processEntityBatch(
+				context.Background(),
+				client,
+				"entity-token",
+				&protos.EntityBatchRequest{InstanceId: "@counter@key"},
+				nil,
+			)
+			require.Len(t, client.entityCompletions, 1)
+			require.Contains(t, client.entityCompletions[0].FailureDetails.ErrorMessage, test.errorContains)
+		})
+	}
+}
+
+type failingPayloadBackend struct {
+	storeErr   error
+	resolveErr error
+}
+
+func (backend *failingPayloadBackend) Store(context.Context, []byte) (string, error) {
+	return "", backend.storeErr
+}
+
+func (backend *failingPayloadBackend) Resolve(context.Context, string) ([]byte, error) {
+	return nil, backend.resolveErr
+}
+
+func TestTaskHubGrpcWorkerCompletesEntityPayloadFailures(t *testing.T) {
+	makeExternalizedInput := func(t *testing.T) (*payload.MemoryStore, *wrapperspb.StringValue) {
+		t.Helper()
+		store := payload.NewMemoryStore()
+		input, err := largepayload.Externalize(
+			context.Background(),
+			&api.LargePayloadOptions{
+				Store:           store,
+				Resolver:        store,
+				ThresholdBytes:  1,
+				MaxPayloadBytes: 1024,
+			},
+			wrapperspb.String(`"large"`),
+		)
+		require.NoError(t, err)
+		return store, input
+	}
+
+	t.Run("hydration", func(t *testing.T) {
+		store, input := makeExternalizedInput(t)
+		client := new(fakeSchedulerClient)
+		worker := newFakeWorker(t, client, WithWorkerLargePayloads(&api.LargePayloadOptions{
+			Store:           store,
+			Resolver:        &failingPayloadBackend{resolveErr: errors.New("hydrate failed")},
+			ThresholdBytes:  1,
+			MaxPayloadBytes: 1024,
+		}))
+		worker.processEntityBatch(
+			context.Background(),
+			client,
+			"token",
+			&protos.EntityBatchRequest{
+				InstanceId: "@counter@key",
+				Operations: []*protos.OperationRequest{{Operation: "run", Input: input}},
+			},
+			nil,
+		)
+		require.Len(t, client.entityCompletions, 1)
+		require.Contains(t, client.entityCompletions[0].FailureDetails.ErrorMessage, "hydrate failed")
+	})
+
+	t.Run("hydration cancellation", func(t *testing.T) {
+		store, input := makeExternalizedInput(t)
+		client := new(fakeSchedulerClient)
+		worker := newFakeWorker(t, client, WithWorkerLargePayloads(&api.LargePayloadOptions{
+			Store:           store,
+			Resolver:        &failingPayloadBackend{resolveErr: context.Canceled},
+			ThresholdBytes:  1,
+			MaxPayloadBytes: 1024,
+		}))
+		worker.processEntityBatch(
+			context.Background(),
+			client,
+			"token",
+			&protos.EntityBatchRequest{
+				InstanceId: "@counter@key",
+				Operations: []*protos.OperationRequest{{Operation: "run", Input: input}},
+			},
+			nil,
+		)
+		require.Empty(t, client.entityCompletions)
+		require.Equal(t, 1, client.entityAbandonAttempts)
+		require.NoError(t, client.entityAbandonContextErr)
+	})
+
+	t.Run("externalization fallback", func(t *testing.T) {
+		backend := &failingPayloadBackend{
+			storeErr:   errors.New("externalize failed"),
+			resolveErr: errors.New("resolve failed"),
+		}
+		client := new(fakeSchedulerClient)
+		worker := newFakeWorker(t, client, WithWorkerLargePayloads(&api.LargePayloadOptions{
+			Store:           backend,
+			Resolver:        backend,
+			ThresholdBytes:  1,
+			MaxPayloadBytes: 1024,
+		}))
+		worker.executor = &recordingExecutor{
+			executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+				return &protos.EntityBatchResult{EntityState: wrapperspb.String("large")}, nil
+			},
+		}
+		worker.processEntityBatch(
+			context.Background(),
+			client,
+			"token",
+			&protos.EntityBatchRequest{InstanceId: "@counter@key"},
+			nil,
+		)
+		require.Len(t, client.entityCompletions, 1)
+		completion := client.entityCompletions[0]
+		require.Contains(t, completion.FailureDetails.ErrorMessage, "externalize failed")
+		require.Nil(t, completion.EntityState)
+	})
+}
+
+func TestTaskHubGrpcWorkerAbandonsWhenEntityFailureFallbackCannotComplete(t *testing.T) {
+	backend := &failingPayloadBackend{
+		storeErr:   errors.New("externalize failed"),
+		resolveErr: errors.New("resolve failed"),
+	}
+	client := &fakeSchedulerClient{entityCompletionErr: status.Error(codes.InvalidArgument, "cannot complete")}
+	worker := newFakeWorker(t, client, WithWorkerLargePayloads(&api.LargePayloadOptions{
+		Store:           backend,
+		Resolver:        backend,
+		ThresholdBytes:  1,
+		MaxPayloadBytes: 1024,
+	}))
+	worker.executor = &recordingExecutor{
+		executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+			return &protos.EntityBatchResult{EntityState: wrapperspb.String("large")}, nil
+		},
+	}
+
+	worker.processEntityBatch(
+		context.Background(),
+		client,
+		"token",
+		&protos.EntityBatchRequest{InstanceId: "@counter@key"},
+		nil,
+	)
+	require.Equal(t, 1, client.entityAbandonAttempts)
+}
+
+func TestTaskHubGrpcWorkerConvertsInvalidEntityResultsToBatchFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		result         *protos.EntityBatchResult
+		operationInfos []*protos.OperationInfo
+		errorContains  string
+	}{
+		{
+			name:          "V1 result count mismatch",
+			result:        &protos.EntityBatchResult{},
+			errorContains: "does not match operation count",
+		},
+		{
+			name:           "V2 result count mismatch",
+			result:         &protos.EntityBatchResult{},
+			operationInfos: []*protos.OperationInfo{{RequestId: uuid.NewString()}},
+			errorContains:  "does not match operation count",
+		},
+		{
+			name: "batch failure with partial state",
+			result: &protos.EntityBatchResult{
+				FailureDetails: &protos.TaskFailureDetails{ErrorMessage: "failed"},
+				EntityState:    wrapperspb.String("partial"),
+			},
+			errorContains: "must not contain partial effects",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := new(fakeSchedulerClient)
+			worker := newFakeWorker(t, client)
+			worker.executor = &recordingExecutor{
+				executeEntity: func(context.Context, *protos.EntityBatchRequest) (*protos.EntityBatchResult, error) {
+					return test.result, nil
+				},
+			}
+
+			worker.processEntityBatch(
+				context.Background(),
+				client,
+				"entity-token",
+				&protos.EntityBatchRequest{
+					InstanceId: "@counter@key",
+					Operations: []*protos.OperationRequest{{Operation: "get"}},
+				},
+				test.operationInfos,
+			)
+
+			require.Len(t, client.entityCompletions, 1)
+			completion := client.entityCompletions[0]
+			require.Contains(t, completion.FailureDetails.ErrorMessage, test.errorContains)
+			require.Empty(t, completion.OperationInfos)
+			require.Nil(t, completion.EntityState)
+		})
+	}
 }
 
 func TestTaskHubGrpcWorkerAbandonsInvalidV2EntityWithBoundedRetry(t *testing.T) {

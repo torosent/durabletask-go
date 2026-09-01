@@ -11,7 +11,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -38,8 +37,13 @@ func run() error {
 		return fmt.Errorf("failed to register counter entity: %w", err)
 	}
 
-	// Pattern 2: Register an auto-dispatch entity backed by a struct
-	if err := r.AddEntityN("bankaccount", task.NewEntityFor[BankAccount]()); err != nil {
+	// Pattern 2: Register a persistent entity object with separate durable state.
+	bankAccountFactory := task.NewEntityObjectFactory[BankAccountState, *BankAccount](
+		func(task.EntityFactoryContext) (*BankAccount, error) {
+			return new(BankAccount), nil
+		},
+	)
+	if err := r.AddEntityFactoryN("bankaccount", bankAccountFactory); err != nil {
 		return fmt.Errorf("failed to register bank account entity: %w", err)
 	}
 	if err := r.AddOrchestratorN("transfer", TransferOrchestrator); err != nil {
@@ -166,25 +170,33 @@ func CounterEntity(ctx *task.EntityContext) (any, error) {
 
 // BankAccount is a struct-based entity. Public methods are automatically
 // dispatched by operation name (case-insensitive).
-type BankAccount struct {
+type BankAccountState struct {
 	Balance int `json:"balance"`
 }
 
+type BankAccount struct {
+	task.EntityObjectBase[BankAccountState]
+}
+
 func (a *BankAccount) Deposit(amount int) (any, error) {
-	a.Balance += amount
-	return a.Balance, nil
+	a.State().Balance += amount
+	return a.State().Balance, nil
 }
 
 func (a *BankAccount) Withdraw(amount int) (any, error) {
-	if amount > a.Balance {
-		return nil, fmt.Errorf("insufficient funds: balance=%d, withdrawal=%d", a.Balance, amount)
+	if amount > a.State().Balance {
+		return nil, fmt.Errorf(
+			"insufficient funds: balance=%d, withdrawal=%d",
+			a.State().Balance,
+			amount,
+		)
 	}
-	a.Balance -= amount
-	return a.Balance, nil
+	a.State().Balance -= amount
+	return a.State().Balance, nil
 }
 
 func (a *BankAccount) Get() (any, error) {
-	return a.Balance, nil
+	return a.State().Balance, nil
 }
 
 type TransferInput struct {
@@ -234,13 +246,13 @@ func waitForEntityState(
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		metadata, err := client.FetchEntityMetadata(ctx, entityID, true)
+		metadata, err := client.GetEntity(ctx, entityID)
 		// The entity does not exist until the service has processed its first
 		// signal, so a not-found result means "not ready yet", not a failure.
-		if err != nil && !errors.Is(err, api.ErrInstanceNotFound) {
+		if err != nil {
 			return nil, err
 		}
-		if err == nil && metadata != nil && metadata.SerializedState == expected {
+		if metadata != nil && metadata.SerializedState == expected {
 			return metadata, nil
 		}
 		select {

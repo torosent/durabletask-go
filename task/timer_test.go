@@ -336,8 +336,8 @@ func executeTimerTurn(
 		context.Background(),
 		instanceID,
 		oldEvents,
-		newEvents,
-	)
+		newEvents, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}

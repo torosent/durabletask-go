@@ -682,7 +682,7 @@ func TestDTSEmulatorDurableEntities(t *testing.T) {
 
 	require.NoError(t, managementClient.SignalEntity(ctx, entityID, "add", api.WithSignalInput(5)))
 	require.Eventually(t, func() bool {
-		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		metadata, err := managementClient.GetEntity(ctx, entityID)
 		return err == nil && metadata != nil && metadata.SerializedState == "5"
 	}, 20*time.Second, 100*time.Millisecond)
 
@@ -695,11 +695,11 @@ func TestDTSEmulatorDurableEntities(t *testing.T) {
 		api.WithSignalScheduledTime(scheduledAt),
 	))
 	require.Never(t, func() bool {
-		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		metadata, err := managementClient.GetEntity(ctx, entityID)
 		return err == nil && metadata != nil && metadata.SerializedState == "10"
 	}, 300*time.Millisecond, 50*time.Millisecond)
 	require.Eventually(t, func() bool {
-		metadata, err := managementClient.FetchEntityMetadata(ctx, entityID, true)
+		metadata, err := managementClient.GetEntity(ctx, entityID)
 		return err == nil && metadata != nil && metadata.SerializedState == "10"
 	}, 20*time.Second, 100*time.Millisecond)
 
@@ -725,7 +725,6 @@ func TestDTSEmulatorDurableEntities(t *testing.T) {
 
 	query, err := managementClient.QueryEntities(ctx, api.EntityQuery{
 		InstanceIDStartsWith: entityID.String(),
-		IncludeState:         true,
 	})
 	require.NoError(t, err)
 	require.Len(t, query.Entities, 1)

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,27 @@ import (
 // An entity function receives an EntityContext and returns a result and error.
 type Entity func(ctx *EntityContext) (any, error)
 
+// EntityFactoryContext identifies the entity batch for which an implementation is created.
+type EntityFactoryContext struct {
+	Context context.Context
+	ID      api.EntityID
+}
+
+// EntityBatch contains one batch-scoped entity implementation and optional cleanup.
+type EntityBatch struct {
+	Entity Entity
+	Close  func(context.Context) error
+}
+
+// EntityBatchCloser can release object resources after an entity batch completes.
+type EntityBatchCloser interface {
+	CloseEntityBatch(context.Context) error
+}
+
+// EntityFactory creates one entity implementation for an operation batch.
+// Factories may run concurrently for different entity batches.
+type EntityFactory func(EntityFactoryContext) (EntityBatch, error)
+
 // EntityContext provides the execution context for an entity operation.
 type EntityContext struct {
 	ID        api.EntityID
@@ -26,7 +48,7 @@ type EntityContext struct {
 	RequestID string
 	IsSignal  bool
 
-	rawInput    []byte
+	rawInput    entityPayload
 	state       entityState
 	stateDirty  bool
 	actions     []*protos.OperationAction
@@ -38,14 +60,30 @@ type EntityContext struct {
 	parentTrace *protos.TraceContext
 }
 
+type entityPayload struct {
+	value   []byte
+	present bool
+}
+
 type entityState struct {
 	value    []byte
 	hasValue bool
 }
 
+// HasInput reports whether the caller supplied an operation input.
+func (ctx *EntityContext) HasInput() bool {
+	return ctx.rawInput.present
+}
+
 // GetInput unmarshals the serialized entity operation input and saves the result into [v].
 func (ctx *EntityContext) GetInput(v any) error {
-	return unmarshalData(ctx.converter, ctx.rawInput, v)
+	if !ctx.HasInput() {
+		return fmt.Errorf("entity operation has no input")
+	}
+	if v == nil {
+		return nil
+	}
+	return api.NormalizeDataConverter(ctx.converter).Deserialize(string(ctx.rawInput.value), v)
 }
 
 // SerializeInput serializes a value using the entity's configured data converter.
@@ -86,13 +124,16 @@ func (ctx *EntityContext) GetState(v any) error {
 	if !ctx.state.hasValue {
 		return fmt.Errorf("entity has no state")
 	}
-	return unmarshalData(ctx.converter, ctx.state.value, v)
+	if v == nil {
+		return nil
+	}
+	return api.NormalizeDataConverter(ctx.converter).Deserialize(string(ctx.state.value), v)
 }
 
 // SetState serializes and stores entity state with the configured converter.
 // Passing nil deletes the entity state.
 func (ctx *EntityContext) SetState(state any) error {
-	if state == nil {
+	if isNilEntityValue(state) {
 		ctx.DeleteState()
 		return nil
 	}
@@ -155,13 +196,9 @@ func (ctx *EntityContext) signalEntity(entityID api.EntityID, operationName stri
 		return fmt.Errorf("entity operation name must not be empty")
 	}
 
-	var rawInput *wrapperspb.StringValue
-	if input != nil {
-		bytes, err := marshalData(ctx.converter, input)
-		if err != nil {
-			return fmt.Errorf("failed to serialize signal input: %w", err)
-		}
-		rawInput = wrapperspb.String(string(bytes))
+	rawInput, err := marshalEntityInput(ctx.converter, input)
+	if err != nil {
+		return fmt.Errorf("failed to serialize signal input: %w", err)
 	}
 
 	action := &protos.OperationAction{
@@ -238,11 +275,11 @@ type EntityStartOrchestrationOption func(*entityStartOrchestrationOptions, api.D
 // WithEntityStartOrchestrationInput sets the input for the new orchestration.
 func WithEntityStartOrchestrationInput(input any) EntityStartOrchestrationOption {
 	return func(opts *entityStartOrchestrationOptions, converter api.DataConverter) error {
-		bytes, err := marshalData(converter, input)
+		rawInput, err := marshalEntityInput(converter, input)
 		if err != nil {
 			return fmt.Errorf("failed to serialize orchestration input: %w", err)
 		}
-		opts.rawInput = wrapperspb.String(string(bytes))
+		opts.rawInput = rawInput
 		return nil
 	}
 }
@@ -294,11 +331,11 @@ type callEntityOptions struct {
 // WithEntityInput configures an input for an entity operation invocation.
 func WithEntityInput(input any) callEntityOption {
 	return func(opt *callEntityOptions, converter api.DataConverter) error {
-		data, err := marshalData(converter, input)
+		rawInput, err := marshalEntityInput(converter, input)
 		if err != nil {
 			return err
 		}
-		opt.rawInput = wrapperspb.String(string(data))
+		opt.rawInput = rawInput
 		return nil
 	}
 }
@@ -322,13 +359,58 @@ type signalEntityOptions struct {
 // WithSignalEntityInput configures an input for a signal entity invocation.
 func WithSignalEntityInput(input any) signalEntityOption {
 	return func(opt *signalEntityOptions, converter api.DataConverter) error {
-		data, err := marshalData(converter, input)
+		rawInput, err := marshalEntityInput(converter, input)
 		if err != nil {
 			return err
 		}
-		opt.rawInput = wrapperspb.String(string(data))
+		opt.rawInput = rawInput
 		return nil
 	}
+}
+
+// OptionalEntityInput binds an entity method input that may be omitted by the caller.
+type OptionalEntityInput[T any] struct {
+	Value   T
+	Present bool
+}
+
+// Or returns the input value when present, or defaultValue when absent.
+func (input OptionalEntityInput[T]) Or(defaultValue T) T {
+	if input.Present {
+		return input.Value
+	}
+	return defaultValue
+}
+
+type optionalEntityInputBinder interface {
+	bindEntityInput(*EntityContext) error
+}
+
+func (input *OptionalEntityInput[T]) bindEntityInput(ctx *EntityContext) error {
+	input.Present = ctx.HasInput()
+	if !input.Present {
+		return nil
+	}
+	return ctx.GetInput(&input.Value)
+}
+
+func marshalEntityInput(converter api.DataConverter, input any) (*wrapperspb.StringValue, error) {
+	if isNilEntityValue(input) {
+		return nil, nil
+	}
+	payload, err := marshalData(converter, input)
+	if err != nil {
+		return nil, err
+	}
+	return wrapperspb.String(string(payload)), nil
+}
+
+func isNilEntityValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	return isNilable(reflected.Kind()) && reflected.IsNil()
 }
 
 // WithRawSignalEntityInput configures a raw input for a signal entity invocation.

@@ -24,6 +24,7 @@ type Executor interface {
 		iid api.InstanceID,
 		oldEvents []*protos.HistoryEvent,
 		newEvents []*protos.HistoryEvent,
+		entityParameters *protos.OrchestratorEntityParameters,
 	) (*ExecutionResults, error)
 	ExecuteActivity(context.Context, api.InstanceID, *protos.HistoryEvent) (*protos.HistoryEvent, error)
 	Shutdown(ctx context.Context) error

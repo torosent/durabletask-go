@@ -135,10 +135,10 @@ func (f *fakeBackend) PurgeOrchestrationState(
 	return f.purgeErr
 }
 
-func (f *fakeBackend) FetchEntityMetadata(
+func (f *fakeBackend) GetEntity(
 	_ context.Context,
 	_ api.EntityID,
-	_ bool,
+	_ ...api.GetEntityOptions,
 ) (*api.EntityMetadata, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -165,7 +165,12 @@ func entityMetadata(t *testing.T, jobID string, state ExportJobState) *api.Entit
 	t.Helper()
 	payload, err := json.Marshal(state)
 	require.NoError(t, err)
-	return &api.EntityMetadata{InstanceID: EntityID(jobID), SerializedState: string(payload)}
+	return &api.EntityMetadata{
+		InstanceID:      EntityID(jobID),
+		StateIncluded:   true,
+		HasState:        true,
+		SerializedState: string(payload),
+	}
 }
 
 func newTestClient(t *testing.T, hub *fakeBackend, options ClientOptions) *Client {
@@ -431,7 +436,6 @@ func TestGetJob(t *testing.T) {
 
 	t.Run("maps a missing instance to not found", func(t *testing.T) {
 		hub := newFakeBackend()
-		hub.entityErr = api.ErrInstanceNotFound
 		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, ErrJobNotFound)
@@ -439,7 +443,10 @@ func TestGetJob(t *testing.T) {
 
 	t.Run("a deleted entity with empty state is not found", func(t *testing.T) {
 		hub := newFakeBackend()
-		hub.entity = &api.EntityMetadata{InstanceID: EntityID("job-1")}
+		hub.entity = &api.EntityMetadata{
+			InstanceID:    EntityID("job-1"),
+			StateIncluded: true,
+		}
 		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.ErrorIs(t, err, ErrJobNotFound)
@@ -447,7 +454,12 @@ func TestGetJob(t *testing.T) {
 
 	t.Run("corrupt state surfaces a deserialization error", func(t *testing.T) {
 		hub := newFakeBackend()
-		hub.entity = &api.EntityMetadata{InstanceID: EntityID("job-1"), SerializedState: "not json"}
+		hub.entity = &api.EntityMetadata{
+			InstanceID:      EntityID("job-1"),
+			StateIncluded:   true,
+			HasState:        true,
+			SerializedState: "not json",
+		}
 		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		_, err := client.GetJob(context.Background(), "job-1")
 		require.Error(t, err)
@@ -490,7 +502,7 @@ func TestListJobs(t *testing.T) {
 		assert.Equal(t, "job-2", result.Jobs[1].JobID)
 		assert.Equal(t, "next", result.ContinuationToken)
 		assert.Equal(t, "@exportjob@", hub.lastQuery.InstanceIDStartsWith)
-		assert.True(t, hub.lastQuery.IncludeState)
+		assert.False(t, hub.lastQuery.ExcludeState)
 		assert.Equal(t, int32(DefaultJobQueryPageSize), hub.lastQuery.PageSize)
 	})
 
@@ -684,7 +696,6 @@ func TestCreateClearsTheRunOfATerminalJob(t *testing.T) {
 
 	t.Run("a job that does not exist needs no cleanup", func(t *testing.T) {
 		hub := newFakeBackend()
-		hub.entityErr = api.ErrInstanceNotFound
 		client := newTestClient(t, hub, ClientOptions{ContainerName: "container"})
 		job, err := client.JobClient("job-1")
 		require.NoError(t, err)

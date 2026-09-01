@@ -2,6 +2,7 @@ package task
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/microsoft/durabletask-go/api"
@@ -11,6 +12,33 @@ import (
 
 type testCounter struct {
 	Value int `json:"value"`
+}
+
+func Test_EntityDispatcher_ConcurrentFirstUse(t *testing.T) {
+	entity := NewEntityFor[testCounter]()
+	var wait sync.WaitGroup
+	failures := make(chan error, 32)
+	for i := 0; i < 32; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			result, err := entity(&EntityContext{
+				ID:        api.NewEntityID("counter", "key"),
+				Operation: "Add",
+				rawInput:  presentEntityPayload("1"),
+			})
+			if err != nil {
+				failures <- err
+			} else if result != 1 {
+				failures <- fmt.Errorf("result = %v, want 1", result)
+			}
+		}()
+	}
+	wait.Wait()
+	close(failures)
+	for err := range failures {
+		require.NoError(t, err)
+	}
 }
 
 func (c *testCounter) Add(amount int) (any, error) {
@@ -34,7 +62,7 @@ func Test_EntityDispatcher_BasicOperations(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("counter", "test"),
 		Operation: "Add",
-		rawInput:  []byte("5"),
+		rawInput:  presentEntityPayload("5"),
 	}
 	result, err := entity(ctx)
 	require.NoError(t, err)
@@ -53,7 +81,7 @@ func Test_EntityDispatcher_CaseInsensitive(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("counter", "test"),
 		Operation: "add", // lowercase
-		rawInput:  []byte("10"),
+		rawInput:  presentEntityPayload("10"),
 	}
 	result, err := entity(ctx)
 	require.NoError(t, err)
@@ -66,7 +94,7 @@ func Test_EntityDispatcher_WithExistingState(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("counter", "test"),
 		Operation: "Add",
-		rawInput:  []byte("3"),
+		rawInput:  presentEntityPayload("3"),
 		state:     entityState{value: []byte(`{"value":7}`), hasValue: true},
 	}
 	result, err := entity(ctx)
@@ -188,7 +216,7 @@ func Test_EntityDispatcher_CaseInsensitiveMethodMatching(t *testing.T) {
 			ctx := &EntityContext{
 				ID:        api.NewEntityID("counter", "k"),
 				Operation: op,
-				rawInput:  []byte("7"),
+				rawInput:  presentEntityPayload("7"),
 			}
 			result, err := entity(ctx)
 			require.NoError(t, err)
@@ -211,18 +239,16 @@ func Test_EntityDispatcher_GetFromExistingState(t *testing.T) {
 	assert.Equal(t, 42, result)
 }
 
-// Add_NoInput: in Go, missing input for int results in zero value
-func Test_EntityDispatcher_MissingInputUsesZeroValue(t *testing.T) {
+func Test_EntityDispatcher_MissingRequiredInputFails(t *testing.T) {
 	entity := NewEntityFor[testCounter]()
 
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("counter", "k"),
 		Operation: "Add",
-		// no rawInput — int will default to 0
 	}
-	result, err := entity(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 0, result) // 0 + 0 = 0
+	_, err := entity(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected an input value")
 }
 
 // ImplicitDelete_ClearsState: default delete operation clears state
@@ -368,7 +394,7 @@ func Test_EntityDispatcher_StateMachine(t *testing.T) {
 	t.Run("create then complete", func(t *testing.T) {
 		ctx := &EntityContext{
 			ID: api.NewEntityID("job", "1"), Operation: "Create",
-			rawInput: []byte(`"myJob"`),
+			rawInput: presentEntityPayload(`"myJob"`),
 		}
 		result, err := entity(ctx)
 		require.NoError(t, err)
@@ -395,14 +421,14 @@ func Test_EntityDispatcher_StateMachine(t *testing.T) {
 	t.Run("create twice fails", func(t *testing.T) {
 		ctx := &EntityContext{
 			ID: api.NewEntityID("job", "3"), Operation: "Create",
-			rawInput: []byte(`"first"`),
+			rawInput: presentEntityPayload(`"first"`),
 		}
 		_, err := entity(ctx)
 		require.NoError(t, err)
 
 		ctx2 := &EntityContext{
 			ID: api.NewEntityID("job", "3"), Operation: "Create",
-			rawInput: []byte(`"second"`), state: ctx.state,
+			rawInput: presentEntityPayload(`"second"`), state: ctx.state,
 		}
 		_, err = entity(ctx2)
 		require.Error(t, err)
@@ -412,7 +438,7 @@ func Test_EntityDispatcher_StateMachine(t *testing.T) {
 	t.Run("create then fail then recreate", func(t *testing.T) {
 		ctx := &EntityContext{
 			ID: api.NewEntityID("job", "4"), Operation: "Create",
-			rawInput: []byte(`"v1"`),
+			rawInput: presentEntityPayload(`"v1"`),
 		}
 		_, err := entity(ctx)
 		require.NoError(t, err)
@@ -435,7 +461,7 @@ func Test_EntityDispatcher_StateMachine(t *testing.T) {
 
 		ctx4 := &EntityContext{
 			ID: api.NewEntityID("job", "4"), Operation: "Create",
-			rawInput: []byte(`"v2"`),
+			rawInput: presentEntityPayload(`"v2"`),
 		}
 		result, err := entity(ctx4)
 		require.NoError(t, err)
@@ -510,7 +536,7 @@ func Test_EntityDispatcher_ContextAndInputBinding(t *testing.T) {
 
 	ctx := &EntityContext{
 		ID: api.NewEntityID("logger", "main"), Operation: "Process",
-		rawInput: []byte(`"hello world"`),
+		rawInput: presentEntityPayload(`"hello world"`),
 	}
 	result, err := entity(ctx)
 	require.NoError(t, err)
@@ -539,7 +565,7 @@ func Test_EntityDispatcher_ExplicitContextStateWins(t *testing.T) {
 	ctx := &EntityContext{
 		ID:        api.NewEntityID("explicit", "k"),
 		Operation: "Replace",
-		rawInput:  []byte("5"),
+		rawInput:  presentEntityPayload("5"),
 	}
 	result, err := entity(ctx)
 	require.NoError(t, err)
@@ -580,9 +606,9 @@ func (*invalidSignatureEntity) Panics() {
 	panic("boom")
 }
 
-func Test_EntityDispatcher_InvalidReflectionNeverLeaksPanic(t *testing.T) {
+func Test_EntityDispatcher_InvalidSignaturesReturnErrors(t *testing.T) {
 	entity := NewEntityFor[invalidSignatureEntity]()
-	for _, operation := range []string{"TooManyInputs", "WrongSecondReturn", "Panics"} {
+	for _, operation := range []string{"TooManyInputs", "WrongSecondReturn"} {
 		t.Run(operation, func(t *testing.T) {
 			ctx := &EntityContext{ID: api.NewEntityID("invalid", "key"), Operation: operation}
 			assert.NotPanics(t, func() {
@@ -591,6 +617,61 @@ func Test_EntityDispatcher_InvalidReflectionNeverLeaksPanic(t *testing.T) {
 			})
 		})
 	}
+}
+
+func Test_EntityDispatcher_UserPanicEscapesReflection(t *testing.T) {
+	entity := NewEntityFor[invalidSignatureEntity]()
+	ctx := &EntityContext{ID: api.NewEntityID("invalid", "key"), Operation: "Panics"}
+	assert.PanicsWithValue(t, "boom", func() {
+		_, _ = entity(ctx)
+	})
+}
+
+type optionalInputEntity struct {
+	Value int `json:"value"`
+}
+
+func (entity *optionalInputEntity) Add(input OptionalEntityInput[int]) int {
+	entity.Value += input.Or(5)
+	return entity.Value
+}
+
+func Test_EntityDispatcher_OptionalInput(t *testing.T) {
+	entity := NewEntityFor[optionalInputEntity]()
+
+	absent := &EntityContext{ID: api.NewEntityID("optional", "key"), Operation: "Add"}
+	result, err := entity(absent)
+	require.NoError(t, err)
+	require.Equal(t, 5, result)
+
+	present := &EntityContext{
+		ID:        api.NewEntityID("optional", "key"),
+		Operation: "Add",
+		rawInput:  presentEntityPayload("3"),
+		state:     absent.state,
+	}
+	result, err = entity(present)
+	require.NoError(t, err)
+	require.Equal(t, 8, result)
+}
+
+type nullableInputEntity struct{}
+
+func (*nullableInputEntity) IsNil(value *string) bool {
+	return value == nil
+}
+
+func Test_EntityDispatcher_JSONNullIsPresent(t *testing.T) {
+	entity := NewEntityFor[nullableInputEntity]()
+	ctx := &EntityContext{
+		ID:        api.NewEntityID("nullable", "key"),
+		Operation: "IsNil",
+		rawInput:  presentEntityPayload("null"),
+	}
+	result, err := entity(ctx)
+	require.NoError(t, err)
+	require.Equal(t, true, result)
+	require.True(t, ctx.HasInput())
 }
 
 type caseCollisionEntity struct{}

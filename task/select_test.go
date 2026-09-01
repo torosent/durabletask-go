@@ -265,6 +265,7 @@ func executeOrchestrationTurn(
 		instanceID,
 		oldEvents,
 		newEvents,
+		supportedEntityParameters(),
 	)
 	if err != nil {
 		t.Fatal(err)

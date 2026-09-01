@@ -148,8 +148,8 @@ func TestRetryDoesNotScheduleTimerPastRetryTimeout(t *testing.T) {
 				ErrorType:    "TransientFailure",
 				ErrorMessage: "retry me",
 			}),
-		},
-	)
+		}, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,14 +204,16 @@ func TestRetryDecisionIsStableWhenCompletionIsRedelivered(t *testing.T) {
 
 	// First delivery: the failure arrives as a new event.
 	first, err := executor.ExecuteOrchestrator(
-		context.Background(), instanceIDStableRetry, committed, delivered)
+		context.Background(), instanceIDStableRetry, committed, delivered, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Redelivery after a lost response: the identical failure is now replayed
 	// history, so IsReplaying flips while the decision must not.
 	second, err := executor.ExecuteOrchestrator(
-		context.Background(), instanceIDStableRetry, append(committed, delivered...), nil)
+		context.Background(), instanceIDStableRetry, append(committed, delivered...), nil, nil)
+
 	if err != nil {
 		t.Fatal(err)
 	}

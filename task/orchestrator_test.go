@@ -7,7 +7,14 @@ import (
 
 	"github.com/microsoft/durabletask-go/api"
 	"github.com/microsoft/durabletask-go/internal/protos"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+func supportedEntityParameters() *protos.OrchestratorEntityParameters {
+	return &protos.OrchestratorEntityParameters{
+		EntityMessageReorderWindow: durationpb.New(0),
+	}
+}
 
 func newTestOrchestrationContext(
 	registry *TaskRegistry,
@@ -26,6 +33,7 @@ func newTestOrchestrationContext(
 		nil,
 		"",
 		api.DefaultDataConverter(),
+		true,
 	)
 }
 

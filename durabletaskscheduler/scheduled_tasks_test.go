@@ -136,7 +136,7 @@ func TestScheduleClientTargetsUnversionedOperationOrchestrator(t *testing.T) {
 }
 
 func TestScheduleClientGetReturnsNilForMissingSchedule(t *testing.T) {
-	backend := &scheduleClientBackend{fetchErr: api.ErrInstanceNotFound}
+	backend := &scheduleClientBackend{}
 	client := &ScheduledTaskClient{client: backend}
 	description, err := client.Get(context.Background(), "missing")
 	require.NoError(t, err)
@@ -500,7 +500,7 @@ func (b *scheduleClientBackend) WaitForOrchestrationCompletion(context.Context, 
 	return &api.OrchestrationMetadata{RuntimeStatus: api.RUNTIME_STATUS_COMPLETED}, nil
 }
 
-func (b *scheduleClientBackend) FetchEntityMetadata(context.Context, api.EntityID, bool) (*api.EntityMetadata, error) {
+func (b *scheduleClientBackend) GetEntity(context.Context, api.EntityID, ...api.GetEntityOptions) (*api.EntityMetadata, error) {
 	return nil, b.fetchErr
 }
 

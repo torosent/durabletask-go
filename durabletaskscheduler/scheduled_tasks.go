@@ -741,8 +741,10 @@ func scheduleEntityWithDefaultVersion(ctx *task.EntityContext, defaultVersion st
 	switch {
 	case strings.EqualFold(ctx.Operation, deleteScheduleOperation):
 		var token string
-		if err := ctx.GetInput(&token); err != nil {
-			return nil, err
+		if ctx.HasInput() {
+			if err := ctx.GetInput(&token); err != nil {
+				return nil, err
+			}
 		}
 		if token != "" && token != state.ExecutionToken {
 			return nil, nil
@@ -1267,7 +1269,7 @@ func cloneStrings[M ~map[string]string](values M) map[string]string {
 type scheduledTaskBackend interface {
 	ScheduleNewOrchestration(context.Context, string, ...api.NewOrchestrationOptions) (api.InstanceID, error)
 	WaitForOrchestrationCompletion(context.Context, api.InstanceID, ...api.FetchOrchestrationMetadataOptions) (*api.OrchestrationMetadata, error)
-	FetchEntityMetadata(context.Context, api.EntityID, bool) (*api.EntityMetadata, error)
+	GetEntity(context.Context, api.EntityID, ...api.GetEntityOptions) (*api.EntityMetadata, error)
 	QueryEntities(context.Context, api.EntityQuery) (*api.EntityQueryResults, error)
 }
 
@@ -1358,7 +1360,6 @@ func (c *ScheduledTaskClient) List(ctx context.Context, query ScheduleQuery) (*S
 	}
 	entities, err := c.client.QueryEntities(ctx, api.EntityQuery{
 		InstanceIDStartsWith: "@schedule@" + query.ScheduleIDPrefix,
-		IncludeState:         true,
 		PageSize:             pageSize,
 		ContinuationToken:    query.ContinuationToken,
 	})
@@ -1413,12 +1414,12 @@ func (c *ScheduleClient) Describe(ctx context.Context) (*ScheduleDescription, er
 	if c == nil || c.client == nil {
 		return nil, fmt.Errorf("schedule client is required")
 	}
-	entity, err := c.client.FetchEntityMetadata(ctx, scheduleEntityID(c.scheduleID), true)
-	if errors.Is(err, api.ErrInstanceNotFound) {
-		return nil, &ScheduleNotFoundError{ScheduleID: c.scheduleID}
-	}
+	entity, err := c.client.GetEntity(ctx, scheduleEntityID(c.scheduleID))
 	if err != nil {
 		return nil, err
+	}
+	if entity == nil {
+		return nil, &ScheduleNotFoundError{ScheduleID: c.scheduleID}
 	}
 	description, err := scheduleDescription(entity, c.converter)
 	if err != nil {

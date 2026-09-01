@@ -32,6 +32,9 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		ctx.DeleteState()
 		return nil, nil
 	case strings.EqualFold(ctx.Operation, createOperation):
+		if !ctx.HasInput() {
+			return nil, &ValidationError{JobID: jobID, Message: "export job creation options are required"}
+		}
 		var options JobCreationOptions
 		if err := ctx.GetInput(&options); err != nil {
 			return nil, &ValidationError{JobID: jobID, Message: "export job creation options are not valid JSON"}
@@ -46,7 +49,9 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		var request RunJobRequest
 		// Run carries an optional fencing token, so an absent input is not an
 		// error.
-		_ = ctx.GetInput(&request)
+		if ctx.HasInput() {
+			_ = ctx.GetInput(&request)
+		}
 		if dropsStaleMutation(ctx, &state, "a run signal", request.RunToken) {
 			return nil, nil
 		}
@@ -76,7 +81,9 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		var request MarkAsCompletedRequest
 		// MarkAsCompleted carries an optional fencing token, so an absent input
 		// is not an error.
-		_ = ctx.GetInput(&request)
+		if ctx.HasInput() {
+			_ = ctx.GetInput(&request)
+		}
 		if dropsStaleMutation(ctx, &state, "a completion", request.RunToken) {
 			return nil, nil
 		}
@@ -87,7 +94,9 @@ func exportJobEntity(ctx *task.EntityContext) (any, error) {
 		var request MarkAsFailedRequest
 		// MarkAsFailed carries an optional message and fencing token, so an
 		// absent input is not an error.
-		_ = ctx.GetInput(&request)
+		if ctx.HasInput() {
+			_ = ctx.GetInput(&request)
+		}
 		if dropsStaleMutation(ctx, &state, "a failure", request.RunToken) {
 			return nil, nil
 		}
