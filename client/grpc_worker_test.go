@@ -466,6 +466,16 @@ func TestTaskHubGrpcWorkerDoesNotAbandonExpiredActivityLease(t *testing.T) {
 	require.Zero(t, client.activityAbandons)
 }
 
+// Entity work-item filters are normalized with the same invariant rule as entity
+// instance IDs, so a filter keeps matching its own entity name.
+func TestEntityWorkItemFiltersUseInvariantCasing(t *testing.T) {
+	filters, err := cloneWorkItemFilters(&WorkItemFilters{Entities: []string{"İstanbul"}})
+	require.NoError(t, err)
+	entityID, err := api.EntityIDFromString(api.NewEntityID("İstanbul", "key").String())
+	require.NoError(t, err)
+	require.True(t, matchesEntityWorkItemFilters(filters, entityID.Name))
+}
+
 func TestWorkItemFiltersApplyIndependentlyByKind(t *testing.T) {
 	filters, err := cloneWorkItemFilters(&WorkItemFilters{
 		Entities: []string{"Counter"},

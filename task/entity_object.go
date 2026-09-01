@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/microsoft/durabletask-go/internal/helpers"
 )
 
 // EntityObjectBase binds a persistent entity object to its current state and operation context.
@@ -62,6 +64,9 @@ func WithEntityStateDispatch[S any]() EntityObjectOption[S] {
 
 // NewEntityObjectFactory creates one persistent entity object per batch while
 // storing only S as durable state.
+//
+// Operation binding is validated when the factory is created, so a malformed
+// entity object fails at startup instead of failing every batch at runtime.
 func NewEntityObjectFactory[S any, E EntityObjectBinding[S]](
 	factory func(EntityFactoryContext) (E, error),
 	configure ...EntityObjectOption[S],
@@ -70,14 +75,26 @@ func NewEntityObjectFactory[S any, E EntityObjectBinding[S]](
 	if stateType.Kind() == reflect.Pointer {
 		panic("NewEntityObjectFactory does not support pointer state types")
 	}
+	if factory == nil {
+		panic("NewEntityObjectFactory requires an entity object factory")
+	}
 	options := entityObjectOptions[S]{}
 	for _, apply := range configure {
 		apply(&options)
 	}
-	return func(factoryContext EntityFactoryContext) (EntityBatch, error) {
-		if factory == nil {
-			return EntityBatch{}, fmt.Errorf("entity object factory must not be nil")
+
+	// A concrete type parameter is validated eagerly. An interface type
+	// parameter only reveals its operations once the object is created.
+	var staticSets *entityObjectMethodSets
+	if objectType := reflect.TypeFor[E](); objectType.Kind() != reflect.Interface {
+		sets, err := newEntityObjectMethodSets(objectType, stateType)
+		if err != nil {
+			panic(err.Error())
 		}
+		staticSets = sets
+	}
+
+	return func(factoryContext EntityFactoryContext) (EntityBatch, error) {
 		object, err := factory(factoryContext)
 		if err != nil {
 			return EntityBatch{}, err
@@ -89,35 +106,15 @@ func NewEntityObjectFactory[S any, E EntityObjectBinding[S]](
 		if closer, ok := any(object).(EntityBatchCloser); ok {
 			batch.Close = closer.CloseEntityBatch
 		}
-		failSetup := func(setupErr error) (EntityBatch, error) {
-			if batch.Close == nil {
-				return EntityBatch{}, setupErr
-			}
-			if closeErr := batch.Close(factoryContext.Context); closeErr != nil {
-				return EntityBatch{}, errors.Join(
-					setupErr,
-					fmt.Errorf("failed to close entity batch after setup failure: %w", closeErr),
-				)
-			}
-			return EntityBatch{}, setupErr
-		}
 
 		objectValue := reflect.ValueOf(object)
-		objectMethods, err := collectEntityMethods(
-			objectValue.Type(),
-			"closeentitybatch",
-			"context",
-			"state",
-		)
-		if err != nil {
-			return failSetup(err)
+		sets := staticSets
+		if sets == nil {
+			sets, err = newEntityObjectMethodSets(objectValue.Type(), stateType)
+			if err != nil {
+				return closeAfterSetupFailure(factoryContext, batch, err)
+			}
 		}
-		stateMethods, err := collectEntityMethods(reflect.PointerTo(stateType))
-		if err != nil {
-			return failSetup(err)
-		}
-		objectMethodSet := entityMethodSet{methods: objectMethods}
-		stateMethodSet := entityMethodSet{methods: stateMethods}
 
 		batch.Entity = func(ctx *EntityContext) (any, error) {
 			var state S
@@ -134,12 +131,12 @@ func NewEntityObjectFactory[S any, E EntityObjectBinding[S]](
 			}
 			object.bindEntityObject(ctx, &state)
 
-			result, found, err := objectMethodSet.call(ctx, objectValue)
+			result, found, err := sets.object.call(ctx, objectValue)
 			if err != nil {
 				return nil, err
 			}
 			if !found && options.allowStateDispatch {
-				result, found, err = stateMethodSet.call(ctx, reflect.ValueOf(&state))
+				result, found, err = sets.state.call(ctx, reflect.ValueOf(&state))
 				if err != nil {
 					return nil, err
 				}
@@ -162,6 +159,53 @@ func NewEntityObjectFactory[S any, E EntityObjectBinding[S]](
 	}
 }
 
+// entityObjectMethodSets holds the dispatch tables shared by every batch of one
+// registered entity object.
+type entityObjectMethodSets struct {
+	object *entityMethodSet
+	state  *entityMethodSet
+}
+
+func newEntityObjectMethodSets(
+	objectType reflect.Type,
+	stateType reflect.Type,
+) (*entityObjectMethodSets, error) {
+	objectMethods, err := collectEntityMethods(
+		objectType,
+		"closeentitybatch",
+		"context",
+		"state",
+	)
+	if err != nil {
+		return nil, err
+	}
+	stateMethods, err := collectEntityMethods(reflect.PointerTo(stateType))
+	if err != nil {
+		return nil, err
+	}
+	return &entityObjectMethodSets{
+		object: &entityMethodSet{methods: objectMethods},
+		state:  &entityMethodSet{methods: stateMethods},
+	}, nil
+}
+
+func closeAfterSetupFailure(
+	factoryContext EntityFactoryContext,
+	batch EntityBatch,
+	setupErr error,
+) (EntityBatch, error) {
+	if batch.Close == nil {
+		return EntityBatch{}, setupErr
+	}
+	if closeErr := batch.Close(factoryContext.Context); closeErr != nil {
+		return EntityBatch{}, errors.Join(
+			setupErr,
+			fmt.Errorf("failed to close entity batch after setup failure: %w", closeErr),
+		)
+	}
+	return EntityBatch{}, setupErr
+}
+
 func collectEntityMethods(
 	targetType reflect.Type,
 	excludedNames ...string,
@@ -169,7 +213,7 @@ func collectEntityMethods(
 	methods := make(map[string]reflect.Method)
 	for i := 0; i < targetType.NumMethod(); i++ {
 		method := targetType.Method(i)
-		name := strings.ToLower(method.Name)
+		name := helpers.ToLowerInvariant(method.Name)
 		if slices.Contains(excludedNames, name) {
 			continue
 		}

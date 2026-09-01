@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/microsoft/durabletask-go/api"
+	"github.com/microsoft/durabletask-go/internal/helpers"
 )
 
 var (
@@ -47,7 +48,7 @@ type entityMethodSet struct {
 }
 
 func (set *entityMethodSet) call(ctx *EntityContext, receiver reflect.Value) (any, bool, error) {
-	operation := strings.ToLower(ctx.Operation)
+	operation := helpers.ToLowerInvariant(ctx.Operation)
 	method, found := set.methods[operation]
 	if !found {
 		return nil, false, nil
@@ -87,7 +88,7 @@ func NewEntityFor[S any]() Entity {
 	pointerType := reflect.PointerTo(stateType)
 	for i := 0; i < pointerType.NumMethod(); i++ {
 		method := pointerType.Method(i)
-		name := strings.ToLower(method.Name)
+		name := helpers.ToLowerInvariant(method.Name)
 		if existing, ok := methods[name]; ok {
 			panic(fmt.Sprintf(
 				"NewEntityFor found case-insensitive operation collision between %s and %s",

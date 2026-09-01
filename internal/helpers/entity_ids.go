@@ -31,7 +31,7 @@ func ParseEntityInstanceID(instanceID string) (string, string, error) {
 	if err := ValidateEntityName(name); err != nil {
 		return "", "", err
 	}
-	return strings.ToLower(name), key, nil
+	return ToLowerInvariant(name), key, nil
 }
 
 // IsEntityInstanceID reports whether the instance ID uses the reserved entity format.

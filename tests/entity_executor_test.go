@@ -777,7 +777,9 @@ func Test_Executor_EntityStartOrchestrationIDIsStableAcrossRetry(t *testing.T) {
 	)
 }
 
-func Test_Executor_EntityLegacyStateElisionRequestsState(t *testing.T) {
+// The scheduler signals an elided entity state with the "IncludeState" property,
+// matching Microsoft.DurableTask's GrpcInstanceRunnerUtils.
+func Test_Executor_EntityStateElisionRequestsState(t *testing.T) {
 	var invoked bool
 	r := task.NewTaskRegistry()
 	require.NoError(t, r.AddEntityN("cached", func(*task.EntityContext) (any, error) {
@@ -792,10 +794,72 @@ func Test_Executor_EntityLegacyStateElisionRequestsState(t *testing.T) {
 			RequestId: uuid.NewString(),
 		}},
 		Properties: map[string]*structpb.Value{
-			"entityStateIncluded": structpb.NewBoolValue(false),
+			"IncludeState": structpb.NewBoolValue(false),
 		},
 	})
 	require.NoError(t, err)
 	assert.True(t, result.RequiresState)
 	assert.False(t, invoked)
+	assert.Empty(t, result.Results)
+	assert.Nil(t, result.EntityState)
+}
+
+// A state request is driven by the property alone, so an attached state does not
+// suppress it and an unregistered entity does not mask it.
+func Test_Executor_EntityStateElisionIgnoresAttachedStateAndRegistration(t *testing.T) {
+	executor := newEntityExecutor(task.NewTaskRegistry())
+	result, err := executor.ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
+		InstanceId:  "@unregistered@key",
+		EntityState: wrapperspb.String("42"),
+		Operations: []*protos.OperationRequest{{
+			Operation: "get",
+			RequestId: uuid.NewString(),
+		}},
+		Properties: map[string]*structpb.Value{
+			"IncludeState": structpb.NewBoolValue(false),
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.RequiresState)
+	assert.Empty(t, result.Results)
+}
+
+// A missing or non-boolean property means the state was included.
+func Test_Executor_EntityStateElisionDefaultsToIncluded(t *testing.T) {
+	properties := map[string]map[string]*structpb.Value{
+		"absent": nil,
+		"wrong-type": {
+			"IncludeState": structpb.NewStringValue("false"),
+		},
+		"misspelled": {
+			"includestate": structpb.NewBoolValue(false),
+		},
+		"true": {
+			"IncludeState": structpb.NewBoolValue(true),
+		},
+	}
+	for name, property := range properties {
+		t.Run(name, func(t *testing.T) {
+			var invoked bool
+			r := task.NewTaskRegistry()
+			require.NoError(t, r.AddEntityN("cached", func(*task.EntityContext) (any, error) {
+				invoked = true
+				return nil, nil
+			}))
+			result, err := newEntityExecutor(r).ExecuteEntity(
+				context.Background(),
+				&protos.EntityBatchRequest{
+					InstanceId: "@cached@key",
+					Operations: []*protos.OperationRequest{{
+						Operation: "get",
+						RequestId: uuid.NewString(),
+					}},
+					Properties: property,
+				},
+			)
+			require.NoError(t, err)
+			assert.False(t, result.RequiresState)
+			assert.True(t, invoked)
+		})
+	}
 }

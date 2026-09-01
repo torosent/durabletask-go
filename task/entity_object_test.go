@@ -107,7 +107,7 @@ func Test_EntityFactory_RunsAfterStateHandshake(t *testing.T) {
 	result, err := executor.ExecuteEntity(context.Background(), &protos.EntityBatchRequest{
 		InstanceId: "@counter@key",
 		Properties: map[string]*structpb.Value{
-			"entityStateIncluded": structpb.NewBoolValue(false),
+			"IncludeState": structpb.NewBoolValue(false),
 		},
 	})
 	require.NoError(t, err)
@@ -187,10 +187,30 @@ func (entity *setupFailureObject) CloseEntityBatch(context.Context) error {
 	return nil
 }
 
-func Test_EntityObjectFactory_ClosesAfterSetupFailure(t *testing.T) {
+// A colliding operation set is a permanent authoring error, so it must fail when
+// the factory is created rather than failing every batch as a retriable fault.
+func Test_EntityObjectFactory_RejectsCollisionAtConstruction(t *testing.T) {
 	closeCalls := 0
-	factory := NewEntityObjectFactory[objectCounterState, *setupFailureObject](
-		func(EntityFactoryContext) (*setupFailureObject, error) {
+	require.PanicsWithValue(
+		t,
+		"entity object found case-insensitive operation collision between OPERATION and Operation",
+		func() {
+			_ = NewEntityObjectFactory[objectCounterState, *setupFailureObject](
+				func(EntityFactoryContext) (*setupFailureObject, error) {
+					return &setupFailureObject{closeCalls: &closeCalls}, nil
+				},
+			)
+		},
+	)
+	require.Zero(t, closeCalls)
+}
+
+// An interface type parameter only reveals its operations once the object
+// exists, so that path still reports setup failure per batch and releases it.
+func Test_EntityObjectFactory_ClosesAfterDynamicSetupFailure(t *testing.T) {
+	closeCalls := 0
+	factory := NewEntityObjectFactory[objectCounterState, EntityObjectBinding[objectCounterState]](
+		func(EntityFactoryContext) (EntityObjectBinding[objectCounterState], error) {
 			return &setupFailureObject{closeCalls: &closeCalls}, nil
 		},
 	)

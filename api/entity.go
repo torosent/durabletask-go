@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/microsoft/durabletask-go/internal/helpers"
@@ -32,12 +31,12 @@ func NewEntityID(name string, key string) EntityID {
 	if err := helpers.ValidateEntityName(name); err != nil {
 		panic(err)
 	}
-	return EntityID{Name: strings.ToLower(name), Key: key}
+	return EntityID{Name: helpers.ToLowerInvariant(name), Key: key}
 }
 
 // String returns the entity instance ID in the format "@<name>@<key>".
 func (e EntityID) String() string {
-	return fmt.Sprintf("@%s@%s", strings.ToLower(e.Name), e.Key)
+	return fmt.Sprintf("@%s@%s", helpers.ToLowerInvariant(e.Name), e.Key)
 }
 
 // MarshalJSON serializes entity IDs using the cross-SDK compact instance ID format.

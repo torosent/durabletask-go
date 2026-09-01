@@ -151,7 +151,7 @@ func (r *TaskRegistry) AddEntityFactoryN(name string, factory EntityFactory) err
 		if err := helpers.ValidateEntityName(name); err != nil {
 			return err
 		}
-		name = strings.ToLower(name)
+		name = helpers.ToLowerInvariant(name)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -181,7 +181,7 @@ func (r *TaskRegistry) hasOrchestrator(name, version string) bool {
 
 func (r *TaskRegistry) getEntityFactory(name string) (EntityFactory, bool) {
 	if name != "*" {
-		name = strings.ToLower(name)
+		name = helpers.ToLowerInvariant(name)
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()

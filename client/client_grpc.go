@@ -480,7 +480,7 @@ func entityMetadataFromProto(
 func normalizeEntityQueryPrefix(value string) string {
 	value = strings.TrimPrefix(value, "@")
 	name, key, hasKey := strings.Cut(value, "@")
-	prefix := "@" + strings.ToLower(name)
+	prefix := "@" + helpers.ToLowerInvariant(name)
 	if hasKey {
 		return prefix + "@" + key
 	}

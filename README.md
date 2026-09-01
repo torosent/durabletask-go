@@ -378,6 +378,8 @@ The SDK supports raw entity functions, state-struct dispatch, and persistent ent
 
 The SDK also supports scheduled signals, orchestration calls, entity-to-entity signals, queries, cleanup, and ordered critical sections across more than one entity.
 
+Entity names and operation names are matched case-insensitively using the same invariant rule as the .NET SDK, so a name resolves to the same entity in both SDKs.
+
 The DTS worker accepts the legacy `EntityBatchRequest` work item and the current `EntityRequestV2` work item.
 
 Full sample: [samples/entity](./samples/entity).
