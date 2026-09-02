@@ -56,7 +56,7 @@ Use these features for large systems or for special conditions.
 
 ## Quick start
 
-This project needs Go 1.23 or later.
+This project needs Go 1.25 or later.
 
 1. Start the [DTS emulator](https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/quickstart-durable-task-scheduler). Use any OCI runtime:
 
@@ -144,7 +144,7 @@ Each sample connects to the task hub in `DTS_CONNECTION_STRING`. Set that variab
 | [retries](./samples/retries) | Retry an activity after a failure. |
 | [entity](./samples/entity) | Use durable entities. |
 | [exporthistory](./samples/exporthistory) | Export orchestration histories to Azure Blob Storage. |
-| [distributedtracing](./samples/distributedtracing) | Send trace data to Zipkin. |
+| [distributedtracing](./samples/distributedtracing) | Send trace data to an OpenTelemetry collector. |
 
 Two samples need more steps:
 
@@ -448,13 +448,15 @@ The [`payload`](./payload) package includes Azure Blob Storage support. It emits
 
 The SDK sends the W3C trace context of a sampled caller when it schedules an orchestration. DTS owns the spans for the orchestrations, activities, timers, and sub-orchestrations. Your application code can use standard [OpenTelemetry](https://opentelemetry.io/) instrumentation. Use it for caller spans, custom activity spans, and outbound dependencies.
 
-This example sends the traces of your process to [Zipkin](https://zipkin.io/). Configure the DTS telemetry separately for the service-owned spans.
+This example sends the traces of your process to an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) over OTLP/HTTP. Configure the DTS telemetry separately for the service-owned spans.
 
 ```go
-func ConfigureZipkinTracing() (*trace.TracerProvider, error) {
-	// This code follows the OpenTelemetry Zipkin sample:
-	// https://github.com/open-telemetry/opentelemetry-go/blob/main/example/zipkin/main.go
-	exp, err := zipkin.New("http://localhost:9411/api/v2/spans")
+func ConfigureOTLPTracing(ctx context.Context) (*trace.TracerProvider, error) {
+	exp, err := otlptracehttp.New(
+		ctx,
+		otlptracehttp.WithEndpoint("localhost:4318"),
+		otlptracehttp.WithInsecure(),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -531,7 +533,7 @@ The protocol buffer definitions are in [`vendored/durabletask-protobuf/protos`](
 
 ### Build the project
 
-This project needs Go 1.23 or later. This project is a library. To build all of the packages, run this command in the project root:
+This project needs Go 1.25 or later. This project is a library. To build all of the packages, run this command in the project root:
 
 ```bash
 go build ./...
@@ -612,7 +614,7 @@ The DTS emulator supplies a local task hub. Use it for development and for the e
 docker run -d -p 8080:8080 -p 8082:8082 \
   -e DTS_TASK_HUB_NAMES=default \
   mcr.microsoft.com/dts/dts-emulator:latest
-docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.35.0
+docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.37.0
 ```
 
 The end-to-end tests read these environment variables. The tests skip themselves if the variables are empty.

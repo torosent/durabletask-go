@@ -15,9 +15,9 @@ on:
 
 env:
   # Configure protoc and go grpc plugin
-  PROTOC_VERSION: "25.x"
-  PROTOC_GEN_GO: "v1.30"
-  PROTOC_GEN_GO_GRPC: "v1.3"
+  PROTOC_VERSION: "36.x"
+  PROTOC_GEN_GO: "v1.36.12"
+  PROTOC_GEN_GO_GRPC: "v1.6.2"
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -29,12 +29,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - go-version: '1.23.x'
+          - go-version: '1.25.x'
             test-kind: coverage
             test-command: >-
               go test ./... -count=1 -timeout=20m
               -coverpkg=./api,./task,./client,./durabletaskscheduler,./exporthistory,./payload,./internal/contextprop,./internal/failure,./internal/grpcerrors,./internal/helpers,./internal/historyconv,./internal/largepayload,./internal/tagcodec
-          - go-version: '1.24.x'
+          - go-version: '1.27.x'
             test-kind: race
             test-command: go test -race ./... -count=1 -timeout=30m
 
@@ -42,7 +42,7 @@ jobs:
     # the end-to-end and blob storage tests.
     services:
       dts:
-        image: mcr.microsoft.com/dts/dts-emulator:latest
+        image: mcr.microsoft.com/dts/dts-emulator:latest@sha256:361323065a608d605f9d3ae56b854eb11f1c47fcc16845a37f948f03ca9c5fac
         env:
           DTS_TASK_HUB_NAMES: default
         ports:
@@ -50,18 +50,18 @@ jobs:
           - 8082:8082
 
       azurite:
-        image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+        image: mcr.microsoft.com/azure-storage/azurite:3.37.0
         ports:
           - 10000:10000
 
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           
       - name: Setup Go environment
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
           
@@ -69,7 +69,7 @@ jobs:
         run: go mod download
       
       - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
         with:
           version: ${{ env.PROTOC_VERSION }}
 
@@ -102,7 +102,9 @@ jobs:
           go test ./...
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        with:
+          version: v2.13.2
 
       - name: Wait for service emulators
         run: |
